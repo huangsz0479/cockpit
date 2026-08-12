@@ -625,16 +625,6 @@ describe("App connection actions", () => {
     await nextTick();
     expect(entryDateHeader.classList.contains("selected-column")).toBe(true);
     expect(host.querySelector(".column-direct-edit-input")).not.toBeNull();
-    const outsideColumnTarget = host.querySelector<HTMLElement>(".result-search")!;
-    outsideColumnTarget.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
-    await nextTick();
-    expect(host.querySelector(".data-grid .selected-column")).toBeNull();
-    expect(host.querySelector(".column-direct-edit-input")).toBeNull();
-
-    entryDateHeader.click();
-    await nextTick();
-    expect(entryDateHeader.classList.contains("selected-column")).toBe(true);
-    expect(host.querySelector(".column-direct-edit-input")).not.toBeNull();
     host.querySelector<HTMLElement>('.table-data-view tbody td[data-grid-row="0"][data-grid-column="1"]')!.click();
     await nextTick();
     expect(host.querySelector(".data-grid .selected-column")).toBeNull();

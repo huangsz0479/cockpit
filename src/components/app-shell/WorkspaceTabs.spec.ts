@@ -14,7 +14,6 @@ describe("WorkspaceTabs", () => {
       tabs: [{ id: "query-1", kind: "console", title: "订单查询", closable: true, pinned: false }],
       activeId: "query-1",
       dirtyIds: [],
-      canShowTableDetail: false,
       onClose: close,
     }) });
     app.mount(host);
@@ -38,7 +37,6 @@ describe("WorkspaceTabs", () => {
       ],
       activeId: "query-1",
       dirtyIds: [],
-      canShowTableDetail: false,
       onActivate: activate,
     }) });
     app.mount(host);

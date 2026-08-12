@@ -61,7 +61,7 @@ type ResultView = "result" | "summary";
 interface WorkspaceTab {
   id: string;
   sessionId: UUID;
-  kind: "console" | "table" | "table-detail" | "create-table" | "alter-table" | "database-object";
+  kind: "console" | "table" | "create-table" | "alter-table" | "database-object";
   title: string;
   connectionId?: UUID | null;
   database: string | null;
@@ -69,7 +69,6 @@ interface WorkspaceTab {
   originalTableDefinition?: CreateTableDefinition;
   tableDetail?: TableDetail;
   editableTable?: TableInfo | null;
-  detailSection?: "columns" | "indexes" | "foreignKeys" | "ddl";
   sql: string;
   result: QueryResultPage | null;
   hasExecuted?: boolean;
@@ -292,19 +291,41 @@ const filteredDatabases = computed(() => {
     : databases.value;
 });
 const activeWorkspaceTab = computed<WorkspaceTab | null>(() => workspaceTabs.value.find((tab) => tab.id === activeWorkspaceTabId.value) ?? null);
+const editorColumnCache = new Map<string, readonly string[]>();
+const editorColumnRequests = new Map<string, Promise<readonly string[]>>();
+
+function editorColumnCacheKey(connectionId: UUID, database: string, table: string) {
+  return `${connectionId}\0${database}\0${table}`;
+}
+
+async function loadEditorTableColumns(table: string, database?: string): Promise<readonly string[]> {
+  const tab = activeWorkspaceTab.value;
+  const connectionId = tab?.connectionId ?? activeConnectionId.value;
+  const targetDatabase = database || tab?.database || selectedDatabase.value;
+  if (!connectionId || !targetDatabase) return [];
+  const key = editorColumnCacheKey(connectionId, targetDatabase, table);
+  const cached = editorColumnCache.get(key);
+  if (cached) return cached;
+  const pending = editorColumnRequests.get(key);
+  if (pending) return pending;
+  const request: Promise<readonly string[]> = api.listColumns(connectionId, targetDatabase, table)
+    .then((columns) => {
+      const names = columns.map((column) => column.name);
+      editorColumnCache.set(key, names);
+      return names;
+    })
+    .catch(() => [])
+    .finally(() => editorColumnRequests.delete(key));
+  editorColumnRequests.set(key, request);
+  return request;
+}
+
 const sqlEditor = ref<InstanceType<typeof SqlEditor> | null>(null);
 const activeWorkspaceTitle = computed(() => {
   const tab = activeWorkspaceTab.value;
   return tab && (!tab.generatedTitle || tab.title !== untitledQueryTitle(tab.connectionId)) ? tab.title : "";
 });
 const dirtyWorkspaceTabIds = computed(() => workspaceTabs.value.filter(workspaceTabIsDirty).map((tab) => tab.id));
-const availableTableDetail = computed(() => {
-  const tab = activeWorkspaceTab.value;
-  if (tab?.tableDetail && (tab.kind === "table" || tab.kind === "table-detail" || Boolean(tab.editableTable))) {
-    return tab.tableDetail;
-  }
-  return tableDetail.value;
-});
 const activeQueryConnection = computed(() => connections.value.find((connection) => connection.id === activeWorkspaceTab.value?.connectionId) ?? null);
 const activeQueryConnectionIcon = computed(() => {
   const connection = activeQueryConnection.value;
@@ -498,6 +519,10 @@ function handleOutsidePointer(event: PointerEvent) {
   const target = event.target;
   if (tableActionsOpen.value && target instanceof Node && !tableActionsMenu.value?.contains(target)) closeTableActionsMenu();
   if (columnMenuColumn.value && !(target instanceof Element && target.closest(".column-header-menu"))) closeColumnMenu();
+  if (
+    batchEditColumn.value
+    && !(target instanceof Element && target.closest("th.selected-column, .column-batch-edit-bar"))
+  ) cancelColumnBatchEdit();
 }
 
 function handleTableActionsMenuClick(event: MouseEvent) {
@@ -867,7 +892,6 @@ async function restoreWorkspace() {
           selectedCell: null,
           tableDetail: tab.kind === "console" ? undefined : tab.tableDetail,
           editableTable: null,
-          detailSection: tab.kind === "table-detail" ? tab.detailSection ?? "columns" : tab.detailSection,
           pageSize: tab.pageSize ?? (tab.kind === "table" ? settings.value.tablePageSize : settings.value.queryPageSize),
           persistedSql: tab.persistedSql ?? tab.sql,
         });
@@ -1468,13 +1492,12 @@ async function dropDatabase(database: string) {
   }
 }
 
-async function runTableContextAction(action: "open" | "preview" | "generate" | "design" | "truncate" | "drop" | "copy" | "copy-qualified") {
+async function runTableContextAction(action: "preview" | "generate" | "design" | "truncate" | "drop" | "copy" | "copy-qualified") {
   const target = contextMenu.value?.target;
   if (!target || target.kind !== "table") return;
   const table = target.table;
   closeContextMenu();
-  if (action === "open") await showTableDetail(table);
-  else if (action === "preview") await previewTable(table);
+  if (action === "preview") await previewTable(table);
   else if (action === "generate") generateSelect(table);
   else if (action === "design") {
     if (table.tableType.includes("VIEW")) await openDatabaseObject(table.database, "view", table.name);
@@ -1502,7 +1525,8 @@ async function runTableDdl(table: TableInfo, statement: string, description: str
   if (tab) await closeWorkspaceTab(tab.id);
 }
 
-function isDatabaseViewTab(tab: WorkspaceTab) {
+function isDatabaseViewTab(tab: { kind: string }) {
+  // `table-detail` is retained only to discard tabs saved by older versions.
   return tab.kind === "table" || tab.kind === "table-detail";
 }
 
@@ -1619,42 +1643,6 @@ async function openDatabase(database: string) {
   await store.selectDatabase(database);
 }
 
-async function openTable(table: TableInfo) {
-  if (selectedDatabase.value !== table.database) await openDatabase(table.database);
-  await store.selectTable(table);
-}
-
-async function showTableDetail(table: TableInfo) {
-  const cachedDetail = tableDetail.value?.table.database === table.database
-    && tableDetail.value.table.name === table.name
-    ? tableDetail.value
-    : null;
-  if (!cachedDetail) await openTable(table);
-  const detail = cachedDetail ?? tableDetail.value;
-  if (!detail || detail.table.database !== table.database || detail.table.name !== table.name) return;
-  const tabId = `table-detail:${activeConnectionId.value ?? ""}:${table.database}:${table.name}`;
-  let tab = workspaceTabs.value.find((item) => item.id === tabId);
-  if (!tab) {
-    tab = {
-      id: tabId,
-      sessionId: crypto.randomUUID(),
-      kind: "table-detail",
-      title: `表结构 · ${table.name}`,
-      connectionId: activeConnectionId.value,
-      database: table.database,
-      tableDetail: detail,
-      detailSection: "columns",
-      sql: "",
-      result: null,
-      columnWidths: {},
-      closable: true,
-    };
-    workspaceTabs.value.push(tab);
-  } else {
-    tab.tableDetail = detail;
-  }
-  activeWorkspaceTabId.value = tab.id;
-}
 
 function routineObjectKind(routine: RoutineInfo): DatabaseObjectKind {
   return routine.routineType.toUpperCase() === "FUNCTION" ? "function" : "procedure";
@@ -2127,7 +2115,7 @@ async function saveSqlFile(forceSaveAs = false, linkToTab = true): Promise<strin
 }
 
 async function applyQueryContext(tab: WorkspaceTab): Promise<boolean> {
-  if ((tab.kind !== "console" && tab.kind !== "create-table" && tab.kind !== "alter-table" && tab.kind !== "database-object" && tab.kind !== "table" && tab.kind !== "table-detail") || !tab.closable || !tab.connectionId) return false;
+  if ((tab.kind !== "console" && tab.kind !== "create-table" && tab.kind !== "alter-table" && tab.kind !== "database-object" && tab.kind !== "table") || !tab.closable || !tab.connectionId) return false;
   if (activeConnectionId.value !== tab.connectionId) await store.connect(tab.connectionId);
   if (activeConnectionId.value !== tab.connectionId) return false;
   if (!await store.openTabSession(tab.connectionId, tab.sessionId)) return false;
@@ -3599,7 +3587,7 @@ async function importSqlFile(targetDatabase?: string) {
       @settings="showSettings = true"
     />
 
-    <div v-if="error && (!activeWorkspaceTab || activeWorkspaceTab.kind === 'table-detail')" class="global-error-notice" role="alert">
+    <div v-if="error && !activeWorkspaceTab" class="global-error-notice" role="alert">
       <span class="global-error-icon" aria-hidden="true">!</span>
       <div><strong>操作未完成</strong><span>{{ error }}</span></div>
       <button type="button" class="icon-button" aria-label="关闭错误提示" @click="error = null"><X :size="14" /></button>
@@ -3681,10 +3669,8 @@ async function importSqlFile(targetDatabase?: string) {
         :tabs="workspaceTabs"
         :active-id="activeWorkspaceTabId"
         :dirty-ids="dirtyWorkspaceTabIds"
-        :can-show-table-detail="Boolean(availableTableDetail)"
         @activate="activateWorkspaceTabById"
         @close="closeWorkspaceTab"
-        @show-table-detail="availableTableDetail && showTableDetail(availableTableDetail.table)"
         @toggle-pin="toggleActiveTabPin"
       />
 
@@ -3730,6 +3716,7 @@ async function importSqlFile(targetDatabase?: string) {
             :model-value="sql"
             :document-id="activeWorkspaceTab.id"
             :schema="editorSchema"
+            :load-table-columns="loadEditorTableColumns"
             :database-kind="activeQueryConnection?.driverKind ?? 'mysql'"
             :font-size="settings.editorFontSize ?? 12"
             :tab-size="settings.editorTabSize ?? 2"
@@ -3939,29 +3926,6 @@ async function importSqlFile(targetDatabase?: string) {
           </div>
         </section>
       </div>
-
-      <section v-else-if="activeWorkspaceTab?.kind === 'table-detail'" class="table-structure-view">
-        <template v-if="activeWorkspaceTab.tableDetail">
-          <div class="detail-heading">
-            <div><small>{{ activeWorkspaceTab.tableDetail.table.tableType }} · {{ activeWorkspaceTab.tableDetail.table.database }}</small><h3>{{ activeWorkspaceTab.tableDetail.table.name }}</h3></div>
-            <div class="detail-heading-actions">
-              <button type="button" class="ghost compact" @click="activeWorkspaceTab.tableDetail.table.tableType.includes('VIEW') ? openDatabaseObject(activeWorkspaceTab.tableDetail.table.database, 'view', activeWorkspaceTab.tableDetail.table.name) : designTable(activeWorkspaceTab.tableDetail.table)">{{ activeWorkspaceTab.tableDetail.table.tableType.includes('VIEW') ? '编辑定义' : '设计' }}</button>
-              <span v-if="activeWorkspaceTab.tableDetail.table.estimatedRows != null">≈ {{ activeWorkspaceTab.tableDetail.table.estimatedRows.toLocaleString() }} 行</span>
-            </div>
-          </div>
-          <nav class="detail-tabs" role="tablist" aria-label="表结构分类">
-            <button id="detail-tab-columns" role="tab" :aria-selected="(activeWorkspaceTab.detailSection ?? 'columns') === 'columns'" :class="{ active: (activeWorkspaceTab.detailSection ?? 'columns') === 'columns' }" @click="activeWorkspaceTab.detailSection = 'columns'">列</button>
-            <button id="detail-tab-indexes" role="tab" :aria-selected="activeWorkspaceTab.detailSection === 'indexes'" :class="{ active: activeWorkspaceTab.detailSection === 'indexes' }" @click="activeWorkspaceTab.detailSection = 'indexes'">索引</button>
-            <button id="detail-tab-foreign-keys" role="tab" :aria-selected="activeWorkspaceTab.detailSection === 'foreignKeys'" :class="{ active: activeWorkspaceTab.detailSection === 'foreignKeys' }" @click="activeWorkspaceTab.detailSection = 'foreignKeys'">外键</button>
-            <button id="detail-tab-ddl" role="tab" :aria-selected="activeWorkspaceTab.detailSection === 'ddl'" :class="{ active: activeWorkspaceTab.detailSection === 'ddl' }" @click="activeWorkspaceTab.detailSection = 'ddl'">DDL</button>
-          </nav>
-          <div v-if="(activeWorkspaceTab.detailSection ?? 'columns') === 'columns'" class="detail-content" role="tabpanel" aria-labelledby="detail-tab-columns"><div v-for="column in activeWorkspaceTab.tableDetail.columns" :key="column.name" class="column-row"><div><strong>{{ column.name }}</strong><small>{{ column.fullType }}<span v-if="!column.nullable"> · NOT NULL</span></small></div><span v-if="column.key" class="key-badge">{{ column.key }}</span></div></div>
-          <div v-else-if="activeWorkspaceTab.detailSection === 'indexes'" class="detail-content" role="tabpanel" aria-labelledby="detail-tab-indexes"><div v-for="index in activeWorkspaceTab.tableDetail.indexes" :key="index.name" class="column-row"><div><strong>{{ index.name }}</strong><small>{{ index.columns.join(', ') }}</small></div><span class="key-badge">{{ index.primary ? 'PK' : index.unique ? 'UNIQUE' : index.indexType }}</span></div></div>
-          <div v-else-if="activeWorkspaceTab.detailSection === 'foreignKeys'" class="detail-content" role="tabpanel" aria-labelledby="detail-tab-foreign-keys"><div v-for="foreignKey in activeWorkspaceTab.tableDetail.foreignKeys" :key="foreignKey.name" class="column-row"><div><strong>{{ foreignKey.name }}</strong><small>{{ foreignKey.columns.join(', ') }} → {{ foreignKey.referencedDatabase }}.{{ foreignKey.referencedTable }} ({{ foreignKey.referencedColumns.join(', ') }})</small></div><span class="key-badge">{{ foreignKey.onDelete || 'RESTRICT' }}</span></div><div v-if="!activeWorkspaceTab.tableDetail.foreignKeys.length" class="empty-small">没有外键</div></div>
-          <pre v-else class="ddl-view" role="tabpanel" aria-labelledby="detail-tab-ddl">{{ activeWorkspaceTab.tableDetail.ddl }}</pre>
-        </template>
-        <div v-else class="empty-small">无法加载表结构</div>
-      </section>
 
       <section v-else-if="activeWorkspaceTab?.kind === 'create-table' || activeWorkspaceTab?.kind === 'alter-table'" class="create-table-view">
         <CreateTableEditor
@@ -4299,7 +4263,6 @@ async function importSqlFile(targetDatabase?: string) {
 
       <template v-else>
         <div class="context-menu-title">{{ contextMenu.target.table.name }}</div>
-        <button role="menuitem" @click="runTableContextAction('open')"><Table2 :size="14" />查看结构</button>
         <button role="menuitem" @click="runTableContextAction('preview')"><Play :size="14" />预览前 100 行</button>
         <button role="menuitem" @click="runTableContextAction('generate')"><FileCode2 :size="14" />生成 SELECT</button>
         <button role="menuitem" @click="runTableContextAction('design')"><Pencil :size="14" />{{ contextMenu.target.table.tableType.includes('VIEW') ? '查看视图定义' : '设计表结构' }}</button>

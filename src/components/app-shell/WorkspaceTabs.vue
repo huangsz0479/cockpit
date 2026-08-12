@@ -7,13 +7,11 @@ const props = defineProps<{
   tabs: WorkspaceTabView[];
   activeId: string | null;
   dirtyIds: readonly string[];
-  canShowTableDetail: boolean;
 }>();
 
 const emit = defineEmits<{
   activate: [id: string];
   close: [id: string];
-  "show-table-detail": [];
   "toggle-pin": [];
 }>();
 
@@ -50,7 +48,7 @@ function navigateTabs(event: KeyboardEvent, tabId: string) {
         <button type="button" class="workspace-tab" role="tab" :aria-selected="tab.id === activeId" :aria-label="tab.title" :tabindex="tab.id === activeId ? 0 : -1" :class="{ active: tab.id === activeId }" @click="$emit('activate', tab.id)" @keydown="navigateTabs($event, tab.id)">
           <Plus v-if="tab.kind === 'create-table'" :size="14" />
           <Braces v-else-if="tab.kind === 'database-object'" :size="14" />
-          <Table2 v-else-if="tab.kind === 'table' || tab.kind === 'table-detail'" :size="14" />
+          <Table2 v-else-if="tab.kind === 'table'" :size="14" />
           <img v-else-if="tab.kind === 'console'" class="workspace-tab-icon" :src="sqlIcon" alt="" aria-hidden="true" />
           <FileCode2 v-else :size="14" />
           <span class="tab-title">{{ tab.title }}</span>
@@ -61,7 +59,6 @@ function navigateTabs(event: KeyboardEvent, tabId: string) {
       </div>
     </div>
     <div class="workspace-tab-actions">
-      <button v-if="canShowTableDetail" type="button" class="tab-action detail-toggle" aria-label="在新标签页查看表结构" @click="$emit('show-table-detail')"><Table2 :size="14" /><span>表结构</span></button>
       <button v-if="activeId" type="button" class="tab-action" aria-label="固定或取消固定当前标签" @click="$emit('toggle-pin')"><Pin :size="14" /></button>
     </div>
   </nav>

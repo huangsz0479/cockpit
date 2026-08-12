@@ -12,7 +12,7 @@ export type NavigationContextTarget =
 
 export interface WorkspaceTabView {
   id: string;
-  kind: "console" | "table" | "table-detail" | "create-table" | "alter-table" | "database-object";
+  kind: "console" | "table" | "create-table" | "alter-table" | "database-object";
   title: string;
   closable: boolean;
   pinned?: boolean;

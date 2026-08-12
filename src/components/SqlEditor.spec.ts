@@ -1,4 +1,4 @@
-import { completionStatus, startCompletion } from "@codemirror/autocomplete";
+import { completionStatus, currentCompletions, startCompletion } from "@codemirror/autocomplete";
 import { EditorView, runScopeHandlers } from "@codemirror/view";
 import { createApp, defineComponent, h, nextTick, ref } from "vue";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -14,7 +14,10 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-function mountEditor(initialValue = "", onExecute = vi.fn()) {
+function mountEditor(initialValue = "", onExecute = vi.fn(), editorProps: {
+  schema?: Record<string, readonly string[]>;
+  loadTableColumns?: (table: string, database?: string) => Promise<readonly string[]>;
+} = {}) {
   const modelValue = ref(initialValue);
   const modelUpdates: string[] = [];
   const host = document.createElement("div");
@@ -29,6 +32,7 @@ function mountEditor(initialValue = "", onExecute = vi.fn()) {
           modelValue.value = value;
         },
         onExecute,
+        ...editorProps,
       });
     },
   }));
@@ -108,6 +112,74 @@ describe("SqlEditor", () => {
     expect(view.state.doc.toString()).toBe("SELECT");
   });
 
+  it("suggests fields from the FROM table in a WHERE expression", async () => {
+    const loadTableColumns = vi.fn().mockResolvedValue(["id", "dept_name", "parent_id"]);
+    const { view } = mountEditor("SELECT * FROM system_dept WHERE i", vi.fn(), {
+      schema: { system_dept: [] },
+      loadTableColumns,
+    });
+    view.dispatch({ selection: { anchor: view.state.doc.length } });
+    view.focus();
+    startCompletion(view);
+
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBe("active"));
+    expect(currentCompletions(view.state).map((completion) => completion.label)).toContain("id");
+    expect(loadTableColumns).toHaveBeenCalledWith("system_dept", undefined);
+  });
+
+  it("uses already-known fields without reloading the table", async () => {
+    const loadTableColumns = vi.fn();
+    const { view } = mountEditor("SELECT * FROM system_dept WHERE dept_", vi.fn(), {
+      schema: { system_dept: ["id", "dept_name"] },
+      loadTableColumns,
+    });
+    view.dispatch({ selection: { anchor: view.state.doc.length } });
+    view.focus();
+    startCompletion(view);
+
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBe("active"));
+    expect(currentCompletions(view.state).map((completion) => completion.label)).toContain("dept_name");
+    expect(loadTableColumns).not.toHaveBeenCalled();
+  });
+
+  it("limits qualified field suggestions to the matching table alias", async () => {
+    const { view } = mountEditor(
+      "SELECT * FROM users u JOIN teams t ON t.id = u.team_id WHERE t.team_",
+      vi.fn(),
+      { schema: { users: ["team_user_name"], teams: ["team_name"] } },
+    );
+    view.dispatch({ selection: { anchor: view.state.doc.length } });
+    view.focus();
+    startCompletion(view);
+
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBe("active"));
+    const labels = currentCompletions(view.state).map((completion) => completion.label);
+    expect(labels).toContain("team_name");
+    expect(labels).not.toContain("team_user_name");
+  });
+
+  it("automatically opens field suggestions immediately after an alias dot", async () => {
+    const loadTableColumns = vi.fn().mockResolvedValue(["id", "dict_label", "dict_value"]);
+    const sql = "SELECT * FROM system_dict_data t WHERE t";
+    const { view } = mountEditor(sql, vi.fn(), {
+      schema: { system_dict_data: [] },
+      loadTableColumns,
+    });
+    view.dispatch({ selection: { anchor: view.state.doc.length } });
+    view.focus();
+    view.dispatch({
+      changes: { from: view.state.doc.length, insert: "." },
+      selection: { anchor: view.state.doc.length + 1 },
+      userEvent: "input.type",
+    });
+
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBe("active"));
+    expect(currentCompletions(view.state).map((completion) => completion.label)).toEqual(
+      expect.arrayContaining(["id", "dict_label", "dict_value"]),
+    );
+    expect(loadTableColumns).toHaveBeenCalledWith("system_dict_data", undefined);
+  });
+
   it("inserts a tab at the current cursor position", () => {
     const { view } = mountEditor("SELECT 1");
     view.dispatch({ selection: { anchor: "SELECT".length } });
@@ -149,6 +221,19 @@ describe("SqlEditor", () => {
 
     expect(activeLine).not.toBeNull();
     expect(editorStyles).toContain("rgba(226, 232, 240, 0.25)");
+  });
+
+  it("styles the completion menu without changing its row height", () => {
+    mountEditor("SELECT * FROM system_dict_data t WHERE t.", vi.fn(), {
+      schema: { system_dict_data: ["id", "dict_label"] },
+    });
+    const editorStyles = Array.from(document.querySelectorAll("style"), (style) => style.textContent).join("\n");
+
+    expect(editorStyles).toContain("border-radius: var(--radius-md)");
+    expect(editorStyles).toContain("box-shadow: var(--shadow-md)");
+    expect(editorStyles).toContain("padding: 1px 8px");
+    expect(editorStyles).toContain("line-height: 1.2");
+    expect(editorStyles).toContain("font-style: normal");
   });
 
   it("disables native smart text features on the editable content", () => {
