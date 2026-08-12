@@ -1,0 +1,49 @@
+[package]
+name = "cockpit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "cockpit_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.4", features = [] }
+
+[dependencies]
+chrono.workspace = true
+aes-gcm.workspace = true
+argon2.workspace = true
+calamine.workspace = true
+base64.workspace = true
+csv.workspace = true
+encoding_rs.workspace = true
+flate2.workspace = true
+cockpit-core = { path = "../crates/cockpit-core" }
+cockpit-mysql = { path = "../crates/cockpit-mysql" }
+cockpit-postgres = { path = "../crates/cockpit-postgres" }
+cockpit-sqlite = { path = "../crates/cockpit-sqlite" }
+log = "0.4"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+rand_core.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tauri = { version = "2.8", features = [] }
+tauri-plugin-dialog = "2.4"
+tauri-plugin-log = "2.7"
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }

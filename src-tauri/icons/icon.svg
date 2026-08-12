@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Cockpit application icon</title>
+  <desc id="desc">A blue database inside a rounded tile, surrounded by orbital paths and colorful status nodes.</desc>
+
+  <defs>
+    <linearGradient id="background" x1="180" y1="120" x2="844" y2="904" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f8fbff"/>
+      <stop offset="1" stop-color="#eaf2fd"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="300" y1="270" x2="736" y2="762" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eef5ff"/>
+    </linearGradient>
+    <pattern id="grid" width="128" height="128" patternUnits="userSpaceOnUse">
+      <path d="M128 0H0V128" fill="none" stroke="#cadcf3" stroke-width="3"/>
+    </pattern>
+    <filter id="background-shadow" x="0" y="0" width="1024" height="1024" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="22" stdDeviation="28" flood-color="#244b86" flood-opacity=".18"/>
+    </filter>
+    <filter id="tile-shadow" x="250" y="240" width="524" height="560" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="24" stdDeviation="30" flood-color="#2f69c7" flood-opacity=".18"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#background-shadow)">
+    <rect x="48" y="48" width="928" height="928" rx="220" fill="url(#background)"/>
+    <rect x="48" y="48" width="928" height="928" rx="220" fill="url(#grid)" opacity=".28"/>
+    <rect x="52" y="52" width="920" height="920" rx="216" fill="none" stroke="#d5e3f6" stroke-width="8"/>
+  </g>
+
+  <g fill="none" stroke="#bdd3f4" stroke-width="8">
+    <ellipse cx="512" cy="500" rx="402" ry="214" transform="rotate(-9 512 500)"/>
+    <ellipse cx="512" cy="500" rx="306" ry="264" transform="rotate(36 512 500)"/>
+  </g>
+
+  <g filter="url(#tile-shadow)">
+    <rect x="252" y="236" width="520" height="520" rx="156" fill="url(#tile)"/>
+    <rect x="256" y="240" width="512" height="512" rx="152" fill="none" stroke="#c6d8f3" stroke-width="8"/>
+  </g>
+
+  <g fill="none" stroke="#2f6edb" stroke-linecap="round" stroke-linejoin="round" stroke-width="28">
+    <ellipse cx="512" cy="382" rx="160" ry="56"/>
+    <path d="M352 382v252c0 31 72 56 160 56s160-25 160-56V382"/>
+    <path d="M352 508c0 31 72 56 160 56s160-25 160-56"/>
+  </g>
+
+  <g>
+    <circle cx="766" cy="286" r="42" fill="#d9e8fa" opacity=".92"/>
+    <circle cx="766" cy="286" r="29" fill="#ffffff"/>
+    <circle cx="766" cy="286" r="16" fill="#3378df"/>
+
+    <circle cx="196" cy="604" r="42" fill="#d5ecea" opacity=".92"/>
+    <circle cx="196" cy="604" r="29" fill="#ffffff"/>
+    <circle cx="196" cy="604" r="16" fill="#11998d"/>
+
+    <circle cx="748" cy="668" r="55" fill="#d1eae7" opacity=".94"/>
+    <circle cx="748" cy="668" r="38" fill="#ffffff"/>
+    <circle cx="748" cy="668" r="21" fill="#169889"/>
+
+    <circle cx="584" cy="782" r="42" fill="#e1ddf9" opacity=".94"/>
+    <circle cx="584" cy="782" r="29" fill="#ffffff"/>
+    <circle cx="584" cy="782" r="16" fill="#735ad9"/>
+  </g>
+</svg>

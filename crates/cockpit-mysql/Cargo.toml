@@ -1,0 +1,19 @@
+[package]
+name = "cockpit-mysql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+futures.workspace = true
+cockpit-core = { path = "../cockpit-core" }
+mysql_async.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true

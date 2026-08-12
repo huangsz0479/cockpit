@@ -1,0 +1,73 @@
+name: Desktop installers
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [release]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-installers-release
+  cancel-in-progress: true
+
+jobs:
+  package:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            args: --target universal-apple-darwin --bundles dmg
+          - platform: windows-latest
+            rust_targets: ""
+            args: --bundles nsis,msi
+          - platform: ubuntu-22.04
+            rust_targets: ""
+            args: --bundles appimage,deb
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libsecret-1-dev
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and publish installers
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: preview-v__VERSION__
+          releaseName: Cockpit v__VERSION__ Preview
+          releaseBody: "Automated preview build from the release branch. These packages are not code signed."
+          releaseCommitish: ${{ github.event.workflow_run.head_sha || github.sha }}
+          releaseDraft: false
+          prerelease: true
+          retryAttempts: 1
+          args: ${{ matrix.args }}

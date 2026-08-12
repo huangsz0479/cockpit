@@ -1,0 +1,15 @@
+node_modules/
+dist/
+target/
+.DS_Store
+*.log
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+
+.cursor
+.codegraph
+

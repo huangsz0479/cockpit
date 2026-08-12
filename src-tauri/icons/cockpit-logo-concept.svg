@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Cockpit logo concept</title>
+  <desc id="desc">A geometric H encircled by a halo above two stacked data layers.</desc>
+
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="#17191d"/>
+
+  <!-- Rear half of the halo. -->
+  <ellipse
+    cx="512"
+    cy="454"
+    rx="354"
+    ry="150"
+    fill="none"
+    stroke="#2457c5"
+    stroke-width="64"
+  />
+
+  <!-- The H keeps the current icon's initial while replacing the literal cylinder. -->
+  <rect x="286" y="196" width="164" height="470" rx="40" fill="#f7f7f8"/>
+  <rect x="574" y="196" width="164" height="470" rx="40" fill="#f7f7f8"/>
+  <rect x="410" y="394" width="204" height="120" rx="28" fill="#f7f7f8"/>
+
+  <!-- Front half of the halo crosses the H to create the brand's orbital cue. -->
+  <path
+    d="M158 454A354 150 0 0 0 866 454"
+    fill="none"
+    stroke="#7ba2ff"
+    stroke-width="64"
+    stroke-linecap="round"
+  />
+
+  <!-- Two compact data layers remain legible at application-icon sizes. -->
+  <path
+    d="M310 712Q512 830 714 712"
+    fill="none"
+    stroke="#2457c5"
+    stroke-width="72"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M340 806Q512 906 684 806"
+    fill="none"
+    stroke="#7ba2ff"
+    stroke-width="72"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/cockpit-core",
+  "crates/cockpit-mysql",
+  "crates/cockpit-postgres",
+  "crates/cockpit-sqlite",
+  "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.5"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+async-trait = "0.1"
+aes-gcm = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+calamine = "0.36.1"
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
+encoding_rs = "0.8"
+flate2 = "1"
+futures = "0.3"
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls", "chrono", "rust_decimal"] }
+native-tls = "0.2"
+postgres-native-tls = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust_xlsxwriter = "0.96"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "s"
