@@ -495,7 +495,7 @@ kbd { padding: 1px 4px; border: 1px solid var(--accent-border); border-radius: 4
 .data-grid tbody tr.selected td { background: var(--accent-soft); }
 .data-grid tbody tr.inline-insert-row td { background: color-mix(in srgb, var(--accent-soft) 55%, var(--surface-1)); border-top: 1px solid var(--accent); }
 .data-grid tbody tr.inline-insert-row .row-number { color: var(--accent); font-weight: 700; }
-.data-grid tbody tr td.selected-column { background: color-mix(in srgb, var(--accent) 86%, var(--surface-1)); color: #fff; }
+.data-grid tbody tr.data-row td.selected-column { background: color-mix(in srgb, var(--accent) 86%, var(--surface-1)); color: #fff; }
 .data-grid tbody tr td.column-direct-edit-preview { font-weight: 650; }
 .data-grid td.selected-cell { position: relative; z-index: 1; box-shadow: inset 0 0 0 2px var(--accent); }
 .data-grid td[role="gridcell"]:focus { outline: 0; }
