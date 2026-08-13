@@ -1,333 +1,335 @@
-# Cockpit 使用文档
+**English** | [简体中文](README.zh-CN.md)
 
-Cockpit 是一款跨平台桌面数据库客户端，支持 MySQL、MariaDB、PostgreSQL 和 SQLite。本文档面向日常使用者，介绍如何建立连接、执行 SQL、维护数据以及完成导入、导出和备份操作。
+# Cockpit User Guide
 
-## 1. 支持范围
+Cockpit is a cross-platform desktop database client supporting MySQL, MariaDB, PostgreSQL, and SQLite. This guide is intended for everyday users and explains how to create connections, run SQL, manage data, and perform import, export, backup, and restore operations.
 
-| 数据库 | 连接方式 | 说明 |
+## 1. Supported Databases
+
+| Database | Connection methods | Capabilities |
 | --- | --- | --- |
-| MySQL / MariaDB | 直连、TLS、SSH Agent、SSH 私钥 | 支持查询、数据编辑、结构管理、导入导出和备份恢复 |
-| PostgreSQL | 直连、TLS | 支持查询、数据编辑、对象管理和备份恢复，暂不支持 SSH 隧道 |
-| SQLite | 本地数据库文件 | 无需主机、端口、用户名和密码 |
+| MySQL / MariaDB | Direct, TLS, SSH Agent, SSH private key | Queries, data editing, schema management, import/export, and backup/restore |
+| PostgreSQL | Direct, TLS | Queries, data editing, object management, and backup/restore; SSH tunneling is not currently supported |
+| SQLite | Local database file | No host, port, username, or password required |
 
-不同数据库提供的对象类型和管理能力有所差异，Cockpit 会根据当前连接自动显示可用操作。
+Available object types and management features vary by database. Cockpit automatically shows the operations supported by the current connection.
 
-## 2. 启动 Cockpit
+## 2. Starting Cockpit
 
-### 使用安装包
+### Using an Installer
 
-下载适合当前操作系统的安装包并按提示安装：
+Download the installer for your operating system and follow the installation prompts:
 
-- Windows：NSIS 或 MSI 安装包
-- macOS：DMG 安装包
-- Linux：AppImage 或 DEB 安装包
+- Windows: NSIS or MSI installer
+- macOS: DMG installer
+- Linux: AppImage or DEB package
 
-### 从源码启动
+### Starting from Source
 
-开发环境需要 Node.js `20.19+`、npm `10+`、Rust `1.88+` 以及当前平台所需的 Tauri 2 系统依赖。
+The development environment requires Node.js `20.19+`, npm `10+`, Rust `1.88+`, and the Tauri 2 system dependencies for your platform.
 
-```bash
+~~~bash
 npm install
 npm run dev:tauri
-```
+~~~
 
-首次启动需要下载并编译依赖，耗时通常比后续启动更长。
+The first launch downloads and compiles dependencies, so it usually takes longer than subsequent launches.
 
-## 3. 界面说明
+## 3. Interface Overview
 
-Cockpit 主界面分为三个区域：
+The Cockpit window has three main areas:
 
-1. 顶部工具栏：新建连接、新建查询、打开 SQL 文件和打开设置。
-2. 左侧资源管理器：管理连接，并浏览数据库、表、视图、函数、存储过程、事件和触发器。
-3. 中央工作区：通过标签页显示 SQL 编辑器、查询结果、表数据和对象设计器。
+1. Top toolbar: create a connection, create a query, open an SQL file, or open Settings.
+2. Left explorer: manage connections and browse databases, tables, views, functions, stored procedures, events, and triggers.
+3. Center workspace: display the SQL editor, query results, table data, and object designers in tabs.
 
-连接、数据库、对象分组和数据表均提供右键菜单。常见的新建、刷新、备份、结构设计和删除操作可以从对应对象的右键菜单进入。
+Connections, databases, object groups, and tables all provide context menus. Common create, refresh, backup, schema design, and delete operations are available from the context menu of the relevant object.
 
-## 4. 建立数据库连接
+## 4. Creating a Database Connection
 
-### 4.1 新建连接
+### 4.1 Create a Connection
 
-1. 点击顶部的 **新建连接**。
-2. 选择数据库类型。
-3. 填写连接名称和连接信息：
-   - MySQL、MariaDB、PostgreSQL：填写主机、端口、用户名和密码；默认数据库可不填。
-   - SQLite：选择本地 `.db`、`.sqlite` 或 `.sqlite3` 文件。
-4. 根据需要设置连接分组。
-5. 点击 **测试连接**，确认服务器版本和连接状态。
-6. 点击 **保存连接**。
+1. Click **New Connection** in the top toolbar.
+2. Select the database type.
+3. Enter a connection name and connection details:
+   - MySQL, MariaDB, and PostgreSQL: enter the host, port, username, and password. The default database is optional.
+   - SQLite: select a local `.db`, `.sqlite`, or `.sqlite3` file.
+4. Optionally assign the connection to a group.
+5. Click **Test Connection** to verify the server version and connection status.
+6. Click **Save Connection**.
 
-密码由操作系统凭据库保存，不会写入 Cockpit 的本地项目数据库。
+Passwords are stored in the operating system credential store and are not written to Cockpit's local project database.
 
-### 4.2 安全标记
+### 4.2 Safety Labels
 
-- **只读连接**：在驱动层阻止写入语句，适合查询生产数据或共享只读账号。
-- **生产环境**：在连接和查询标签上显示醒目标识，便于区分生产与测试环境。
+- **Read-only connection**: blocks write statements at the driver layer. Use it when querying production data or working with a shared read-only account.
+- **Production environment**: shows a prominent indicator on the connection and query tabs, helping distinguish production from test environments.
 
-对于重要数据库，建议同时启用生产环境标记，并在不需要写入时启用只读连接。
+For important databases, enable the production environment label and also enable read-only mode whenever writes are unnecessary.
 
-### 4.3 TLS 和 SSH
+### 4.3 TLS and SSH
 
-展开 **高级连接设置** 可以配置：
+Expand **Advanced Connection Settings** to configure:
 
-- TLS 模式：关闭、优先、必须、校验 CA 或校验主机名
-- CA 证书、客户端证书和客户端私钥
-- 连接超时、查询超时和连接池上限
-- 连接标识色
+- TLS mode: Disabled, Preferred, Required, Verify CA, or Verify Hostname
+- CA certificate, client certificate, and client private key
+- Connection timeout, query timeout, and maximum connection pool size
+- Connection color
 
-MySQL 和 MariaDB 还可以启用 SSH 隧道，并使用 SSH Agent 或私钥认证。首次连接 SSH 主机时，请先向服务器管理员核对公钥指纹；如果已保存的主机密钥发生变化，不要在原因不明时直接接受新密钥。
+MySQL and MariaDB also support SSH tunneling with SSH Agent or private-key authentication. Before connecting to an SSH host for the first time, verify its public-key fingerprint with the server administrator. If a saved host key changes, do not accept the new key until you understand why it changed.
 
-### 4.4 连接与断开
+### 4.4 Connect and Disconnect
 
-- 单击左侧连接名称前的箭头可连接并展开资源树。
-- 单击数据库名称可加载其表和其他对象。
-- 将鼠标移到连接上，可使用编辑和断开按钮。
-- 右键连接可执行连接、编辑、断开或删除连接配置。
+- Click the arrow before a connection name in the explorer to connect and expand its resource tree.
+- Click a database name to load its tables and other objects.
+- Hover over a connection to use its edit and disconnect buttons.
+- Right-click a connection to connect, edit, disconnect, or delete its configuration.
 
-删除连接只会移除本地配置，不会删除服务器中的数据库或数据。
+Deleting a connection only removes its local configuration. It does not delete any database or data from the server.
 
-## 5. 浏览数据库对象
+## 5. Browsing Database Objects
 
-连接成功后，左侧资源管理器按数据库展示以下对象：
+After connecting, the explorer displays these objects for each database:
 
-- 表
-- 视图
-- 函数和存储过程
-- 事件
-- 触发器
+- Tables
+- Views
+- Functions and stored procedures
+- Events
+- Triggers
 
-常用操作：
+Common operations:
 
-- 双击表或按 `Enter`：预览表数据。
-- 右键表：预览前 100 行、生成 `SELECT`、设计表结构、复制名称、清空表或删除表。
-- 双击视图、函数、存储过程、事件或触发器：查看定义。
-- 右键对象分组：新建对象、创建查询或刷新列表。
-- 右键数据库：打开、刷新、备份、恢复 SQL 备份或进行结构对比。
+- Double-click a table or press `Enter` to preview its data.
+- Right-click a table to preview the first 100 rows, generate a `SELECT`, design its schema, copy its name, truncate it, or drop it.
+- Double-click a view, function, stored procedure, event, or trigger to view its definition.
+- Right-click an object group to create an object, create a query, or refresh the list.
+- Right-click a database to open or refresh it, create a backup, restore an SQL backup, or compare schemas.
 
-清空表、删除表、删除数据库等操作不可撤销，执行前请仔细核对确认窗口中的目标名称。
+Truncating a table, dropping a table, and dropping a database cannot be undone. Carefully verify the target name in the confirmation dialog before continuing.
 
-## 6. 使用 SQL 工作区
+## 6. Using the SQL Workspace
 
-### 6.1 新建或打开查询
+### 6.1 Create or Open a Query
 
-- 点击顶部 **新建查询** 创建空白 SQL 标签页。
-- 点击 **打开 SQL** 加载本地 `.sql` 文件。
-- 在查询工具栏中选择执行所用的连接和数据库。
-- 点击 **保存** 保存当前 SQL；首次保存时需要选择文件位置。
+- Click **New Query** in the top toolbar to create an empty SQL tab.
+- Click **Open SQL** to load a local `.sql` file.
+- Select the connection and database to use from the query toolbar.
+- Click **Save** to save the current SQL. The first save prompts you to choose a file location.
 
-工作区开启自动保存后，会恢复查询标签、SQL 内容和最近的工作状态。未保存到文件的工作区内容不能替代正式备份。
+When workspace autosave is enabled, Cockpit restores query tabs, SQL content, and recent workspace state. Workspace content that has not been saved to a file is not a substitute for a proper backup.
 
-### 6.2 编写和执行 SQL
+### 6.2 Write and Run SQL
 
-编辑器会根据当前数据库提供语法高亮、补全和格式化：
+The editor provides syntax highlighting, completion, and formatting for the current database:
 
-1. 输入 SQL，并确认查询工具栏中的连接和数据库。
-2. 如需只执行部分内容，先选中目标 SQL；未选择文本时会执行光标所在语句。
-3. 点击 **执行**，或使用 `Ctrl+Enter`；macOS 使用 `⌘+Enter`。
-4. 在下方结果区查看数据、影响行数、执行信息或多结果集。
-5. 长时间运行的查询可点击 **停止** 取消。
+1. Enter SQL and verify the connection and database in the query toolbar.
+2. To run only part of the content, select the target SQL first. When no text is selected, Cockpit runs the statement at the cursor.
+3. Click **Run**, or press `Ctrl+Enter`; on macOS, press `⌘+Enter`.
+4. Review data, affected-row counts, execution information, or multiple result sets in the results area below.
+5. Click **Stop** to cancel a long-running query.
 
-如果 SQL 中包含参数占位符，执行前会弹出参数填写窗口。
+If the SQL contains parameter placeholders, Cockpit prompts you to enter values before execution.
 
-### 6.3 事务
+### 6.3 Transactions
 
-点击查询工具栏中的 **事务** 可以为当前标签页开启事务。事务开始后：
+Click **Transaction** in the query toolbar to start a transaction for the current tab. After a transaction begins:
 
-- 点击 **提交** 永久保存修改。
-- 点击 **回滚** 撤销当前事务中的修改。
-- 关闭标签、切换连接或断开连接时，Cockpit 会提示处理尚未提交的事务。
+- Click **Commit** to save changes permanently.
+- Click **Rollback** to undo changes made in the current transaction.
+- Cockpit prompts you to resolve uncommitted transactions when closing the tab, switching connections, or disconnecting.
 
-每个查询或数据标签页使用独立会话，一个标签页中的事务不会自动应用到其他标签页。
+Each query or data tab uses an independent session. A transaction in one tab does not automatically apply to another tab.
 
-### 6.4 查询结果
+### 6.4 Query Results
 
-结果区支持：
+The results area supports:
 
-- 多结果集切换和分页
-- 当前页搜索、排序和筛选
-- 调整列宽、隐藏列、调整列顺序和冻结列
-- 结果分析和数值概要
-- 复制当前行或当前页
-- 导出当前页或完整查询结果
+- Multiple result sets and pagination
+- Search, sorting, and filtering on the current page
+- Column resizing, hiding, reordering, and freezing
+- Result analysis and numeric summaries
+- Copying the current row or current page
+- Exporting the current page or the complete query result
 
-并非所有 SQL 都能安全转换为完整分页查询；此时只能导出当前页。
+Not every SQL statement can be safely converted into a fully paginated query. In those cases, only the current page can be exported.
 
-## 7. 查看和编辑表数据
+## 7. Viewing and Editing Table Data
 
-双击资源树中的表后，Cockpit 会打开数据标签页。
+Double-click a table in the resource tree to open it in a data tab.
 
-### 7.1 筛选与分页
+### 7.1 Filtering and Pagination
 
-- 使用工具栏中的页内搜索快速筛选当前页。
-- 使用列标题菜单进行排序或筛选。
-- 使用右下角的上一页、下一页按钮翻页。
-- 调整设置中的表格分页大小可以改变每页读取行数。
+- Use the toolbar search to quickly filter the current page.
+- Use column-header menus to sort or filter.
+- Use the Previous and Next buttons in the lower-right corner to move between pages.
+- Change the table page size in Settings to control how many rows are loaded per page.
 
-页内搜索只作用于已加载的当前页；要缩小服务器端结果范围，请使用列筛选或编写带 `WHERE` 条件的查询。
+Page search only applies to the currently loaded page. To narrow results on the server, use column filters or write a query with a `WHERE` clause.
 
-### 7.2 新增和修改
+### 7.2 Add and Edit Rows
 
-- 点击 **新增**，在表格内填写新行，按 `Enter` 保存，按 `Esc` 取消。
-- 选择一行后点击 **编辑**，修改单元格并保存。
-- 勾选多行后，在 **更多** 菜单中使用 **批量修改**。
-- 可空字段可以显式设为 `NULL`；具有数据库默认值的字段可以保留默认值。
+- Click **Add**, enter values in the new row, press `Enter` to save, or press `Esc` to cancel.
+- Select a row and click **Edit** to change cells and save the row.
+- Select multiple rows and choose **Bulk Edit** from the **More** menu.
+- Nullable fields can be explicitly set to `NULL`. Fields with database defaults can be left at their default values.
 
-行编辑需要表中存在主键或唯一键。保存时 Cockpit 会同时检查原值；如果该行已被其他会话修改，会停止写入并提示冲突。
+Row editing requires a primary key or unique key. When saving, Cockpit also checks the original values. If another session has already changed the row, Cockpit stops the write and reports a conflict.
 
-### 7.3 删除
+### 7.3 Delete Rows
 
-- 选择一行并点击 **删除** 可删除当前行。
-- 勾选多行后，在 **更多** 菜单中选择 **批量删除**。
+- Select a row and click **Delete** to remove it.
+- Select multiple rows and choose **Bulk Delete** from the **More** menu.
 
-批量写入会尽量在事务中完成；发生错误时会回滚已执行的同批修改。删除前仍应确认选中的连接、数据库和行数。
+Cockpit attempts to perform bulk writes in a transaction and rolls back changes from the same batch when an error occurs. Even so, verify the selected connection, database, and row count before deleting.
 
-### 7.4 特殊数据
+### 7.4 Special Data Types
 
-- JSON 内容可以格式化查看。
-- 二进制字段可以预览或保存到文件。
-- 日期时间字段提供适配的数据输入方式。
-- 高精度数值按文本精确显示，避免前端浮点转换造成精度丢失。
+- JSON content can be viewed with formatting.
+- Binary fields can be previewed or saved to a file.
+- Date and time fields provide appropriate input controls.
+- High-precision numbers are displayed as exact text to avoid precision loss from frontend floating-point conversion.
 
-## 8. 表结构和数据库对象
+## 8. Table Schemas and Database Objects
 
-### 8.1 新建表
+### 8.1 Create a Table
 
-右键数据库下的 **表** 分组，选择 **新建表**。在设计器中填写表名、字段、类型、可空、默认值、主键、索引和外键等信息，然后预览并执行生成的 SQL。
+Right-click the **Tables** group under a database and select **New Table**. In the designer, enter the table name, columns, types, nullability, default values, primary key, indexes, foreign keys, and other details. Preview and run the generated SQL when ready.
 
-PostgreSQL 会打开预填充的建表 SQL，可在执行前自行调整。
+For PostgreSQL, Cockpit opens prefilled `CREATE TABLE` SQL that you can adjust before running it.
 
-### 8.2 修改表结构
+### 8.2 Modify a Table Schema
 
-右键现有表并选择 **设计表结构**，修改字段或索引后先检查生成的 `ALTER SQL`，确认无误再执行。
+Right-click an existing table and select **Design Table Schema**. After changing columns or indexes, review the generated `ALTER SQL` before running it.
 
-### 8.3 其他对象
+### 8.3 Other Objects
 
-可以从对应分组的右键菜单新建或编辑视图、函数、存储过程、触发器和事件。SQLite 不支持存储过程、函数和事件；PostgreSQL 不支持 MySQL `EVENT`。
+Use the context menu on the relevant group to create or edit views, functions, stored procedures, triggers, and events. SQLite does not support stored procedures, functions, or events. PostgreSQL does not support MySQL `EVENT` objects.
 
-### 8.4 结构对比
+### 8.4 Schema Comparison
 
-右键数据库并选择 **结构对比**，选择另一个数据库作为目标。Cockpit 会显示结构差异，并生成迁移 SQL 和回滚 SQL。执行前应先在测试环境验证生成结果。
+Right-click a database, select **Schema Comparison**, and choose another database as the target. Cockpit displays schema differences and generates migration and rollback SQL. Validate the generated output in a test environment before running it.
 
-## 9. 导入和导出
+## 9. Import and Export
 
-### 9.1 导入表数据
+### 9.1 Import Table Data
 
-1. 打开目标表。
-2. 点击 **更多**，选择 **导入数据**。
-3. 选择 CSV、TSV、TXT、XLSX、XLS 或 XLSB 文件。
-4. 对 CSV 文件确认编码和分隔符；对 Excel 文件选择工作表。
-5. 检查源字段到目标字段的映射，不需要的字段可设为忽略。
-6. 选择冲突策略：遇错停止、忽略重复键、替换整行或更新重复键。
-7. 设置批次大小和 `NULL` 标记后开始导入。
+1. Open the target table.
+2. Click **More** and select **Import Data**.
+3. Select a CSV, TSV, TXT, XLSX, XLS, or XLSB file.
+4. For CSV files, verify the encoding and delimiter. For Excel files, select a worksheet.
+5. Review the source-to-target column mapping. Set columns you do not need to Ignore.
+6. Choose a conflict strategy: Stop on Error, Ignore Duplicate Keys, Replace Entire Row, or Update Duplicate Keys.
+7. Set the batch size and `NULL` marker, then start the import.
 
-导入前请仔细核对字段类型、唯一键和冲突策略。使用“替换整行”时，文件中未提供的值可能受到数据库替换语义影响。
+Before importing, carefully review data types, unique keys, and the conflict strategy. When using Replace Entire Row, values not provided in the file may be affected by the database's replacement semantics.
 
-### 9.2 导出数据
+### 9.2 Export Data
 
-支持 TXT、SQL、CSV 和 Excel（`.xlsx`）格式：
+Cockpit supports TXT, SQL, CSV, and Excel (`.xlsx`) exports:
 
-- 查询结果：点击查询工具栏的 **导出**，选择当前页或全部。
-- 表数据：打开表后，在 **更多** 菜单的导出区域选择当前页或整表。
+- Query results: click **Export** in the query toolbar and choose the current page or all results.
+- Table data: open the table and choose the current page or entire table from the export section of the **More** menu.
 
-大数据量导出会显示进度。导出 CSV 时，Cockpit 默认防护以 `= + - @` 开头的电子表格公式，降低文件被 Excel 等工具打开时执行公式的风险。
+Progress is displayed for large exports. By default, Cockpit protects CSV values beginning with `= + - @` from being interpreted as spreadsheet formulas, reducing the risk of formula execution when the file is opened in Excel or similar applications.
 
-### 9.3 导入 SQL 文件
+### 9.3 Import an SQL File
 
-右键目标数据库并选择 **恢复 SQL 备份**，然后选择 SQL 文件。恢复会执行文件中的语句，可能覆盖或删除现有对象和数据，建议先备份当前数据库。
+Right-click the target database, select **Restore SQL Backup**, and choose an SQL file. Restoring executes statements from the file and may overwrite or delete existing objects and data. Back up the current database first.
 
-## 10. 备份与恢复
+## 10. Backup and Restore
 
-### 10.1 手动备份
+### 10.1 Manual Backup
 
-1. 在设置的 **备份与导出** 中选择是否包含表数据、是否使用 Gzip 压缩以及是否加密。
-2. 右键目标数据库，选择 **备份数据库**。
-3. 选择输出位置。
-4. 如果启用了加密，输入至少 8 个字符的备份密码。
+1. Under **Backup & Export** in Settings, choose whether to include table data, use Gzip compression, or enable encryption.
+2. Right-click the target database and select **Back Up Database**.
+3. Choose an output location.
+4. If encryption is enabled, enter a backup password of at least eight characters.
 
-备份完成后会显示表、对象和数据行数量，并生成 SHA-256 校验值。加密使用 AES-256-GCM；密码不会被保存，丢失后无法恢复备份内容。
+When the backup finishes, Cockpit displays the numbers of tables, objects, and data rows and generates a SHA-256 checksum. Encryption uses AES-256-GCM. The password is not stored, and a lost password cannot be recovered.
 
-### 10.2 恢复备份
+### 10.2 Restore a Backup
 
-右键目标数据库并选择 **恢复 SQL 备份**。如果备份经过压缩或加密，Cockpit 会在恢复过程中进行相应处理；加密备份必须提供创建时使用的密码。
+Right-click the target database and select **Restore SQL Backup**. If the backup is compressed or encrypted, Cockpit handles it during restoration. An encrypted backup requires the password used when it was created.
 
-恢复前建议：
+Before restoring:
 
-1. 先为当前数据库创建一份新备份。
-2. 确认当前连接不是只读连接。
-3. 确认备份所属的数据库类型和目标数据库一致。
-4. 在测试环境验证恢复结果后再处理生产数据库。
+1. Create a fresh backup of the current database.
+2. Verify that the current connection is not read-only.
+3. Verify that the backup's database type matches the target database.
+4. Test the restore in a non-production environment before restoring production data.
 
-### 10.3 定时备份
+### 10.3 Scheduled Backups
 
-定时备份仅在 Cockpit 运行期间生效。应用退出、目标连接未打开或电脑休眠时，Cockpit 无法像系统后台服务一样保证按时执行计划；关键生产备份应同时使用服务器或操作系统级备份方案。
+Scheduled backups only run while Cockpit is open. If the application is closed, the target connection is disconnected, or the computer is asleep, Cockpit cannot guarantee that a schedule will run like a system background service. Important production backups should also use server-level or operating-system-level backup solutions.
 
-## 11. 设置与诊断
+## 11. Settings and Diagnostics
 
-点击顶部 **设置** 可以调整：
+Click **Settings** in the top toolbar to configure:
 
-- 查询和表格的分页大小
-- 是否显示系统数据库
-- 工作区自动保存
-- 编辑器字号和 Tab 宽度
-- 默认导出格式、备份内容、压缩和加密
-- 高风险 SQL 确认
-- 更新检查地址和启动时检查更新
+- Query and table page sizes
+- Whether system databases are shown
+- Workspace autosave
+- Editor font size and tab width
+- Default export format, backup content, compression, and encryption
+- High-risk SQL confirmation
+- Update manifest URL and update checks on startup
 
-设置窗口中的 **诊断日志** 可用于排查连接或执行问题。日志会对敏感连接信息脱敏；分享日志前仍建议检查其中是否包含业务表名、SQL 或其他内部信息。
+Use **Diagnostic Logs** in Settings to investigate connection or execution issues. Logs redact sensitive connection information, but you should still check for business table names, SQL, or other internal information before sharing them.
 
-## 12. 快捷键
+## 12. Keyboard Shortcuts
 
-Windows 和 Linux 使用 `Ctrl`，macOS 使用 `⌘`。
+Windows and Linux use `Ctrl`; macOS uses `⌘`.
 
-| 操作 | Windows / Linux | macOS |
+| Action | Windows / Linux | macOS |
 | --- | --- | --- |
-| 新建查询 | `Ctrl+N` | `⌘+N` |
-| 打开 SQL 文件 | `Ctrl+O` | `⌘+O` |
-| 保存当前 SQL | `Ctrl+S` | `⌘+S` |
-| 另存当前 SQL | `Ctrl+Shift+S` | `⌘+Shift+S` |
-| 执行选区；无选区时执行全部 SQL | `Ctrl+Enter` | `⌘+Enter` |
-| 关闭当前标签 | `Ctrl+W` | `⌘+W` |
-| 打开设置 | `Ctrl+,` | `⌘+,` |
-| 关闭当前弹窗或菜单 | `Esc` | `Esc` |
+| New query | `Ctrl+N` | `⌘+N` |
+| Open SQL file | `Ctrl+O` | `⌘+O` |
+| Save current SQL | `Ctrl+S` | `⌘+S` |
+| Save current SQL as | `Ctrl+Shift+S` | `⌘+Shift+S` |
+| Run the selection; when there is no selection, run all SQL | `Ctrl+Enter` | `⌘+Enter` |
+| Close current tab | `Ctrl+W` | `⌘+W` |
+| Open Settings | `Ctrl+,` | `⌘+,` |
+| Close current dialog or menu | `Esc` | `Esc` |
 
-## 13. 安全建议
+## 13. Security Recommendations
 
-- 生产连接应启用 **生产环境** 标记；日常查询优先使用 **只读连接**。
-- 执行 `UPDATE`、`DELETE`、DDL 或无法可靠分类的 SQL 前，认真核对确认提示。
-- 无 `WHERE` 的 `UPDATE` / `DELETE` 以及 `DROP` / `TRUNCATE` 会被标记为高风险操作。
-- 不要关闭高风险 SQL 确认来加快批量操作；应先在事务或测试环境中验证语句。
-- 导入、恢复、结构迁移和批量修改前先创建可用备份。
-- 不要将连接密码、SSH 私钥或备份密码写入 SQL 文件、截图或问题报告。
+- Enable the **Production Environment** label for production connections. Prefer a **Read-only Connection** for routine queries.
+- Carefully review confirmation prompts before running `UPDATE`, `DELETE`, DDL, or SQL that cannot be reliably classified.
+- Cockpit marks `UPDATE` / `DELETE` statements without a `WHERE` clause and `DROP` / `TRUNCATE` statements as high risk.
+- Do not disable high-risk SQL confirmation to speed up bulk operations. Validate statements in a transaction or test environment first.
+- Create a usable backup before importing, restoring, migrating schemas, or making bulk changes.
+- Do not put connection passwords, SSH private keys, or backup passwords in SQL files, screenshots, or issue reports.
 
-## 14. 常见问题
+## 14. Troubleshooting
 
-### 无法连接数据库
+### Cannot Connect to a Database
 
-依次检查主机和端口、用户名和密码、数据库服务监听地址、防火墙、账号来源限制以及 TLS 配置。使用 SSH 时，还需确认跳板机地址、SSH 用户、Agent 或私钥可用，并核对主机密钥指纹。
+Check the host and port, username and password, database server bind address, firewall, account host restrictions, and TLS configuration. For SSH connections, also verify the bastion host address, SSH user, Agent or private key availability, and host-key fingerprint.
 
-### 可以查询但不能修改数据
+### Queries Work, but Data Cannot Be Modified
 
-检查连接是否启用了只读模式、数据库账号是否有写权限、当前表是否存在主键或唯一键，以及是否有未结束的事务。Cockpit 不允许在无法可靠定位行时执行行编辑或删除。
+Check whether the connection is read-only, the database account has write permissions, the table has a primary or unique key, and there is an unfinished transaction. Cockpit does not allow row editing or deletion when it cannot reliably identify a row.
 
-### 完整导出按钮不可用
+### Complete Export Is Unavailable
 
-当前 SQL 可能无法安全分页。可以改用结构清晰的单表 `SELECT`、缩小查询范围后逐页导出，或直接打开表并使用整表导出。
+The current SQL may not support safe pagination. Try a straightforward single-table `SELECT`, narrow the query and export it page by page, or open the table directly and export the entire table.
 
-### PostgreSQL 中看不到 SSH 设置
+### SSH Settings Are Missing for PostgreSQL
 
-当前 PostgreSQL 驱动只支持直连和 TLS，不支持 SSH 隧道。可以在系统外部建立端口转发，再将 Cockpit 连接到本地转发端口。
+The current PostgreSQL driver supports direct and TLS connections but not SSH tunneling. You can create port forwarding outside Cockpit and connect Cockpit to the local forwarded port.
 
-### 定时备份没有执行
+### A Scheduled Backup Did Not Run
 
-定时备份要求 Cockpit 保持运行且目标连接处于已连接状态。它不是操作系统后台任务，应用退出后不会继续执行。
+Scheduled backups require Cockpit to remain open and the target connection to stay connected. They are not operating-system background tasks and do not continue after the application exits.
 
-## 15. 已知限制
+## 15. Known Limitations
 
-- PostgreSQL 暂不支持 SSH 隧道。
-- 更新检查只读取用户配置的 HTTPS JSON 清单并提示，不会自动下载或安装新版本。
-- 定时备份仅在 Cockpit 运行期间生效。
-- CSV 和 Excel 导入会在提交前将已解析数据保留在内存中，超大文件建议分批处理。
-- 不同数据库版本和账号权限可能导致部分元数据或管理功能不可用。
+- PostgreSQL does not currently support SSH tunneling.
+- Update checks only read a user-configured HTTPS JSON manifest and display a notification. They do not automatically download or install updates.
+- Scheduled backups only run while Cockpit is open.
+- CSV and Excel imports retain parsed data in memory until submission. Split very large files into smaller batches.
+- Some metadata or management features may be unavailable depending on the database version and account permissions.
 
-## 许可证
+## License
 
-Cockpit 基于 [Apache License 2.0](LICENSE) 发布。
+Cockpit is released under the [Apache License 2.0](LICENSE).
