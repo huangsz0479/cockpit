@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import { X } from "lucide-vue-next";
+import AppDialog from "@/components/AppDialog.vue";
 import AppSelect from "@/components/AppSelect.vue";
 import { api } from "@/lib/api";
 import { alterTableSql, tableDetailToDefinition } from "@/lib/sql";
@@ -268,9 +268,7 @@ async function compare() {
 </script>
 
 <template>
-  <div class="dialog-backdrop" @mousedown.self="emit('close')">
-    <section class="dialog schema-compare-dialog" role="dialog" aria-modal="true" aria-labelledby="schema-compare-title">
-      <header><div><h2 id="schema-compare-title">结构对比</h2><p>跨连接比较全部数据库对象，并生成迁移与回滚脚本</p></div><button class="icon-button" aria-label="关闭结构对比" @click="emit('close')"><X :size="15" /></button></header>
+  <AppDialog title="结构对比" title-id="schema-compare-title" description="跨连接比较全部数据库对象，并生成迁移与回滚脚本" dialog-class="schema-compare-dialog" close-label="关闭结构对比" @close="emit('close')">
       <div class="schema-compare-endpoints">
         <fieldset><legend>源</legend><AppSelect v-model="sourceConnectionId" :options="connections.map((connection) => ({ value: connection.id, label: connection.name }))" label="源连接" /><AppSelect v-model="source" :options="sourceDatabases.map((database) => ({ value: database.name, label: database.name }))" label="源数据库" /></fieldset>
         <span>→</span>
@@ -280,7 +278,6 @@ async function compare() {
       <label class="schema-drop-option"><input v-model="includeDrops" type="checkbox" /><span><strong>迁移脚本包含删除目标多余对象 <b>高风险</b></strong><small>启用后会同时生成回滚定义；执行前仍应逐条审查迁移 SQL。</small></span></label>
       <p v-if="error" class="error-banner">{{ error }}</p>
       <div class="schema-compare-results"><pre>{{ report || '选择源和目标后开始比较' }}</pre><div><nav><button :class="{ active: activeScript === 'migration' }" @click="activeScript = 'migration'">迁移 SQL</button><button :class="{ active: activeScript === 'rollback' }" @click="activeScript = 'rollback'">回滚 SQL</button></nav><pre>{{ script || '-- 脚本将显示在这里' }}</pre></div></div>
-      <footer><button class="secondary" @click="emit('close')">关闭</button><button class="primary" :disabled="!script" @click="emit('openSql', script)">在查询中审查</button></footer>
-    </section>
-  </div>
+      <template #footer><button class="secondary" @click="emit('close')">关闭</button><button class="primary" :disabled="!script" @click="emit('openSql', script)">在查询中审查</button></template>
+  </AppDialog>
 </template>

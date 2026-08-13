@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { RefreshCw, X } from "lucide-vue-next";
+import { RefreshCw } from "lucide-vue-next";
 import { api } from "@/lib/api";
 import { cellText } from "@/lib/cell";
 import { useActionDialog } from "@/lib/actionDialog";
 import ActionDialog from "@/components/ActionDialog.vue";
+import AppDialog from "@/components/AppDialog.vue";
 import type { DatabaseKind, QueryResultPage, ServerLockInfo, ServerMetric, ServerProcessInfo, ServerVariable, UserAccount, UUID } from "@/types";
 
 const props = withDefaults(defineProps<{ connectionId: UUID; databaseKind?: DatabaseKind }>(), { databaseKind: "mysql" });
@@ -132,9 +133,7 @@ onMounted(load);
 </script>
 
 <template>
-  <div class="dialog-backdrop" @mousedown.self="emit('close')">
-    <section class="dialog server-admin-dialog" role="dialog" aria-modal="true" aria-labelledby="server-admin-title">
-      <header><div><h2 id="server-admin-title">服务器管理</h2><p>会话、运行状态与用户权限</p></div><button class="icon-button" aria-label="关闭服务器管理" @click="emit('close')"><X :size="15" /></button></header>
+  <AppDialog title="服务器管理" title-id="server-admin-title" description="会话、运行状态与用户权限" dialog-class="server-admin-dialog" close-label="关闭服务器管理" @close="emit('close')">
       <nav class="admin-tabs" role="tablist" aria-label="服务器管理分类"><button v-for="item in tabs" :key="item" role="tab" :aria-selected="tab === item" :class="{ active: tab === item }" @click="tab = item; filter = ''; load()">{{ item === 'processes' ? '会话' : item === 'status' ? '状态' : item === 'variables' ? '变量' : item === 'locks' ? '锁等待' : item === 'replication' ? '复制 / Binlog' : '用户' }}</button></nav>
       <div class="admin-toolbar"><input v-if="tab === 'status' || tab === 'variables'" v-model="filter" type="search" :aria-label="tab === 'variables' ? '筛选服务器变量' : '筛选服务器状态项'" :placeholder="tab === 'variables' ? '筛选服务器变量' : '筛选状态项'" @keyup.enter="load" /><span class="admin-toolbar-summary">{{ summary }}</span><button class="ghost compact" :disabled="busy" @click="load"><RefreshCw :size="13" :class="{ 'loading-icon': busy }" />刷新</button><button v-if="tab === 'users'" class="ghost compact" @click="newUserSql">新建用户 SQL</button></div>
       <p v-if="error" class="error-banner">{{ error }}</p>
@@ -145,8 +144,7 @@ onMounted(load);
       <div v-else-if="tab === 'replication'" class="admin-content replication-content"><h3>复制状态</h3><table v-if="replication?.rows.length"><tbody><tr v-for="(value, name) in resultRows(replication)[0]" :key="name"><th>{{ name }}</th><td>{{ value }}</td></tr></tbody></table><p v-else class="empty-small">当前实例未返回副本状态</p><h3>Binary Logs</h3><table v-if="binaryLogs?.rows.length"><thead><tr><th v-for="column in binaryLogs.columns" :key="column.name">{{ column.name }}</th></tr></thead><tbody><tr v-for="(row, index) in resultRows(binaryLogs)" :key="index"><td v-for="column in binaryLogs.columns" :key="column.name">{{ row[column.name] }}</td></tr></tbody></table><p v-else class="empty-small">未启用 Binlog 或当前账号无权查看</p></div>
       <div v-else-if="users.length" class="admin-user-layout"><div class="admin-user-list"><button v-for="user in users" :key="user.user + '@' + user.host" :class="{ active: selectedUser === user }" @click="selectUser(user)"><strong>{{ user.user || '(anonymous)' }}@{{ user.host }}</strong><small>{{ user.plugin || 'default' }}{{ user.locked ? ' · LOCKED' : '' }}</small></button></div><div class="admin-grants"><template v-if="selectedUser"><div class="admin-grants-heading"><div><strong>{{ selectedUser.user || '(anonymous)' }}@{{ selectedUser.host }}</strong><span>{{ grants.length }} 条授权</span></div><div class="toolbar-actions"><button class="primary compact" @click="editUserSql(selectedUser)">编辑权限</button><button class="secondary compact" @click="manageUserSql(selectedUser, 'lock')">{{ selectedUser.locked ? '解锁 SQL' : '锁定 SQL' }}</button><button class="danger compact" @click="manageUserSql(selectedUser, 'drop')">删除用户 SQL</button></div></div><pre>{{ grants.join('\n') }}</pre></template><p v-else>选择用户查看权限</p></div></div>
       <div v-else-if="!busy" class="admin-empty"><strong>没有数据库用户</strong><span>当前账号可能没有查看系统用户的权限。</span></div>
-      <footer><span>{{ busy ? '正在加载…' : '' }}</span><button class="secondary" @click="emit('close')">关闭</button></footer>
-    </section>
-    <ActionDialog v-if="actionDialog" :key="actionDialog.id" :state="actionDialog" @confirm="acceptActionDialog" @cancel="cancelActionDialog" />
-  </div>
+      <template #footer><span>{{ busy ? '正在加载…' : '' }}</span><button class="secondary" @click="emit('close')">关闭</button></template>
+  </AppDialog>
+  <ActionDialog v-if="actionDialog" :key="actionDialog.id" :state="actionDialog" @confirm="acceptActionDialog" @cancel="cancelActionDialog" />
 </template>

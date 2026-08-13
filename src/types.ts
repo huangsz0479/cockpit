@@ -191,7 +191,6 @@ export interface AppSettings {
   showSystemDatabases: boolean;
   autoSaveWorkspace: boolean;
   backupIncludeData: boolean;
-  theme?: "system" | "light" | "dark";
   editorFontSize?: number;
   editorTabSize?: number;
   confirmDestructiveQueries?: boolean;

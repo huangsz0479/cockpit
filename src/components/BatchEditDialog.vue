@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { X } from "lucide-vue-next";
+import AppDialog from "@/components/AppDialog.vue";
 import AppSelect from "@/components/AppSelect.vue";
 import type { CellValue, ColumnMeta } from "@/types";
 import { parseRowCell, rowDraftValue, rowInputType } from "@/lib/rowEditing";
@@ -33,4 +33,10 @@ function submit() {
 }
 </script>
 
-<template><div class="dialog-backdrop" @mousedown.self="emit('close')"><form class="dialog batch-edit-dialog" role="dialog" aria-modal="true" aria-labelledby="batch-edit-title" @submit.prevent="submit"><header><div><h2 id="batch-edit-title">批量修改</h2><p>将同一个值写入选中的 {{ selectedCount }} 行，并逐行执行并发校验</p></div><button type="button" class="icon-button" aria-label="关闭批量修改" @click="emit('close')"><X :size="15" /></button></header><div class="settings-form"><label>目标字段<AppSelect v-model="column" :options="columns.map((item) => ({ value: item.name, label: item.name }))" label="目标字段" /></label><label>新值<input v-model="value" :type="inputType" :step="inputType === 'datetime-local' ? 'any' : undefined" :disabled="isNull" autocomplete="off" spellcheck="false" /></label><label class="check-row"><input v-model="isNull" type="checkbox" :disabled="!meta?.nullable" />设置为 NULL</label></div><p v-if="error" class="error-banner">{{ error }}</p><footer><button type="button" class="secondary" @click="emit('close')">取消</button><button class="primary">应用到 {{ selectedCount }} 行</button></footer></form></div></template>
+<template>
+  <AppDialog title="批量修改" title-id="batch-edit-title" :description="`将同一个值写入选中的 ${selectedCount} 行，并逐行执行并发校验`" as="form" dialog-class="batch-edit-dialog" close-label="关闭批量修改" @close="emit('close')" @submit="submit">
+    <div class="settings-form"><label>目标字段<AppSelect v-model="column" :options="columns.map((item) => ({ value: item.name, label: item.name }))" label="目标字段" /></label><label>新值<input v-model="value" :type="inputType" :step="inputType === 'datetime-local' ? 'any' : undefined" :disabled="isNull" autocomplete="off" spellcheck="false" /></label><label class="check-row"><input v-model="isNull" type="checkbox" :disabled="!meta?.nullable" />设置为 NULL</label></div>
+    <p v-if="error" class="error-banner">{{ error }}</p>
+    <template #footer><button type="button" class="secondary" @click="emit('close')">取消</button><button class="primary">应用到 {{ selectedCount }} 行</button></template>
+  </AppDialog>
+</template>

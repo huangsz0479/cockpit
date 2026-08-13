@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { Check, Copy, Download, X } from "lucide-vue-next";
+import { Check, Copy, Download } from "lucide-vue-next";
+import AppDialog from "@/components/AppDialog.vue";
 import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "@/lib/api";
 import { cellText } from "@/lib/cell";
@@ -64,5 +65,8 @@ async function saveBytes() {
 </script>
 
 <template>
-  <div class="dialog-backdrop" @mousedown.self="emit('close')"><section class="dialog cell-viewer-dialog" role="dialog" aria-modal="true" aria-labelledby="cell-viewer-title"><header><div><h2 id="cell-viewer-title">{{ column }}</h2><p>{{ kindLabel }}<template v-if="value.kind === 'bytes'"> · {{ value.value.length.toLocaleString() }} 字节</template></p></div><button class="icon-button" aria-label="关闭字段查看器" @click="emit('close')"><X :size="15" /></button></header><pre>{{ displayed }}</pre><footer><span class="cell-viewer-status" :class="statusKind">{{ status }}</span><button v-if="value.kind === 'bytes'" class="secondary" :disabled="busy" @click="saveBytes"><Download :size="14" />{{ busy ? '保存中…' : '保存文件' }}</button><button class="secondary" @click="copy"><Check v-if="status === '内容已复制'" :size="14" /><Copy v-else :size="14" />复制</button><button class="primary" @click="emit('close')">关闭</button></footer></section></div>
+  <AppDialog :title="column" title-id="cell-viewer-title" :description="`${kindLabel}${value.kind === 'bytes' ? ` · ${value.value.length.toLocaleString()} 字节` : ''}`" dialog-class="cell-viewer-dialog" close-label="关闭字段查看器" @close="emit('close')">
+    <pre>{{ displayed }}</pre>
+    <template #footer><span class="cell-viewer-status" :class="statusKind">{{ status }}</span><button v-if="value.kind === 'bytes'" class="secondary" :disabled="busy" @click="saveBytes"><Download :size="14" />{{ busy ? '保存中…' : '保存文件' }}</button><button class="secondary" @click="copy"><Check v-if="status === '内容已复制'" :size="14" /><Copy v-else :size="14" />复制</button><button class="primary" @click="emit('close')">关闭</button></template>
+  </AppDialog>
 </template>

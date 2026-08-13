@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { BarChart3, X } from "lucide-vue-next";
+import { BarChart3 } from "lucide-vue-next";
+import AppDialog from "@/components/AppDialog.vue";
 import AppSelect from "@/components/AppSelect.vue";
 import { cellText } from "@/lib/cell";
 import type { CellValue, ColumnMeta } from "@/types";
@@ -42,5 +43,9 @@ const emptyMessage = computed(() => {
 </script>
 
 <template>
-  <div class="dialog-backdrop" @mousedown.self="emit('close')"><section class="dialog result-insights-dialog" role="dialog" aria-modal="true" aria-labelledby="result-insights-title"><header><div><h2 id="result-insights-title">结果洞察</h2><p>对当前页进行分组、计数、求和和平均值分析</p></div><button class="icon-button" aria-label="关闭结果洞察" @click="emit('close')"><X :size="15" /></button></header><div class="insight-controls"><label>分组字段<AppSelect v-model="dimension" :options="columns.map((column) => ({ value: column.name, label: column.name }))" label="分组字段" /></label><label>统计方式<AppSelect v-model="aggregation" :options="[{ value: 'count', label: '计数' }, { value: 'sum', label: '求和' }, { value: 'avg', label: '平均值' }]" label="统计方式" /></label><label v-if="aggregation !== 'count'">数值字段<AppSelect v-model="metric" :options="[{ value: '', label: '请选择' }, ...numericColumns.map((column) => ({ value: column.name, label: column.name }))]" label="数值字段" /></label></div><div class="insight-chart"><div v-for="row in chartRows" :key="row.label" class="insight-bar-row"><span>{{ row.label }}</span><div><i :style="{ width: `${row.percent}%` }" /></div><strong>{{ Number.isInteger(row.value) ? row.value.toLocaleString() : row.value.toLocaleString(undefined, { maximumFractionDigits: 3 }) }}</strong></div><div v-if="!chartRows.length" class="dialog-empty-state"><BarChart3 :size="26" /><strong>暂无图表</strong><span>{{ emptyMessage }}</span></div></div><footer><span>最多显示前 30 项</span><button class="secondary" @click="emit('close')">关闭</button></footer></section></div>
+  <AppDialog title="结果洞察" title-id="result-insights-title" description="对当前页进行分组、计数、求和和平均值分析" dialog-class="result-insights-dialog" close-label="关闭结果洞察" @close="emit('close')">
+    <template #icon><BarChart3 :size="18" /></template>
+    <div class="insight-controls"><label>分组字段<AppSelect v-model="dimension" :options="columns.map((column) => ({ value: column.name, label: column.name }))" label="分组字段" /></label><label>统计方式<AppSelect v-model="aggregation" :options="[{ value: 'count', label: '计数' }, { value: 'sum', label: '求和' }, { value: 'avg', label: '平均值' }]" label="统计方式" /></label><label v-if="aggregation !== 'count'">数值字段<AppSelect v-model="metric" :options="[{ value: '', label: '请选择' }, ...numericColumns.map((column) => ({ value: column.name, label: column.name }))]" label="数值字段" /></label></div><div class="insight-chart"><div v-for="row in chartRows" :key="row.label" class="insight-bar-row"><span>{{ row.label }}</span><div><i :style="{ width: `${row.percent}%` }" /></div><strong>{{ Number.isInteger(row.value) ? row.value.toLocaleString() : row.value.toLocaleString(undefined, { maximumFractionDigits: 3 }) }}</strong></div><div v-if="!chartRows.length" class="dialog-empty-state"><BarChart3 :size="26" /><strong>暂无图表</strong><span>{{ emptyMessage }}</span></div></div>
+    <template #footer><span>最多显示前 30 项</span><button class="secondary" @click="emit('close')">关闭</button></template>
+  </AppDialog>
 </template>

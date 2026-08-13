@@ -208,7 +208,6 @@ const DEFAULT_SETTINGS: AppSettings = {
   showSystemDatabases: false,
   autoSaveWorkspace: true,
   backupIncludeData: true,
-  theme: "system",
   editorFontSize: 12,
   editorTabSize: 2,
   confirmDestructiveQueries: true,
@@ -491,12 +490,7 @@ let columnResizeStartX = 0;
 let columnResizeStartWidth = 0;
 let resizingColumnKey: string | null = null;
 let resizingColumnTabId: string | null = null;
-let systemThemeMedia: MediaQueryList | null = null;
 let gridResizeObserver: ResizeObserver | null = null;
-
-function handleSystemThemeChange() {
-  if (settings.value.theme === "system") applySettingsEffects();
-}
 
 function activateWorkspaceTabById(id: string) {
   const tab = workspaceTabs.value.find((item) => item.id === id);
@@ -544,10 +538,6 @@ async function refreshRuntimeStats() {
 }
 
 onMounted(async () => {
-  if (typeof window.matchMedia === "function") {
-    systemThemeMedia = window.matchMedia("(prefers-color-scheme: dark)");
-    systemThemeMedia.addEventListener?.("change", handleSystemThemeChange);
-  }
   applySettingsEffects();
   constrainNavigationWidth();
   window.addEventListener("resize", constrainNavigationWidth);
@@ -585,7 +575,6 @@ onBeforeUnmount(() => {
   if (backupScheduleTimer) clearInterval(backupScheduleTimer);
   if (runtimeStatsTimer) clearInterval(runtimeStatsTimer);
   gridResizeObserver?.disconnect();
-  systemThemeMedia?.removeEventListener?.("change", handleSystemThemeChange);
 });
 
 function persistTransferTasks() {
@@ -780,7 +769,11 @@ watch(gridScroll, (element) => {
 async function loadSettings() {
   try {
     const payload = await api.loadWorkspaceState(SETTINGS_STATE_KEY);
-    if (payload) settings.value = { ...DEFAULT_SETTINGS, ...JSON.parse(payload) as Partial<AppSettings> };
+    if (payload) {
+      const loaded = { ...DEFAULT_SETTINGS, ...JSON.parse(payload) as Partial<AppSettings> } as AppSettings & { theme?: unknown };
+      delete loaded.theme;
+      settings.value = loaded;
+    }
     applySettingsEffects();
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause);
@@ -808,10 +801,7 @@ async function saveSettings(next: AppSettings) {
 }
 
 function applySettingsEffects() {
-  const theme = settings.value.theme ?? "system";
-  document.documentElement.dataset.theme = theme === "system"
-    ? (systemThemeMedia?.matches ? "dark" : "light")
-    : theme;
+  delete document.documentElement.dataset.theme;
   exportFormat.value = settings.value.defaultExportFormat ?? "excel";
   document.documentElement.style.setProperty("--editor-font-size", `${settings.value.editorFontSize ?? 12}px`);
 }

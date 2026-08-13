@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { Ban, CircleCheck, CircleX, LoaderCircle, X } from "lucide-vue-next";
+import { Ban, CircleCheck, CircleX, LoaderCircle } from "lucide-vue-next";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "@/lib/api";
+import AppDialog from "@/components/AppDialog.vue";
 import AppSelect from "@/components/AppSelect.vue";
 import type { BackupSchedule, ConnectionProfile, DatabaseInfo, TransferTask, UUID } from "@/types";
 
@@ -77,9 +78,7 @@ function saveSchedule() {
 </script>
 
 <template>
-  <div class="dialog-backdrop" @mousedown.self="emit('close')">
-    <section class="dialog transfer-center-dialog" role="dialog" aria-modal="true" aria-labelledby="transfer-center-title">
-      <header><div><h2 id="transfer-center-title">任务与备份</h2><p>查看进度、取消任务并配置应用运行期间的定时备份</p></div><button class="icon-button" aria-label="关闭任务与备份" @click="emit('close')"><X :size="15" /></button></header>
+  <AppDialog title="任务与备份" title-id="transfer-center-title" description="查看进度、取消任务并配置应用运行期间的定时备份" dialog-class="transfer-center-dialog" close-label="关闭任务与备份" @close="emit('close')">
       <div class="transfer-center-layout">
         <section>
           <div class="fields-card-header"><strong>任务记录</strong><span>{{ activeTasks.length }} 个运行中</span><button class="link" :disabled="tasks.some((task) => task.status === 'running')" @click="emit('clear')">清空记录</button></div>
@@ -107,7 +106,6 @@ function saveSchedule() {
           <div class="toolbar-actions"><button class="secondary" :disabled="!validSchedule" @click="emit('runNow', currentSchedule())">立即运行</button><button class="primary" :disabled="enabled && !validSchedule" @click="saveSchedule">保存计划</button></div>
         </section>
       </div>
-      <footer><span /><button class="secondary" @click="emit('close')">关闭</button></footer>
-    </section>
-  </div>
+      <template #footer><span /><button class="secondary" @click="emit('close')">关闭</button></template>
+  </AppDialog>
 </template>

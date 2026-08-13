@@ -9,4 +9,10 @@ describe("data grid selection styles", () => {
     expect(styles).toContain(alternateRowSelector);
     expect(styles.indexOf(selectedColumnSelector)).toBeGreaterThan(styles.indexOf(alternateRowSelector));
   });
+
+  it("does not include a dark color scheme", () => {
+    expect(styles).not.toContain('data-theme="dark"');
+    expect(styles).not.toContain("prefers-color-scheme: dark");
+    expect(styles).not.toContain("color-scheme: dark");
+  });
 });

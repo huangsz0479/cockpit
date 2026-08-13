@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
-import { X } from "lucide-vue-next";
+import AppDialog from "@/components/AppDialog.vue";
 import type { CellValue, ColumnInfo, ColumnMeta } from "@/types";
 import { cellText } from "@/lib/cell";
 import {
@@ -120,15 +120,17 @@ function submit() {
 </script>
 
 <template>
-  <div class="dialog-backdrop" @mousedown.self="close" @keydown.esc="close">
-    <form class="dialog row-editor-dialog" role="dialog" aria-modal="true" :aria-labelledby="`row-editor-title-${mode}`" @submit.prevent="submit">
-      <header>
-        <div>
-          <h2 :id="`row-editor-title-${mode}`">{{ mode === 'insert' ? '新增行' : '编辑行' }}</h2>
-          <p>{{ mode === 'insert' ? '带默认值的字段会由数据库自动填写。' : '仅保存有变化的字段，并校验原始值以避免覆盖其他会话的修改。' }}</p>
-        </div>
-        <button type="button" class="icon-button" aria-label="关闭" :disabled="busy" @click="close"><X :size="15" /></button>
-      </header>
+  <AppDialog
+    :title="mode === 'insert' ? '新增行' : '编辑行'"
+    :title-id="`row-editor-title-${mode}`"
+    :description="mode === 'insert' ? '带默认值的字段会由数据库自动填写。' : '仅保存有变化的字段，并校验原始值以避免覆盖其他会话的修改。'"
+    as="form"
+    dialog-class="row-editor-dialog"
+    close-label="关闭"
+    :close-disabled="busy"
+    @close="close"
+    @submit="submit"
+  >
       <div class="row-editor-fields">
         <div v-for="(column, index) in editorColumns" :key="column.meta.name" class="row-editor-field" :data-column="column.meta.name" :class="{ changed: mode === 'update' && changed(column) }">
           <label class="row-editor-field-label" :for="`row-editor-${mode}-${index}`">
@@ -163,10 +165,9 @@ function submit() {
         <p v-if="generatedColumnCount" class="row-editor-generated">{{ generatedColumnCount }} 个生成字段将由数据库自动计算。</p>
       </div>
       <p v-if="displayedError" class="error-banner" role="alert">{{ displayedError }}</p>
-      <footer>
+      <template #footer>
         <button type="button" class="secondary" :disabled="busy" @click="close">取消</button>
         <button class="primary" :disabled="!canSubmit">{{ busy ? '保存中…' : mode === 'update' && !hasChanges ? '没有修改' : '保存' }}</button>
-      </footer>
-    </form>
-  </div>
+      </template>
+  </AppDialog>
 </template>

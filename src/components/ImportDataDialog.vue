@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { FileUp, LoaderCircle, X } from "lucide-vue-next";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { FileUp, LoaderCircle } from "lucide-vue-next";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api } from "@/lib/api";
+import AppDialog from "@/components/AppDialog.vue";
 import AppSelect from "@/components/AppSelect.vue";
 import type {
   ImportColumnMapping, ImportConflictStrategy, ImportFormat, ImportPreview, TransferProgress, UUID,
@@ -144,24 +145,14 @@ async function cancelImport() {
   if (taskId) await api.cancelTransfer(taskId);
 }
 
-function closeOnEscape(event: KeyboardEvent) {
-  if (event.key === "Escape" && !importing.value) emit("close");
-}
-
-onMounted(() => window.addEventListener("keydown", closeOnEscape));
 onBeforeUnmount(() => {
-  window.removeEventListener("keydown", closeOnEscape);
   unlisten?.();
 });
 </script>
 
 <template>
-  <div class="dialog-backdrop" @mousedown.self="!importing && emit('close')">
-    <section class="dialog import-dialog" role="dialog" aria-modal="true" aria-labelledby="import-data-title">
-      <header>
-        <div><h2 id="import-data-title">导入数据</h2><p>{{ database }}.{{ table }} · 预览、字段映射和冲突处理</p></div>
-        <button class="icon-button" :disabled="importing" aria-label="关闭导入数据" @click="emit('close')"><X :size="15" /></button>
-      </header>
+  <AppDialog title="导入数据" title-id="import-data-title" :description="`${database}.${table} · 预览、字段映射和冲突处理`" dialog-class="import-dialog" close-label="关闭导入数据" :close-disabled="importing" @close="emit('close')">
+      <template #icon><FileUp :size="18" /></template>
 
       <div class="import-source-grid">
         <label class="wide">文件<div class="path-field"><input :value="inputPath" readonly placeholder="选择 CSV 或 Excel 文件" /><button class="secondary compact" :disabled="importing" @click="chooseFile">选择</button></div></label>
@@ -191,7 +182,6 @@ onBeforeUnmount(() => {
       <div v-if="progress" class="transfer-progress" role="status"><progress v-if="progressPercent !== null" :value="progressPercent" max="100" aria-label="数据导入进度" /><span>{{ progress.phase }}<template v-if="progressPercent !== null"> · {{ progressPercent }}%</template><template v-if="progress.message"> · {{ progress.message }}</template></span></div>
       <p v-if="resultMessage" class="success">{{ resultMessage }}</p>
       <p v-if="error" class="error-banner" role="alert">{{ error }}</p>
-      <footer><button class="secondary" :disabled="importing" @click="emit('close')">关闭</button><button v-if="importing" class="danger" @click="cancelImport">取消导入</button><button v-else class="primary" :disabled="!canImport" @click="startImport">开始导入</button></footer>
-    </section>
-  </div>
+      <template #footer><button class="secondary" :disabled="importing" @click="emit('close')">关闭</button><button v-if="importing" class="danger" @click="cancelImport">取消导入</button><button v-else class="primary" :disabled="!canImport" @click="startImport">开始导入</button></template>
+  </AppDialog>
 </template>

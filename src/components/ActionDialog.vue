@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
-import { AlertTriangle, CheckCircle2, Eye, EyeOff, Info, ShieldAlert, X } from "lucide-vue-next";
+import { AlertTriangle, CheckCircle2, Eye, EyeOff, Info, ShieldAlert } from "lucide-vue-next";
+import AppDialog from "@/components/AppDialog.vue";
 import type { ActionDialogState } from "@/lib/actionDialog";
 
 const props = defineProps<{ state: ActionDialogState }>();
 const emit = defineEmits<{ confirm: [value?: string]; cancel: [] }>();
 const input = ref("");
-const dialogElement = ref<HTMLFormElement | null>(null);
 const inputElement = ref<HTMLInputElement | null>(null);
 const confirmButton = ref<HTMLButtonElement | null>(null);
 const touched = ref(false);
@@ -43,43 +43,23 @@ function submit() {
   emit("confirm", props.state.kind === "prompt" ? input.value : undefined);
 }
 
-function trapFocus(event: KeyboardEvent) {
-  const dialog = dialogElement.value;
-  if (!dialog) return;
-  const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
-    'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
-  )).filter((element) => element.offsetParent !== null || document.activeElement === element);
-  if (!focusable.length) return;
-  const first = focusable[0]!;
-  const last = focusable[focusable.length - 1]!;
-  if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
-    event.preventDefault();
-    last.focus();
-  } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
-    event.preventDefault();
-    first.focus();
-  }
-}
 </script>
 
 <template>
-  <div class="dialog-backdrop action-dialog-backdrop" @mousedown.self="emit('cancel')" @keydown.esc.stop.prevent="emit('cancel')">
-    <form
-      ref="dialogElement"
-      class="dialog action-dialog"
-      :class="`action-dialog-${state.tone}`"
-      :role="state.tone === 'danger' || state.tone === 'warning' ? 'alertdialog' : 'dialog'"
-      aria-modal="true"
-      aria-labelledby="action-dialog-title"
-      aria-describedby="action-dialog-message"
-      @submit.prevent="submit"
-      @keydown.tab="trapFocus"
-    >
-      <header>
-        <span class="action-dialog-icon" aria-hidden="true"><component :is="icon" :size="18" /></span>
-        <div><h2 id="action-dialog-title">{{ state.title }}</h2><p>{{ state.kind === 'prompt' ? '请确认信息后继续' : state.tone === 'danger' ? '请确认此项高风险操作' : 'Cockpit' }}</p></div>
-        <button type="button" class="icon-button" aria-label="关闭" @click="emit('cancel')"><X :size="16" /></button>
-      </header>
+  <AppDialog
+    :title="state.title"
+    title-id="action-dialog-title"
+    :description="state.kind === 'prompt' ? '请确认信息后继续' : state.tone === 'danger' ? '请确认此项高风险操作' : 'Cockpit'"
+    described-by="action-dialog-message"
+    as="form"
+    :role="state.tone === 'danger' || state.tone === 'warning' ? 'alertdialog' : 'dialog'"
+    :dialog-class="['action-dialog', `action-dialog-${state.tone}`]"
+    backdrop-class="action-dialog-backdrop"
+    close-label="关闭"
+    @close="emit('cancel')"
+    @submit="submit"
+  >
+      <template #icon><component :is="icon" :size="18" /></template>
       <div class="action-dialog-body">
         <p id="action-dialog-message" class="action-dialog-message">{{ state.message }}</p>
         <p v-if="state.detail" class="action-dialog-detail">{{ state.detail }}</p>
@@ -104,11 +84,10 @@ function trapFocus(event: KeyboardEvent) {
           <small v-if="touched && validationMessage" id="action-dialog-validation" class="action-dialog-validation" role="alert">{{ validationMessage }}</small>
         </label>
       </div>
-      <footer>
+      <template #footer>
         <span>{{ state.tone === 'danger' ? '此操作可能无法撤销' : '' }}</span>
         <button v-if="state.kind !== 'notice'" type="button" class="secondary" @click="emit('cancel')">{{ state.cancelLabel }}</button>
         <button ref="confirmButton" :class="state.tone === 'danger' ? 'destructive-primary' : 'primary'">{{ state.confirmLabel }}</button>
-      </footer>
-    </form>
-  </div>
+      </template>
+  </AppDialog>
 </template>

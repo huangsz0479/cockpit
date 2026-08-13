@@ -5,7 +5,6 @@ import databaseIcon from "../../../src-tauri/icons/database/database.svg";
 import databaseIconSvg from "../../../src-tauri/icons/database/database.svg?raw";
 import eventIcon from "../../../src-tauri/icons/database/event.svg";
 import functionIcon from "../../../src-tauri/icons/database/fn.svg";
-import groupIconSvg from "../../../src-tauri/icons/database/group.svg?raw";
 import mysqlIconSvg from "../../../src-tauri/icons/database/mysql.svg?raw";
 import postgresqlIconSvg from "../../../src-tauri/icons/database/pgsql.svg?raw";
 import sqliteIconSvg from "../../../src-tauri/icons/database/sql-lite.svg?raw";
@@ -80,7 +79,6 @@ const databaseTypeIcons = {
   postgresql: inlineSvg(postgresqlIconSvg),
   sqlite: inlineSvg(sqliteIconSvg),
 };
-const groupIcon = inlineSvg(groupIconSvg);
 const connectedCount = computed(() => props.connections.filter((connection) => Boolean(props.connectionInfo[connection.id])).length);
 
 function formatMemory(bytes: number | null | undefined) {
@@ -148,7 +146,6 @@ function toggleConnectionGroup(name: string) {
         <button type="button" class="connection-group-title" :aria-expanded="!collapsedConnectionGroups.has(group.name)" @click="toggleConnectionGroup(group.name)">
           <ChevronDown v-if="!collapsedConnectionGroups.has(group.name)" class="tree-chevron" :size="12" />
           <ChevronRight v-else class="tree-chevron" :size="12" />
-          <span class="group-symbol" aria-hidden="true" v-html="groupIcon" />
           <span class="connection-group-name">{{ group.name }}</span>
           <small>{{ group.connections.length }}</small>
         </button>
@@ -213,7 +210,6 @@ function toggleConnectionGroup(name: string) {
     <footer v-if="connections.length" class="navigation-status" aria-label="运行状态">
       <div class="navigation-status-heading">
         <span><i class="navigation-status-dot" :class="{ online: runtimeStatsState === 'ready', unavailable: runtimeStatsState === 'unavailable' }" aria-hidden="true" />运行状态</span>
-        <small>{{ runtimeStatsState === "ready" ? "每 10 秒更新" : runtimeStatsState === "unavailable" ? "采样不可用" : "正在采样" }}</small>
       </div>
       <dl class="navigation-status-metrics">
         <div data-metric="connections" title="当前已打开的数据库连接数；同一连接的多个标签页只计一次">

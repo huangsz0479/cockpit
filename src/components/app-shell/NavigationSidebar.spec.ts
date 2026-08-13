@@ -86,7 +86,8 @@ describe("NavigationSidebar runtime status", () => {
     expect(host.querySelector('[data-metric="sessions"] dd')?.textContent).toBe("4");
     expect(host.querySelector('[data-metric="memory"] dd')?.textContent).toBe("128 MB");
     expect(host.querySelector('[data-metric="memory"]')?.getAttribute("title")).toContain("WebView");
-    expect(host.querySelector(".navigation-status-heading")?.textContent).toContain("每 10 秒更新");
+    expect(host.querySelector(".navigation-status-heading")?.textContent).toBe("运行状态");
+    expect(host.querySelector(".navigation-status-heading small")).toBeNull();
     app.unmount();
   });
 

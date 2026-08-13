@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import AppSelect from "@/components/AppSelect.vue";
-import { Download, FileDown, X } from "lucide-vue-next";
+import AppDialog from "@/components/AppDialog.vue";
+import { Download, FileDown } from "lucide-vue-next";
 import type { ExportFormat } from "@/types";
 
 interface ExportOption {
@@ -25,15 +26,8 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <div class="dialog-backdrop query-export-dialog-backdrop" @mousedown.self="emit('close')" @keydown.esc.stop.prevent="emit('close')">
-    <section id="query-export-dialog" class="dialog query-export-dialog" role="dialog" aria-modal="true" aria-labelledby="query-export-title" aria-describedby="query-export-description">
-      <header>
-        <div>
-          <h2 id="query-export-title">导出查询结果</h2>
-          <p id="query-export-description">选择文件格式和导出范围</p>
-        </div>
-        <button type="button" class="icon-button" aria-label="关闭导出弹窗" @click="emit('close')"><X :size="16" /></button>
-      </header>
+  <AppDialog title="导出查询结果" title-id="query-export-title" description="选择文件格式和导出范围" description-id="query-export-description" dialog-id="query-export-dialog" dialog-class="query-export-dialog" backdrop-class="query-export-dialog-backdrop" close-label="关闭导出弹窗" @close="emit('close')">
+      <template #icon><FileDown :size="18" /></template>
       <div class="query-export-dialog-body">
         <label class="query-export-format">
           <span>文件格式</span>
@@ -53,8 +47,7 @@ const emit = defineEmits<{
           </div>
         </fieldset>
       </div>
-    </section>
-  </div>
+  </AppDialog>
 </template>
 
 <style scoped>

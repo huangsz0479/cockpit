@@ -12,11 +12,11 @@ import {
   Network,
   ShieldAlert,
   SlidersHorizontal,
-  X,
 } from "lucide-vue-next";
 import { api } from "@/lib/api";
 import { useActionDialog } from "@/lib/actionDialog";
 import ActionDialog from "@/components/ActionDialog.vue";
+import AppDialog from "@/components/AppDialog.vue";
 import AppSelect from "@/components/AppSelect.vue";
 import type { ConnectionProfile, DatabaseKind } from "@/types";
 
@@ -147,18 +147,8 @@ function onSshToggle(event: Event) {
 </script>
 
 <template>
-  <div class="dialog-backdrop" @mousedown.self="emit('close')">
-    <form class="dialog connection-dialog" role="dialog" aria-modal="true" aria-labelledby="connection-dialog-title" @submit.prevent="canSave && emit('save', profile, password || undefined)">
-      <header class="connection-dialog-header">
-        <div class="connection-dialog-heading">
-          <span class="connection-dialog-heading-icon" aria-hidden="true"><Cable :size="18" :stroke-width="1.8" /></span>
-          <div>
-            <h2 id="connection-dialog-title">{{ initial ? "编辑连接" : "新建数据库连接" }}</h2>
-            <p>填写基础信息即可连接，更多选项可稍后设置。</p>
-          </div>
-        </div>
-        <button type="button" class="icon-button" aria-label="关闭连接窗口" @click="emit('close')"><X :size="16" /></button>
-      </header>
+  <AppDialog :title="initial ? '编辑连接' : '新建数据库连接'" title-id="connection-dialog-title" description="填写基础信息即可连接，更多选项可稍后设置。" as="form" dialog-class="connection-dialog" close-label="关闭连接窗口" @close="emit('close')" @submit="canSave && emit('save', profile, password || undefined)">
+      <template #icon><Cable :size="18" :stroke-width="1.8" /></template>
 
       <div class="connection-dialog-body">
         <div class="form-grid connection-basics-grid">
@@ -224,7 +214,7 @@ function onSshToggle(event: Event) {
         <p v-if="testMessage" class="test-message" :class="testState" :role="testState === 'error' ? 'alert' : 'status'"><CheckCircle2 v-if="testState === 'success'" :size="15" /><AlertCircle v-else :size="15" />{{ testMessage }}</p>
       </div>
 
-      <footer>
+      <template #footer>
         <button type="button" class="secondary connection-test-button" :disabled="testing || !valid" @click="test">
           <span class="connection-action-icon" aria-hidden="true"><CircleGauge :size="14" :stroke-width="1.8" /></span>
           <span class="connection-action-label">{{ testing ? "正在测试…" : "测试连接" }}</span>
@@ -233,8 +223,7 @@ function onSshToggle(event: Event) {
           <span class="connection-action-icon" aria-hidden="true"><CircleCheck :size="14" :stroke-width="1.8" /></span>
           <span class="connection-action-label">保存连接</span>
         </button>
-      </footer>
-    </form>
-    <ActionDialog v-if="actionDialog" :key="actionDialog.id" :state="actionDialog" @confirm="acceptActionDialog" @cancel="cancelActionDialog" />
-  </div>
+      </template>
+  </AppDialog>
+  <ActionDialog v-if="actionDialog" :key="actionDialog.id" :state="actionDialog" @confirm="acceptActionDialog" @cancel="cancelActionDialog" />
 </template>

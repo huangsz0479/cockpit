@@ -25,6 +25,9 @@ describe("SettingsDialog", () => {
     });
     app.mount(host);
 
+    expect(host.textContent).not.toContain("界面主题");
+    expect(host.textContent).not.toContain("深色");
+
     const labels = Array.from(host.querySelectorAll<HTMLLabelElement>("label"));
     const queryPageSize = host.querySelector<HTMLButtonElement>('button[aria-label="查询结果每页"]')!;
     queryPageSize.click();

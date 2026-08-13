@@ -9,8 +9,8 @@ import {
   ScrollText,
   Settings2,
   ShieldCheck,
-  X,
 } from "lucide-vue-next";
+import AppDialog from "@/components/AppDialog.vue";
 import AppSelect from "@/components/AppSelect.vue";
 import type { AppSettings } from "@/types";
 
@@ -49,44 +49,41 @@ function submit() {
 </script>
 
 <template>
-  <div class="dialog-backdrop" @mousedown.self="emit('close')">
-    <section class="dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-      <header class="settings-dialog-header">
-        <div class="settings-dialog-heading">
-          <span class="settings-dialog-heading-icon" aria-hidden="true"><Settings2 :size="18" :stroke-width="1.8" /></span>
-          <div><h2 id="settings-title">应用设置</h2><p>按需调整 Cockpit 的使用偏好</p></div>
-        </div>
-        <button type="button" class="icon-button" aria-label="关闭设置" @click="emit('close')"><X :size="16" /></button>
-      </header>
+  <AppDialog
+    title="应用设置"
+    title-id="settings-title"
+    description="按需调整 Cockpit 的使用偏好"
+    dialog-class="settings-dialog"
+    close-label="关闭设置"
+    @close="emit('close')"
+  >
+    <template #icon><Settings2 :size="18" :stroke-width="1.8" /></template>
       <div class="settings-layout">
         <nav class="settings-navigation" role="tablist" aria-label="设置分类">
-          <button id="settings-tab-general" type="button" role="tab" aria-controls="settings-panel-general" :aria-selected="activeSection === 'general'" :class="{ active: activeSection === 'general' }" @click="activeSection = 'general'">
+          <button id="settings-tab-general" type="button" role="tab" class="settings-tone-general" aria-controls="settings-panel-general" :aria-selected="activeSection === 'general'" :class="{ active: activeSection === 'general' }" @click="activeSection = 'general'">
             <span class="settings-navigation-icon" aria-hidden="true"><Settings2 :size="16" /></span><span class="settings-navigation-copy"><strong>常规</strong><small>界面与数据加载</small></span>
           </button>
-          <button id="settings-tab-editor" type="button" role="tab" aria-controls="settings-panel-editor" :aria-selected="activeSection === 'editor'" :class="{ active: activeSection === 'editor' }" @click="activeSection = 'editor'">
+          <button id="settings-tab-editor" type="button" role="tab" class="settings-tone-editor" aria-controls="settings-panel-editor" :aria-selected="activeSection === 'editor'" :class="{ active: activeSection === 'editor' }" @click="activeSection = 'editor'">
             <span class="settings-navigation-icon" aria-hidden="true"><Code2 :size="16" /></span><span class="settings-navigation-copy"><strong>编辑器</strong><small>SQL 编写偏好</small></span>
           </button>
-          <button id="settings-tab-backup" type="button" role="tab" aria-controls="settings-panel-backup" :aria-selected="activeSection === 'backup'" :class="{ active: activeSection === 'backup' }" @click="activeSection = 'backup'">
+          <button id="settings-tab-backup" type="button" role="tab" class="settings-tone-backup" aria-controls="settings-panel-backup" :aria-selected="activeSection === 'backup'" :class="{ active: activeSection === 'backup' }" @click="activeSection = 'backup'">
             <span class="settings-navigation-icon" aria-hidden="true"><DatabaseBackup :size="16" /></span><span class="settings-navigation-copy"><strong>备份与导出</strong><small>文件输出设置</small></span>
           </button>
-          <button id="settings-tab-security" type="button" role="tab" aria-controls="settings-panel-security" :aria-selected="activeSection === 'security'" :class="{ active: activeSection === 'security' }" @click="activeSection = 'security'">
+          <button id="settings-tab-security" type="button" role="tab" class="settings-tone-security" aria-controls="settings-panel-security" :aria-selected="activeSection === 'security'" :class="{ active: activeSection === 'security' }" @click="activeSection = 'security'">
             <span class="settings-navigation-icon" aria-hidden="true"><ShieldCheck :size="16" /></span><span class="settings-navigation-copy"><strong>安全与更新</strong><small>确认和版本检查</small></span>
           </button>
-          <button id="settings-tab-about" type="button" role="tab" aria-controls="settings-panel-about" :aria-selected="activeSection === 'about'" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'">
+          <button id="settings-tab-about" type="button" role="tab" class="settings-tone-about" aria-controls="settings-panel-about" :aria-selected="activeSection === 'about'" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'">
             <span class="settings-navigation-icon" aria-hidden="true"><Info :size="16" /></span><span class="settings-navigation-copy"><strong>关于</strong><small>版本与许可证</small></span>
           </button>
         </nav>
 
         <div class="settings-content">
           <div class="settings-form">
-            <section id="settings-panel-general" v-show="activeSection === 'general'" class="settings-section" role="tabpanel" aria-labelledby="settings-tab-general settings-general-title">
+            <section id="settings-panel-general" v-show="activeSection === 'general'" class="settings-section settings-tone-general" role="tabpanel" aria-labelledby="settings-tab-general settings-general-title">
               <div class="settings-section-heading"><span class="settings-section-icon" aria-hidden="true"><Settings2 :size="17" /></span><div><h3 id="settings-general-title">常规</h3><p>控制界面外观、分页数量和工作区行为。</p></div></div>
               <div class="settings-group">
                 <h4>外观与数据</h4>
                 <div class="settings-grid">
-                  <label class="setting-field"><span>界面主题</span>
-                    <AppSelect v-model="draft.theme" :options="[{ value: 'system', label: '跟随系统' }, { value: 'light', label: '浅色' }, { value: 'dark', label: '深色' }]" label="界面主题" />
-                  </label>
                   <label class="setting-field"><span>查询结果每页</span>
                     <AppSelect v-model="draft.queryPageSize" :options="[100, 250, 500, 1000, 2000].map((value) => ({ value, label: `${value.toLocaleString()} 行` }))" label="查询结果每页" />
                   </label>
@@ -104,7 +101,7 @@ function submit() {
               </div>
             </section>
 
-            <section id="settings-panel-editor" v-show="activeSection === 'editor'" class="settings-section" role="tabpanel" aria-labelledby="settings-tab-editor settings-editor-title">
+            <section id="settings-panel-editor" v-show="activeSection === 'editor'" class="settings-section settings-tone-editor" role="tabpanel" aria-labelledby="settings-tab-editor settings-editor-title">
               <div class="settings-section-heading"><span class="settings-section-icon" aria-hidden="true"><Code2 :size="17" /></span><div><h3 id="settings-editor-title">编辑器</h3><p>调整 SQL 编辑器的字号和缩进习惯。</p></div></div>
               <div class="settings-group">
                 <h4>文本与缩进</h4>
@@ -119,7 +116,7 @@ function submit() {
               </div>
             </section>
 
-            <section id="settings-panel-backup" v-show="activeSection === 'backup'" class="settings-section" role="tabpanel" aria-labelledby="settings-tab-backup settings-backup-title">
+            <section id="settings-panel-backup" v-show="activeSection === 'backup'" class="settings-section settings-tone-backup" role="tabpanel" aria-labelledby="settings-tab-backup settings-backup-title">
               <div class="settings-section-heading"><span class="settings-section-icon" aria-hidden="true"><DatabaseBackup :size="17" /></span><div><h3 id="settings-backup-title">备份与导出</h3><p>设置备份内容、压缩方式和默认导出格式。</p></div></div>
               <div class="settings-group">
                 <h4>备份选项</h4>
@@ -138,7 +135,7 @@ function submit() {
               </div>
             </section>
 
-            <section id="settings-panel-security" v-show="activeSection === 'security'" class="settings-section" role="tabpanel" aria-labelledby="settings-tab-security settings-security-title">
+            <section id="settings-panel-security" v-show="activeSection === 'security'" class="settings-section settings-tone-security" role="tabpanel" aria-labelledby="settings-tab-security settings-security-title">
               <div class="settings-section-heading"><span class="settings-section-icon" aria-hidden="true"><ShieldCheck :size="17" /></span><div><h3 id="settings-security-title">安全与更新</h3><p>管理高风险操作确认和应用更新检查。</p></div></div>
               <div class="settings-group">
                 <h4>操作保护</h4>
@@ -158,7 +155,7 @@ function submit() {
               </div>
             </section>
 
-            <section id="settings-panel-about" v-show="activeSection === 'about'" class="settings-section settings-about" role="tabpanel" aria-labelledby="settings-tab-about settings-about-title">
+            <section id="settings-panel-about" v-show="activeSection === 'about'" class="settings-section settings-about settings-tone-about" role="tabpanel" aria-labelledby="settings-tab-about settings-about-title">
               <div class="settings-about-product">
                 <span class="settings-about-mark"><Database :size="24" /></span>
                 <div><h3 id="settings-about-title">Cockpit</h3><p>轻量、安全、面向日常生产工作的桌面数据库工具。</p></div>
@@ -174,12 +171,11 @@ function submit() {
           </div>
         </div>
       </div>
-      <footer>
+      <template #footer>
         <button type="button" class="ghost settings-diagnostics-button" @click="emit('diagnostics')"><ScrollText :size="14" aria-hidden="true" /><span>诊断日志</span></button>
         <span class="settings-footer-note">更改将在保存后生效</span>
         <button type="button" class="secondary settings-cancel-button" @click="emit('close')">取消</button>
         <button type="button" class="primary settings-save-button" @click="submit"><Check :size="14" aria-hidden="true" /><span>保存设置</span></button>
-      </footer>
-    </section>
-  </div>
+      </template>
+  </AppDialog>
 </template>
