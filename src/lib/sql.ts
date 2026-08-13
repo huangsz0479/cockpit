@@ -128,9 +128,79 @@ function unquoteSqlIdentifier(identifier: string) {
   return identifier;
 }
 
-export function singleTableSelectAllTarget(sql: string, defaultDatabase?: string | null): SingleTableSelectTarget | null {
-  const statement = sql.trim().replace(/;+\s*$/, "");
-  if (!statement || statement.includes(";")) return null;
+function sqlStatementsWithoutComments(sql: string): string[] | null {
+  const statements: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | "`" | "]" | null = null;
+  let lineComment = false;
+  let blockComment = false;
+  const pushStatement = () => {
+    const statement = current.trim();
+    if (statement) statements.push(statement);
+    current = "";
+  };
+
+  for (let index = 0; index < sql.length; index += 1) {
+    const character = sql[index]!;
+    const next = sql[index + 1];
+    if (lineComment) {
+      if (character === "\n" || character === "\r") {
+        lineComment = false;
+        current += character;
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (character === "*" && next === "/") {
+        blockComment = false;
+        current += " ";
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      current += character;
+      if (character === "\\" && quote !== "]" && next) {
+        current += next;
+        index += 1;
+      } else if (character === quote) {
+        if (next === quote) {
+          current += next;
+          index += 1;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (character === "#" || (character === "-" && next === "-")) {
+      lineComment = true;
+      current += " ";
+      if (character === "-") index += 1;
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      if (sql[index + 2] === "!" || (sql[index + 2]?.toUpperCase() === "M" && sql[index + 3] === "!")) return null;
+      blockComment = true;
+      current += " ";
+      index += 1;
+      continue;
+    }
+    if (character === ";") {
+      pushStatement();
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") quote = character;
+    else if (character === "[") quote = "]";
+    current += character;
+  }
+
+  if (blockComment || quote) return null;
+  pushStatement();
+  return statements;
+}
+
+function singleTableSelectAllStatementTarget(statement: string, defaultDatabase?: string | null): SingleTableSelectTarget | null {
   const matched = statement.match(SINGLE_TABLE_SELECT_ALL);
   if (!matched) return null;
 
@@ -146,6 +216,16 @@ export function singleTableSelectAllTarget(sql: string, defaultDatabase?: string
   const qualifiedDatabase = matched[2] ? unquoteSqlIdentifier(matched[1]!) : defaultDatabase?.trim();
   const table = unquoteSqlIdentifier(matched[2] ?? matched[1]!);
   return qualifiedDatabase && table ? { database: qualifiedDatabase, table } : null;
+}
+
+export function singleTableSelectAllTargets(sql: string, defaultDatabase?: string | null): (SingleTableSelectTarget | null)[] {
+  const statements = sqlStatementsWithoutComments(sql);
+  return statements?.map((statement) => singleTableSelectAllStatementTarget(statement, defaultDatabase)) ?? [];
+}
+
+export function singleTableSelectAllTarget(sql: string, defaultDatabase?: string | null): SingleTableSelectTarget | null {
+  const targets = singleTableSelectAllTargets(sql, defaultDatabase);
+  return targets.length === 1 ? targets[0] ?? null : null;
 }
 
 export const MYSQL_COLUMN_TYPES = [

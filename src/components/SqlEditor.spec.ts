@@ -81,9 +81,40 @@ describe("SqlEditor", () => {
     expect(view.state.doc.toString()).toBe("SELECT 1");
   });
 
-  it("executes the current statement without splitting semicolons inside strings", () => {
-    const { onExecute, view } = mountEditor("SELECT 'a;b';\nSELECT 2;");
-    view.dispatch({ selection: { anchor: view.state.doc.toString().indexOf("2") } });
+  it("executes all statements when there is no selection regardless of cursor position", () => {
+    const sql = `SELECT
+  *
+FROM
+  bus_card_info t
+WHERE
+  t.card_id = 1;
+
+SELECT
+  *
+FROM
+  bus_card_info
+WHERE
+  apn IS NOT NULL
+LIMIT
+  100;`;
+    const { onExecute, view } = mountEditor(sql);
+    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+    const secondSelect = sql.lastIndexOf("SELECT");
+    for (const anchor of [0, sql.indexOf("card_id"), sql.indexOf(";"), secondSelect - 1, secondSelect]) {
+      view.dispatch({ selection: { anchor } });
+      runScopeHandlers(view, new KeyboardEvent("keydown", {
+        key: "Enter", code: "Enter", ctrlKey: !isMac, metaKey: isMac, bubbles: true, cancelable: true,
+      }), "editor");
+    }
+    expect(onExecute).toHaveBeenCalledTimes(5);
+    for (const [executedSql] of onExecute.mock.calls) expect(executedSql).toBe(sql);
+  });
+
+  it("executes only the selected SQL when text is selected", () => {
+    const sql = "SELECT 'a;b';\nSELECT 2;";
+    const { onExecute, view } = mountEditor(sql);
+    const selectedFrom = sql.indexOf("SELECT 2");
+    view.dispatch({ selection: { anchor: selectedFrom, head: sql.length } });
     const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
     runScopeHandlers(view, new KeyboardEvent("keydown", {
       key: "Enter", code: "Enter", ctrlKey: !isMac, metaKey: isMac, bubbles: true, cancelable: true,

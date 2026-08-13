@@ -171,49 +171,10 @@ function editorTheme(fontSize: number) {
   });
 }
 
-function selectedStatement(editor: EditorView) {
+function sqlForExecution(editor: EditorView) {
   const selection = editor.state.selection.main;
   if (!selection.empty) return editor.state.sliceDoc(selection.from, selection.to).trim();
-  const source = editor.state.doc.toString();
-  const boundaries = [0];
-  let state: "normal" | "single" | "double" | "backtick" | "line" | "block" = "normal";
-  let dollarTag: string | null = null;
-  for (let index = 0; index < source.length; index += 1) {
-    const character = source[index]!;
-    const next = source[index + 1];
-    if (dollarTag) {
-      if (source.startsWith(dollarTag, index)) { index += dollarTag.length - 1; dollarTag = null; }
-      continue;
-    }
-    if (state === "line") { if (character === "\n") state = "normal"; continue; }
-    if (state === "block") { if (character === "*" && next === "/") { state = "normal"; index += 1; } continue; }
-    if (state !== "normal") {
-      const delimiter = state === "single" ? "'" : state === "double" ? '"' : "`";
-      if (character === "\\") { index += 1; continue; }
-      if (character === delimiter) {
-        if (next === delimiter) index += 1;
-        else state = "normal";
-      }
-      continue;
-    }
-    if (character === "-" && next === "-") { state = "line"; index += 1; }
-    else if (character === "#") state = "line";
-    else if (character === "/" && next === "*") { state = "block"; index += 1; }
-    else if (character === "'") state = "single";
-    else if (character === '"') state = "double";
-    else if (character === "`") state = "backtick";
-    else if (character === "$") {
-      const match = /^\$[A-Za-z0-9_]*\$/.exec(source.slice(index));
-      if (match) { dollarTag = match[0]; index += match[0].length - 1; }
-    }
-    else if (character === ";") boundaries.push(index + 1);
-  }
-  let start = 0;
-  for (let index = boundaries.length - 1; index >= 0; index -= 1) {
-    if (boundaries[index]! <= selection.from) { start = boundaries[index]!; break; }
-  }
-  const end = boundaries.find((boundary) => boundary > selection.from) ?? source.length;
-  return source.slice(start, end).trim();
+  return editor.state.doc.toString().trim();
 }
 
 function applyExternalValue(value: string) {
@@ -276,7 +237,7 @@ onMounted(() => {
           { key: "Tab", run: insertTab, shift: indentLess },
         ]),
         Prec.high(keymap.of([
-          { key: "Mod-Enter", run: (editor) => { emit("execute", selectedStatement(editor)); return true; } },
+          { key: "Mod-Enter", run: (editor) => { emit("execute", sqlForExecution(editor)); return true; } },
         ])),
       ],
     }),

@@ -900,6 +900,91 @@ describe("App connection actions", () => {
     app.unmount();
   });
 
+  it("tracks editability independently for each result of a multi-statement query", async () => {
+    const { app, host, store } = mountApp();
+    const connection = profile();
+    const sql = "SELECT id FROM users;\nSELECT * FROM audit_log WHERE active = 1;";
+    const page: QueryResultPage = {
+      executionId: crypto.randomUUID(),
+      columns: [{ name: "id", databaseType: "BIGINT", nullable: false, unsigned: true, binary: false }],
+      rows: [[{ kind: "unsigned", value: "1" }]],
+      affectedRows: 0,
+      executionTimeMs: 4,
+      truncated: false,
+      hasMore: false,
+      resultSetIndex: 0,
+      messages: [],
+      additionalResultSets: [{
+        columns: [
+          { name: "id", databaseType: "BIGINT", nullable: false, unsigned: true, binary: false },
+          { name: "active", databaseType: "TINYINT", nullable: false, unsigned: false, binary: false },
+        ],
+        rows: [[{ kind: "unsigned", value: "8" }, { kind: "signed", value: "1" }]],
+        affectedRows: 0,
+        truncated: false,
+        hasMore: false,
+        resultSetIndex: 1,
+        rowOffset: 0,
+        pageSize: 500,
+      }],
+    };
+    store.connections.push(connection);
+    store.activeConnectionId = connection.id;
+    store.connectionInfo[connection.id] = { serverVersion: "8.0", connectionId: 1, currentDatabase: "demo" };
+    store.databases = [{ name: "demo" }];
+    store.selectedDatabase = "demo";
+    vi.mocked(openDialog).mockResolvedValueOnce("/tmp/multi-result.sql");
+    vi.spyOn(api, "readTextFile").mockResolvedValue({ path: "/tmp/multi-result.sql", contents: sql });
+    const assess = vi.spyOn(api, "assess").mockResolvedValue({
+      statementKind: "MULTI_STATEMENT", risk: "safe", requiresConfirmation: false,
+    });
+    const tableDetail = vi.spyOn(api, "tableDetail").mockResolvedValue({
+      table: { database: "demo", name: "audit_log", tableType: "BASE TABLE" },
+      columns: [
+        { name: "id", ordinal: 1, dataType: "bigint", fullType: "bigint unsigned", nullable: false, defaultValue: null, extra: "auto_increment", key: "PRI" },
+        { name: "active", ordinal: 2, dataType: "tinyint", fullType: "tinyint", nullable: false, defaultValue: null, extra: "", key: "" },
+      ],
+      indexes: [{ name: "PRIMARY", columns: ["id"], unique: true, primary: true }],
+      foreignKeys: [],
+      ddl: "CREATE TABLE audit_log (id BIGINT PRIMARY KEY, active TINYINT NOT NULL)",
+    });
+    const execute = vi.spyOn(store, "execute").mockResolvedValue(page);
+    const mutateRow = vi.spyOn(store, "mutateRow").mockResolvedValue({ affectedRows: 1, concurrentChange: false });
+    await nextTick();
+
+    host.querySelector<HTMLButtonElement>('.window-primary-actions .window-tool[aria-label="打开 SQL"]')!.click();
+    await vi.waitFor(() => expect(host.querySelector("[data-testid='sql-editor']")).not.toBeNull());
+    host.querySelector<HTMLButtonElement>(".execute-button")!.click();
+    await vi.waitFor(() => expect(host.querySelectorAll(".result-set-tabs button")).toHaveLength(2));
+    await vi.waitFor(() => expect(tableDetail).toHaveBeenCalledWith(connection.id, "demo", "audit_log"));
+    expect(host.querySelector(".result-card.editable-query-result")).toBeNull();
+
+    host.querySelectorAll<HTMLButtonElement>(".result-set-tabs button")[1]!.click();
+    await nextTick();
+    expect(host.querySelector(".result-card.editable-query-result")).not.toBeNull();
+    expect(host.querySelector(".query-edit-actions")).not.toBeNull();
+
+    host.querySelector<HTMLElement>('.editable-query-result tbody td[data-grid-row="0"][data-grid-column="1"]')!.click();
+    await nextTick();
+    const input = host.querySelector<HTMLInputElement>('.inline-cell-input[data-column="active"]')!;
+    input.value = "0";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(mutateRow).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+    expect(execute).toHaveBeenLastCalledWith(expect.any(String), sql, false, 0, 500);
+    expect(host.querySelectorAll<HTMLButtonElement>(".result-set-tabs button")[1]!.getAttribute("aria-selected")).toBe("true");
+    expect(host.querySelector(".result-card.editable-query-result")).not.toBeNull();
+
+    host.querySelectorAll<HTMLButtonElement>(".result-set-tabs button")[0]!.click();
+    await nextTick();
+    expect(host.querySelector(".result-card.editable-query-result")).toBeNull();
+
+    assess.mockRestore();
+    tableDetail.mockRestore();
+    app.unmount();
+  });
+
   it("keeps single-table SELECT * editable in the standard query result layout", async () => {
     const { app, host, store } = mountApp();
     const connection = profile();

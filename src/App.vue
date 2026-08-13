@@ -51,7 +51,7 @@ import { columnIsNullable, hasDatabaseDefault, isGeneratedColumn, parseRowCell, 
 import { findSqlParameters } from "@/lib/sqlParameters";
 import { useActionDialog } from "@/lib/actionDialog";
 import { api } from "@/lib/api";
-import { alterTableSql, canAppendSelectQueryLimit, canPageSelectQuery, createDefaultTableDefinition, createTableSql, quoteIdentifier, quoteMysqlIdentifier, selectPreviewSql, selectQueryPageSql, selectTablePageSql, singleTableSelectAllTarget, tableDetailToDefinition } from "@/lib/sql";
+import { alterTableSql, canAppendSelectQueryLimit, canPageSelectQuery, createDefaultTableDefinition, createTableSql, quoteIdentifier, quoteMysqlIdentifier, selectPreviewSql, selectQueryPageSql, selectTablePageSql, singleTableSelectAllTargets, tableDetailToDefinition } from "@/lib/sql";
 import type { CreateTableDefinition } from "@/lib/sql";
 import { useAppStore } from "@/stores/app";
 import type { AppSettings, BackupSchedule, CellValue, ColumnMeta, ConnectionProfile, DatabaseObjectDraft, DatabaseObjectKind, ExportFormat, QueryResultPage, QueryResultSet, QuerySnippet, RoutineInfo, RuntimeStats, TableDetail, TableInfo, TransferProgress, TransferTask, UUID } from "@/types";
@@ -69,6 +69,8 @@ interface WorkspaceTab {
   originalTableDefinition?: CreateTableDefinition;
   tableDetail?: TableDetail;
   editableTable?: TableInfo | null;
+  editableResultSets?: Record<number, TableDetail>;
+  resultSql?: string | null;
   sql: string;
   result: QueryResultPage | null;
   hasExecuted?: boolean;
@@ -449,6 +451,12 @@ function editableTableForTab(tab: WorkspaceTab | null | undefined) {
   if (!tab) return null;
   if (tab.kind === "table") return tab.tableDetail?.table ?? null;
   return tab.kind === "console" ? tab.editableTable ?? null : null;
+}
+function selectConsoleEditableResult(tab: WorkspaceTab, resultSetIndex: number) {
+  if (tab.kind !== "console") return;
+  const detail = tab.editableResultSets?.[resultSetIndex];
+  tab.editableTable = detail?.table ?? null;
+  tab.tableDetail = detail;
 }
 const activeEditableTable = computed(() => {
   return editableTableForTab(activeWorkspaceTab.value);
@@ -2141,6 +2149,8 @@ async function selectQueryConnection(value: string | null) {
   tab.database = null;
   tab.editableTable = null;
   tab.tableDetail = undefined;
+  tab.editableResultSets = {};
+  tab.resultSql = null;
   cancelColumnBatchEdit();
   if (tab.generatedTitle) tab.title = untitledQueryTitle(connectionId);
   if (connectionId) {
@@ -2156,6 +2166,8 @@ async function selectQueryDatabase(value: string | null) {
   tab.database = database;
   tab.editableTable = null;
   tab.tableDetail = undefined;
+  tab.editableResultSets = {};
+  tab.resultSql = null;
   cancelColumnBatchEdit();
   if (database) await store.selectDatabase(database);
 }
@@ -2286,10 +2298,14 @@ async function execute(overrideSql?: unknown) {
   const safeSelect = assessment.statementKind === "SELECT" && !assessment.requiresConfirmation;
   const canPageQuery = tab.kind === "console" && safeSelect && canPageSelectQuery(sqlToRun);
   const appendPageLimit = canPageQuery && canAppendSelectQueryLimit(sqlToRun);
-  const editableTarget = tab.kind === "console" && safeSelect ? singleTableSelectAllTarget(sqlToRun, tab.database) : null;
+  const editableTargets = tab.kind === "console" && !assessment.requiresConfirmation
+    ? singleTableSelectAllTargets(sqlToRun, tab.database)
+    : [];
   if (tab.kind === "console") {
     tab.editableTable = null;
     tab.tableDetail = undefined;
+    tab.editableResultSets = {};
+    tab.resultSql = null;
     cancelColumnBatchEdit();
   }
   const requestSql = appendPageLimit ? selectQueryPageSql(sqlToRun, tab.pageSize ?? 500, 0, activeQueryConnection.value?.driverKind ?? "mysql") : sqlToRun;
@@ -2301,6 +2317,7 @@ async function execute(overrideSql?: unknown) {
   const page = await store.execute(tab.sessionId, requestSql, allowWrite, 0, tab.pageSize ?? 500);
   if (page) {
     tab.result = page;
+    tab.resultSql = tab.kind === "console" ? sqlToRun : null;
     tab.resultSetIndex = 0;
     tab.selectedRowIndex = null;
     tab.selectedRowIndexes = [];
@@ -2308,15 +2325,20 @@ async function execute(overrideSql?: unknown) {
     tab.pageable = canPageQuery || tab.kind === "table";
     tab.pagingSql = canPageQuery ? sqlToRun : null;
     tab.pagingUsesDriverOffset = canPageQuery && !appendPageLimit;
-    if (editableTarget && tab.kind === "console" && tab.connectionId) {
+    if (editableTargets.length && tab.kind === "console" && tab.connectionId) {
       const executedPage = page;
-      void api.tableDetail(tab.connectionId, editableTarget.database, editableTarget.table)
-        .then((detail) => {
-          if (tab.result?.executionId !== executedPage.executionId || tab.pagingSql !== sqlToRun || detail.table.tableType.includes("VIEW")) return;
-          tab.editableTable = detail.table;
-          tab.tableDetail = detail;
-        })
-        .catch(() => { /* 无法确认表结构时保持查询结果只读。 */ });
+      const resultSetCount = 1 + (page.additionalResultSets?.length ?? 0);
+      editableTargets.slice(0, resultSetCount).forEach((editableTarget, resultSetIndex) => {
+        if (!editableTarget) return;
+        void api.tableDetail(tab.connectionId!, editableTarget.database, editableTarget.table)
+          .then((detail) => {
+            if (tab.result?.executionId !== executedPage.executionId || tab.resultSql !== sqlToRun || detail.table.tableType.includes("VIEW")) return;
+            tab.editableResultSets ??= {};
+            tab.editableResultSets[resultSetIndex] = detail;
+            if ((tab.resultSetIndex ?? 0) === resultSetIndex) selectConsoleEditableResult(tab, resultSetIndex);
+          })
+          .catch(() => { /* 无法确认表结构时保持对应结果集只读。 */ });
+      });
     }
   }
 }
@@ -2384,6 +2406,7 @@ function selectResultSet(index: number) {
   const tab = activeWorkspaceTab.value;
   if (!tab) return;
   tab.resultSetIndex = index;
+  selectConsoleEditableResult(tab, index);
   tab.selectedRowIndex = null;
   tab.selectedRowIndexes = [];
   tab.selectedCell = null;
@@ -3342,21 +3365,26 @@ async function reloadBatchEditedTab(tab: WorkspaceTab) {
     await reloadTableTab(tab);
     return;
   }
-  if (tab.kind !== "console" || !tab.pagingSql) return;
+  if (tab.kind !== "console") return;
+  const resultSql = tab.pagingSql ?? tab.resultSql;
+  if (!resultSql) return;
   if (!await applyQueryContext(tab)) return;
   const offset = tab.result?.rowOffset ?? 0;
   const pageSize = tab.pageSize ?? 500;
-  const statement = tab.pagingUsesDriverOffset ? tab.pagingSql : selectQueryPageSql(
-    tab.pagingSql,
+  const pageable = Boolean(tab.pagingSql);
+  const statement = pageable && !tab.pagingUsesDriverOffset ? selectQueryPageSql(
+    resultSql,
     pageSize,
     offset,
     connections.value.find((item) => item.id === tab.connectionId)?.driverKind ?? "mysql",
-  );
-  const page = await store.execute(tab.sessionId, statement, false, tab.pagingUsesDriverOffset ? offset : 0, pageSize);
+  ) : resultSql;
+  const page = await store.execute(tab.sessionId, statement, false, pageable && tab.pagingUsesDriverOffset ? offset : 0, pageSize);
   if (page) {
     page.rowOffset = offset;
+    const resultSetIndex = tab.resultSetIndex ?? 0;
     tab.result = page;
-    tab.resultSetIndex = 0;
+    tab.resultSetIndex = Math.min(resultSetIndex, page.additionalResultSets?.length ?? 0);
+    selectConsoleEditableResult(tab, tab.resultSetIndex);
     tab.selectedRowIndex = null;
     tab.selectedRowIndexes = [];
     tab.selectedCell = null;
@@ -3952,7 +3980,15 @@ async function importSqlFile(targetDatabase?: string) {
       </section>
 
       <section v-else-if="activeWorkspaceTab" class="table-data-view">
-        <form v-if="displayedResult?.columns.length" class="table-filter-bar" @submit.prevent="applyTableFilter"><Search :size="13" /><input v-model="activeWorkspaceTab.filter" class="table-filter-input" aria-label="筛选条件" :disabled="Boolean(executingId) || Boolean(activeInlineRowEditor)" placeholder="输入 WHERE 条件，例如 status = 1" spellcheck="false" /><button type="submit" class="ghost compact" :disabled="Boolean(executingId) || Boolean(activeInlineRowEditor)">应用</button><button v-if="activeWorkspaceTab.appliedFilter" type="button" class="ghost compact" :disabled="Boolean(executingId) || Boolean(activeInlineRowEditor)" @click="clearTableFilter">清除</button><span v-if="activeWorkspaceTab.sortColumn" class="sort-status">排序：{{ activeWorkspaceTab.sortColumn }} {{ activeWorkspaceTab.sortDirection === 'desc' ? '↓' : '↑' }}</span></form>
+        <form v-if="displayedResult?.columns.length" class="table-filter-bar" @submit.prevent="applyTableFilter">
+          <div class="table-filter-field">
+            <Search :size="13" aria-hidden="true" />
+            <input v-model="activeWorkspaceTab.filter" class="table-filter-input" aria-label="筛选条件" :disabled="Boolean(executingId) || Boolean(activeInlineRowEditor)" placeholder="输入 WHERE 条件，例如 status = 1" spellcheck="false" />
+          </div>
+          <button type="submit" class="ghost compact" :disabled="Boolean(executingId) || Boolean(activeInlineRowEditor)">应用</button>
+          <button v-if="activeWorkspaceTab.appliedFilter" type="button" class="ghost compact" :disabled="Boolean(executingId) || Boolean(activeInlineRowEditor)" @click="clearTableFilter">清除</button>
+          <span v-if="activeWorkspaceTab.sortColumn" class="sort-status">排序：{{ activeWorkspaceTab.sortColumn }} {{ activeWorkspaceTab.sortDirection === 'desc' ? '↓' : '↑' }}</span>
+        </form>
         <input
           v-if="activeBatchEditColumn"
           v-model="columnBatchEditValue"

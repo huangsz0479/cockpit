@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { alterTableSql, canAppendSelectQueryLimit, canPageSelectQuery, createDefaultTableDefinition, createTableSql, quoteIdentifier, quoteMysqlIdentifier, selectPreviewSql, selectQueryPageSql, selectTablePageSql, singleTableSelectAllTarget, tableDetailToDefinition, validateCreateTableDefinition } from "./sql";
+import { alterTableSql, canAppendSelectQueryLimit, canPageSelectQuery, createDefaultTableDefinition, createTableSql, quoteIdentifier, quoteMysqlIdentifier, selectPreviewSql, selectQueryPageSql, selectTablePageSql, singleTableSelectAllTarget, singleTableSelectAllTargets, tableDetailToDefinition, validateCreateTableDefinition } from "./sql";
 
 describe("MySQL identifier SQL helpers", () => {
   it("quotes identifiers and escapes embedded backticks", () => {
@@ -53,6 +53,30 @@ describe("MySQL identifier SQL helpers", () => {
       database: "public",
       table: "users",
     });
+    expect(singleTableSelectAllTarget(`
+-- SELECT
+--   *
+-- FROM
+--   bus_card_info t
+-- WHERE
+--   t.card_id = 1;
+
+SELECT
+  *
+FROM
+  bus_card_info
+WHERE
+  apn IS NOT NULL
+LIMIT
+  100;
+`, "demo")).toEqual({
+      database: "demo",
+      table: "bus_card_info",
+    });
+    expect(singleTableSelectAllTarget("SELECT /* editable row */ * FROM users WHERE note = 'a;b'", "demo")).toEqual({
+      database: "demo",
+      table: "users",
+    });
   });
 
   it("rejects query results that cannot safely map to one complete table row", () => {
@@ -63,6 +87,21 @@ describe("MySQL identifier SQL helpers", () => {
     expect(singleTableSelectAllTarget("SELECT * FROM users GROUP BY team_id", "demo")).toBeNull();
     expect(singleTableSelectAllTarget("SELECT * FROM users WHERE active = 1 GROUP BY team_id", "demo")).toBeNull();
     expect(singleTableSelectAllTarget("SELECT * FROM users WHERE team_id IN (SELECT id FROM teams)", "demo")).toBeNull();
+    expect(singleTableSelectAllTarget("SELECT * FROM users; SELECT * FROM teams", "demo")).toBeNull();
+    expect(singleTableSelectAllTarget("SELECT * FROM users /*! JOIN teams ON teams.id = users.team_id */", "demo")).toBeNull();
+  });
+
+  it("maps each statement in a multi-result query to its own editable table", () => {
+    expect(singleTableSelectAllTargets(`
+      SELECT id FROM users;
+      -- the second result remains independently editable
+      SELECT * FROM audit_log WHERE created_at IS NOT NULL;
+      SELECT * FROM \`other-db\`.events LIMIT 10;
+    `, "demo")).toEqual([
+      null,
+      { database: "demo", table: "audit_log" },
+      { database: "other-db", table: "events" },
+    ]);
     expect(singleTableSelectAllTarget("SELECT * FROM users; SELECT * FROM teams", "demo")).toBeNull();
   });
 

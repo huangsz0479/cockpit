@@ -1451,6 +1451,15 @@ fn value_to_cell(value: &Value, column: &mysql_async::Column) -> CellValue {
         {
             CellValue::Decimal(String::from_utf8_lossy(bytes).into_owned())
         }
+        Value::Bytes(bytes) if column_type == ColumnType::MYSQL_TYPE_BIT => mysql_bit_value(bytes)
+            .map_or_else(
+                || CellValue::Bytes {
+                    base64: BASE64.encode(bytes),
+                    preview: None,
+                    length: bytes.len(),
+                },
+                |value| CellValue::Unsigned(value.to_string()),
+            ),
         Value::Bytes(bytes) if column_type == ColumnType::MYSQL_TYPE_JSON => {
             CellValue::Json(String::from_utf8_lossy(bytes).into_owned())
         }
@@ -1521,6 +1530,14 @@ fn printable_preview(bytes: &[u8]) -> Option<String> {
     text.chars()
         .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
         .then(|| text.chars().take(200).collect())
+}
+
+fn mysql_bit_value(bytes: &[u8]) -> Option<u64> {
+    (bytes.len() <= std::mem::size_of::<u64>()).then(|| {
+        bytes
+            .iter()
+            .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte))
+    })
 }
 
 fn read_mysql_srid(bytes: &[u8]) -> Option<u32> {
@@ -1844,6 +1861,15 @@ mod tests {
     fn binary_preview_rejects_control_data() {
         assert_eq!(printable_preview(&[0, 1, 2]), None);
         assert_eq!(printable_preview(b"hello"), Some("hello".into()));
+    }
+
+    #[test]
+    fn bit_values_are_decoded_as_unsigned_integers() {
+        assert_eq!(mysql_bit_value(&[0]), Some(0));
+        assert_eq!(mysql_bit_value(&[1]), Some(1));
+        assert_eq!(mysql_bit_value(&[1, 0]), Some(256));
+        assert_eq!(mysql_bit_value(&[u8::MAX; 8]), Some(u64::MAX));
+        assert_eq!(mysql_bit_value(&[0; 9]), None);
     }
 
     #[test]

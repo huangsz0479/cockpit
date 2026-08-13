@@ -361,7 +361,10 @@ kbd { padding: 1px 4px; border: 1px solid var(--accent-border); border-radius: 4
 .table-actions-panel-enter-active, .table-actions-panel-leave-active { transition: opacity 110ms ease, transform 110ms ease; transform-origin: right bottom; }
 .table-actions-panel-enter-from, .table-actions-panel-leave-to { opacity: 0; transform: translateY(3px) scale(.985); }
 .table-filter-bar { min-height: 32px; flex: 0 0 auto; display: flex; align-items: center; gap: 5px; padding: 3px 7px; border-bottom: 1px solid var(--border); background: var(--surface-2); color: var(--muted); }
-.table-filter-bar input { width: min(440px, 55vw); height: 25px; padding: 0 7px; font: 10px var(--font-mono); }
+.table-filter-field { width: min(440px, 55vw); height: 30px; display: flex; align-items: center; gap: 6px; padding-left: 8px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface-1); transition: border-color 120ms ease, box-shadow 120ms ease; }
+.table-filter-field:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--focus-ring); }
+.table-filter-field > svg { flex: 0 0 auto; stroke-width: 1.8; }
+.table-filter-bar input { width: 100%; height: 100%; min-width: 0; padding: 0 7px 0 0; border: 0; outline: 0; background: transparent; font: 10px var(--font-mono); }
 .column-batch-edit-bar { min-height: 36px; flex: 0 0 auto; display: flex; align-items: center; gap: 6px; padding: 4px 7px; border-bottom: 1px solid var(--accent-border); background: var(--accent-soft); color: var(--text); font-size: 10px; }
 .column-batch-edit-bar > strong { max-width: 180px; overflow: hidden; padding: 2px 5px; border: 1px solid var(--accent-border); border-radius: 3px; background: var(--surface-1); color: var(--accent); font: 10px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
 .column-batch-edit-input { width: min(240px, 28vw); height: 26px; padding: 0 7px; background: var(--surface-1); font: 10px var(--font-mono); }

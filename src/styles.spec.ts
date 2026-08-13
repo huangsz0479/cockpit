@@ -16,3 +16,12 @@ describe("data grid selection styles", () => {
     expect(styles).not.toContain("color-scheme: dark");
   });
 });
+
+describe("table filter styles", () => {
+  it("groups the search icon and input at the compact action height", () => {
+    expect(styles).toContain(".compact { min-height: 30px;");
+    expect(styles).toContain(".table-filter-field { width: min(440px, 55vw); height: 30px;");
+    expect(styles).toContain(".table-filter-field > svg");
+    expect(styles).toContain(".table-filter-bar input { width: 100%; height: 100%;");
+  });
+});
