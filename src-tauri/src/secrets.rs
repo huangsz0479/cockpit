@@ -1,55 +1,45 @@
-use std::{collections::HashMap, path::Path, sync::RwLock};
-
-#[cfg(debug_assertions)]
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::RwLock,
 };
 
-#[cfg(all(debug_assertions, unix))]
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+use aes_gcm::{
+    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
 use cockpit_core::{CockpitError, Result};
+use rand_core::{OsRng, RngCore};
 use uuid::Uuid;
 
-#[cfg(not(debug_assertions))]
-const SERVICE: &str = "com.cockpit.db";
-// Debug binaries get a new macOS code signature after rebuilds, so Keychain would
-// repeatedly request access. Keep this explicitly development-only.
-#[cfg(debug_assertions)]
-const DEV_SECRETS_FILE: &str = "dev-secrets.json";
+const DEVICE_KEY_FILE: &str = "device.key";
+const SECRETS_VAULT_FILE: &str = "credentials.vault";
+const VAULT_MAGIC: &[u8; 8] = b"CKPVAULT";
+const NONCE_LENGTH: usize = 12;
+const KEY_LENGTH: usize = 32;
 
 pub struct SecretStore {
     session_values: RwLock<HashMap<String, String>>,
-    #[cfg(debug_assertions)]
-    dev_file: PathBuf,
+    device_key: [u8; KEY_LENGTH],
+    vault_file: PathBuf,
 }
 
 impl SecretStore {
     pub fn new(data_dir: &Path) -> Result<Self> {
-        #[cfg(debug_assertions)]
-        {
-            let dev_file = data_dir.join(DEV_SECRETS_FILE);
-            let session_values = match fs::read(&dev_file) {
-                Ok(contents) => serde_json::from_slice(&contents)
-                    .map_err(|error| CockpitError::SecretStore(error.to_string()))?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-                Err(error) => return Err(CockpitError::SecretStore(error.to_string())),
-            };
-            Ok(Self {
-                session_values: RwLock::new(session_values),
-                dev_file,
-            })
-        }
-
-        #[cfg(not(debug_assertions))]
-        {
-            let _ = data_dir;
-            Ok(Self {
-                session_values: RwLock::new(HashMap::new()),
-            })
-        }
+        fs::create_dir_all(data_dir).map_err(secret_store_error)?;
+        let device_key = load_or_create_device_key(&data_dir.join(DEVICE_KEY_FILE))?;
+        let vault_file = data_dir.join(SECRETS_VAULT_FILE);
+        let session_values = load_vault(&vault_file, &device_key)?;
+        Ok(Self {
+            session_values: RwLock::new(session_values),
+            device_key,
+            vault_file,
+        })
     }
 
     fn account(connection_id: Uuid, key: &str) -> String {
@@ -62,42 +52,18 @@ impl SecretStore {
             .session_values
             .write()
             .map_err(|_| CockpitError::SecretStore("会话凭据锁已损坏".into()))?;
-        values.insert(account.clone(), value.to_string());
-
-        #[cfg(debug_assertions)]
-        let persisted = self.persist_dev_values(&values).is_ok();
-
-        #[cfg(not(debug_assertions))]
-        let persisted = keyring::Entry::new(SERVICE, &account)
-            .and_then(|entry| entry.set_password(value))
-            .is_ok();
-
-        Ok(persisted)
+        values.insert(account, value.to_string());
+        Ok(persist_vault(&self.vault_file, &self.device_key, &values).is_ok())
     }
 
     pub fn get(&self, connection_id: Uuid, key: &str) -> Result<Option<String>> {
         let account = Self::account(connection_id, key);
-        if let Some(value) = self
+        Ok(self
             .session_values
             .read()
             .map_err(|_| CockpitError::SecretStore("会话凭据锁已损坏".into()))?
             .get(&account)
-        {
-            return Ok(Some(value.clone()));
-        }
-        #[cfg(debug_assertions)]
-        {
-            Ok(None)
-        }
-
-        #[cfg(not(debug_assertions))]
-        {
-            match keyring::Entry::new(SERVICE, &account).and_then(|entry| entry.get_password()) {
-                Ok(value) => Ok(Some(value)),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(CockpitError::SecretStore(error.to_string())),
-            }
-        }
+            .cloned())
     }
 
     pub fn contains(&self, connection_id: Uuid, key: &str) -> Result<bool> {
@@ -105,55 +71,96 @@ impl SecretStore {
     }
 
     pub fn delete_connection(&self, connection_id: Uuid) {
-        #[cfg(debug_assertions)]
         if let Ok(mut values) = self.session_values.write() {
             for key in ["mysql_password", "ssh_password", "ssh_key_passphrase"] {
                 values.remove(&Self::account(connection_id, key));
             }
-            let _ = self.persist_dev_values(&values);
+            let _ = persist_vault(&self.vault_file, &self.device_key, &values);
         }
-
-        #[cfg(not(debug_assertions))]
-        for key in ["mysql_password", "ssh_password", "ssh_key_passphrase"] {
-            let account = Self::account(connection_id, key);
-            let _ =
-                keyring::Entry::new(SERVICE, &account).and_then(|entry| entry.delete_credential());
-            if let Ok(mut values) = self.session_values.write() {
-                values.remove(&account);
-            }
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    fn persist_dev_values(&self, values: &HashMap<String, String>) -> Result<()> {
-        if let Some(parent) = self.dev_file.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| CockpitError::SecretStore(error.to_string()))?;
-        }
-        let contents = serde_json::to_vec(values)
-            .map_err(|error| CockpitError::SecretStore(error.to_string()))?;
-        let mut options = OpenOptions::new();
-        options.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options
-            .open(&self.dev_file)
-            .map_err(|error| CockpitError::SecretStore(error.to_string()))?;
-        file.write_all(&contents)
-            .map_err(|error| CockpitError::SecretStore(error.to_string()))?;
-        #[cfg(unix)]
-        fs::set_permissions(&self.dev_file, fs::Permissions::from_mode(0o600))
-            .map_err(|error| CockpitError::SecretStore(error.to_string()))?;
-        Ok(())
     }
 }
 
-#[cfg(all(test, debug_assertions))]
+fn secret_store_error(error: impl std::fmt::Display) -> CockpitError {
+    CockpitError::SecretStore(error.to_string())
+}
+
+fn secure_file(path: &Path) -> Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path).map_err(secret_store_error)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(secret_store_error)?;
+    Ok(file)
+}
+
+fn load_or_create_device_key(path: &Path) -> Result<[u8; KEY_LENGTH]> {
+    match fs::read(path) {
+        Ok(contents) => contents.try_into().map_err(|_| {
+            CockpitError::SecretStore("本机凭据密钥格式无效，无法解密已保存的密码".into())
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut key = [0_u8; KEY_LENGTH];
+            OsRng.fill_bytes(&mut key);
+            let mut file = secure_file(path)?;
+            file.write_all(&key).map_err(secret_store_error)?;
+            file.sync_all().map_err(secret_store_error)?;
+            Ok(key)
+        }
+        Err(error) => Err(secret_store_error(error)),
+    }
+}
+
+fn load_vault(path: &Path, key: &[u8; KEY_LENGTH]) -> Result<HashMap<String, String>> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(secret_store_error(error)),
+    };
+    if contents.len() <= VAULT_MAGIC.len() + NONCE_LENGTH
+        || &contents[..VAULT_MAGIC.len()] != VAULT_MAGIC
+    {
+        return Err(CockpitError::SecretStore("本机凭据库格式无效".into()));
+    }
+    let nonce_start = VAULT_MAGIC.len();
+    let encrypted_start = nonce_start + NONCE_LENGTH;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(secret_store_error)?;
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(&contents[nonce_start..encrypted_start]),
+            &contents[encrypted_start..],
+        )
+        .map_err(|_| CockpitError::SecretStore("本机凭据库无法解密或已损坏".into()))?;
+    serde_json::from_slice(&plaintext).map_err(secret_store_error)
+}
+
+fn persist_vault(
+    path: &Path,
+    key: &[u8; KEY_LENGTH],
+    values: &HashMap<String, String>,
+) -> Result<()> {
+    let plaintext = serde_json::to_vec(values).map_err(secret_store_error)?;
+    let mut nonce = [0_u8; NONCE_LENGTH];
+    OsRng.fill_bytes(&mut nonce);
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(secret_store_error)?;
+    let encrypted = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext.as_slice())
+        .map_err(secret_store_error)?;
+    let mut file = secure_file(path)?;
+    file.write_all(VAULT_MAGIC).map_err(secret_store_error)?;
+    file.write_all(&nonce).map_err(secret_store_error)?;
+    file.write_all(&encrypted).map_err(secret_store_error)?;
+    file.sync_all().map_err(secret_store_error)?;
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn debug_secrets_persist_without_keychain() {
+    fn encrypted_secrets_persist_without_keychain() {
         let directory = std::env::temp_dir().join(format!("cockpit-secrets-{}", Uuid::new_v4()));
         let connection_id = Uuid::new_v4();
 
@@ -165,6 +172,28 @@ mod tests {
         );
         drop(store);
 
+        let vault = fs::read(directory.join(SECRETS_VAULT_FILE)).unwrap();
+        assert!(!String::from_utf8_lossy(&vault).contains("secret"));
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::metadata(directory.join(DEVICE_KEY_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(directory.join(SECRETS_VAULT_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
         let store = SecretStore::new(&directory).unwrap();
         assert_eq!(
             store.get(connection_id, "mysql_password").unwrap(),
@@ -175,6 +204,18 @@ mod tests {
 
         let store = SecretStore::new(&directory).unwrap();
         assert_eq!(store.get(connection_id, "mysql_password").unwrap(), None);
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn invalid_device_key_is_not_silently_replaced() {
+        let directory = std::env::temp_dir().join(format!("cockpit-secrets-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(DEVICE_KEY_FILE), b"invalid").unwrap();
+
+        let error = SecretStore::new(&directory).err().unwrap();
+        assert!(error.to_string().contains("密钥格式无效"));
 
         let _ = fs::remove_dir_all(directory);
     }
