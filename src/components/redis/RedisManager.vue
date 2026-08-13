@@ -1,17 +1,16 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import { RefreshCw, Search, Terminal, Trash2, KeyRound, CircleGauge, X } from "lucide-vue-next";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { RefreshCw, Search, Terminal, Trash2, CircleGauge, X } from "lucide-vue-next";
 import AppSelect from "@/components/AppSelect.vue";
 import { api } from "@/lib/api";
 import type {
-  ConnectionInfo, ConnectionProfile, RedisDatabaseInfo, RedisKeyInfo, RedisKeyType,
+  ConnectionProfile, RedisDatabaseInfo, RedisKeyInfo, RedisKeyType,
   RedisReply, RedisStringValue, RedisValue, ServerMetric,
 } from "@/types";
 
 const props = withDefaults(defineProps<{ connection: ConnectionProfile; initialDatabase?: number }>(), { initialDatabase: undefined });
 const emit = defineEmits<{ close: [] }>();
 
-const info = ref<ConnectionInfo | null>(null);
 const databases = ref<RedisDatabaseInfo[]>([]);
 const selectedDatabase = ref(0);
 const pattern = ref("");
@@ -66,9 +65,12 @@ function kindLabel(kind: RedisKeyType) {
 }
 
 function ttlLabel(ttlSecs: number) {
-  if (ttlSecs === -1) return "不过期";
+  if (ttlSecs === -1) return "永久";
   if (ttlSecs === -2) return "已过期";
-  return `${ttlSecs}s`;
+  if (ttlSecs < 60) return `${ttlSecs}秒`;
+  if (ttlSecs < 3600) return `${Math.floor(ttlSecs / 60)}分`;
+  if (ttlSecs < 86400) return `${Math.floor(ttlSecs / 3600)}时`;
+  return `${Math.floor(ttlSecs / 86400)}天`;
 }
 
 function collectionTruncated(item: RedisValue | null) {
@@ -124,6 +126,13 @@ async function selectDatabase(index: number) {
   await scanKeys(true);
 }
 
+watch(
+  () => props.initialDatabase,
+  (database) => {
+    if (database != null && database !== selectedDatabase.value) void selectDatabase(database);
+  },
+);
+
 async function openKey(key: RedisKeyInfo) {
   selectedKey.value = key;
   valueLoading.value = true;
@@ -163,12 +172,18 @@ function editString() {
 
 async function deleteSelectedKey() {
   if (!selectedKey.value) return;
-  if (!window.confirm(`确定删除 key “${selectedKey.value.key}”？此操作不可恢复。`)) return;
+  await deleteKey(selectedKey.value);
+}
+
+async function deleteKey(key: RedisKeyInfo) {
+  if (!window.confirm(`确定删除 key “${key.key}”？此操作不可恢复。`)) return;
   error.value = "";
   try {
-    await api.deleteRedisKeys(props.connection.id, selectedDatabase.value, [selectedKey.value.key]);
-    selectedKey.value = null;
-    value.value = null;
+    await api.deleteRedisKeys(props.connection.id, selectedDatabase.value, [key.key]);
+    if (selectedKey.value?.key === key.key) {
+      selectedKey.value = null;
+      value.value = null;
+    }
     await scanKeys(true);
   } catch (cause) {
     error.value = messageOf(cause);
@@ -242,7 +257,7 @@ function replyText(reply: RedisReply | null): string {
 onMounted(async () => {
   error.value = "";
   try {
-    info.value = await api.connectRedis(props.connection.id);
+    await api.connectRedis(props.connection.id);
     await loadDatabases();
   } catch (cause) {
     error.value = messageOf(cause);
@@ -256,21 +271,11 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="redis-manager">
-      <header class="redis-manager-header">
-        <div class="redis-manager-heading">
-          <span class="redis-manager-icon" aria-hidden="true"><KeyRound :size="18" :stroke-width="1.8" /></span>
-          <div>
-            <h2>Redis 管理器 · {{ connection.name }}</h2>
-            <p>{{ info ? `${info.serverVersion}${info.serverComment ? ` · ${info.serverComment}` : ''}` : '正在连接…' }}</p>
-          </div>
-        </div>
-        <button type="button" class="icon-button" aria-label="关闭 Redis 管理器" @click="emit('close')"><X :size="16" /></button>
-      </header>
-
       <div class="redis-manager-body">
         <aside class="redis-key-pane">
           <div class="redis-manager-toolbar">
             <AppSelect v-model="selectedDatabase" :options="keyOptions" label="逻辑库" variant="compact" @change="selectDatabase" />
+            <button type="button" class="icon-button" aria-label="关闭 Redis 管理器" @click="emit('close')"><X :size="15" /></button>
           </div>
           <div class="redis-key-search">
             <Search :size="13" />
@@ -282,10 +287,12 @@ onBeforeUnmount(() => {
             <small v-if="!scanComplete">继续滚动加载更多</small>
           </div>
           <div class="redis-key-list" @scroll.passive="($event) => { const el = $event.currentTarget as HTMLElement; if (!scanComplete && !scanning && el.scrollHeight - el.scrollTop - el.clientHeight < 80) scanKeys(false); }">
-            <button v-for="key in keys" :key="key.key" class="redis-key-item" :class="{ active: selectedKey?.key === key.key }" @click="openKey(key)">
+            <div v-for="key in keys" :key="key.key" class="redis-key-item" :class="{ active: selectedKey?.key === key.key }" role="button" tabindex="0" @click="openKey(key)" @keydown.enter.prevent="openKey(key)" @keydown.space.prevent="openKey(key)">
               <span class="redis-key-name">{{ key.key }}</span>
-              <span class="redis-key-meta"><em>{{ kindLabel(key.kind) }}</em><small>{{ ttlLabel(key.ttlSecs) }}</small></span>
-            </button>
+              <span class="redis-key-badge">{{ kindLabel(key.kind) }}</span>
+              <span v-if="key.ttlSecs !== -1" class="redis-key-ttl" :class="{ expired: key.ttlSecs === -2 }">{{ ttlLabel(key.ttlSecs) }}</span>
+              <button type="button" class="redis-key-delete" :aria-label="`删除 key ${key.key}`" title="删除 key" @click.stop="deleteKey(key)"><Trash2 :size="13" /></button>
+            </div>
             <p v-if="!keys.length && !scanning" class="empty-small">该逻辑库没有 key</p>
           </div>
         </aside>
@@ -345,25 +352,27 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .redis-manager { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--surface-1); }
-.redis-manager-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); background: linear-gradient(180deg, color-mix(in srgb, var(--surface-1) 55%, var(--surface-toolbar, var(--surface-2))) 0%, var(--surface-toolbar, var(--surface-2)) 100%); }
-.redis-manager-heading { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.redis-manager-icon { width: 30px; height: 30px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border-subtle)); border-radius: 9px; background: var(--accent-soft); color: var(--accent); }
-.redis-manager-heading h2 { margin: 0; font-size: 13px; font-weight: 680; letter-spacing: -.01em; }
-.redis-manager-heading p { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
-.redis-manager-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(270px, 320px) minmax(0, 1fr); }
+.redis-manager-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(340px, 400px) minmax(0, 1fr); }
 .redis-key-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 1px solid var(--border); background: var(--surface-sidebar, var(--surface-2)); }
-.redis-manager-toolbar { padding: 8px; border-bottom: 1px solid var(--border-subtle); background: var(--surface-1); }
+.redis-manager-toolbar { display: flex; align-items: center; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border-subtle); background: var(--surface-1); }
+.redis-manager-toolbar .app-select { flex: 1; min-width: 0; }
+.redis-manager-toolbar .icon-button { flex: 0 0 auto; }
 .redis-key-search { display: flex; align-items: center; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border-subtle); background: var(--surface-1); }
 .redis-key-search svg { flex: 0 0 auto; color: var(--muted); }
 .redis-key-search input { flex: 1; min-width: 0; height: 30px; min-height: 30px; padding: 0 8px; font-size: 11px; }
 .redis-key-summary { display: flex; justify-content: space-between; gap: 8px; padding: 7px 10px; font-size: 10.5px; color: var(--muted); border-bottom: 1px solid var(--border-subtle); background: var(--surface-1); }
 .redis-key-list { flex: 1; min-height: 0; overflow-y: auto; padding: 5px; }
-.redis-key-item { width: 100%; min-height: 0; justify-content: flex-start; flex-direction: column; align-items: stretch; gap: 3px; padding: 7px 9px; border: 1px solid transparent; border-radius: var(--radius-sm); text-align: left; color: var(--text); }
-.redis-key-item:hover { border-color: var(--border-subtle); background: var(--surface-hover); }
-.redis-key-item.active { border-color: color-mix(in srgb, var(--accent) 24%, var(--border-subtle)); background: var(--accent-soft); box-shadow: inset 2px 0 var(--accent); }
-.redis-key-name { font: 600 12px/1.35 var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.redis-key-meta { display: flex; gap: 8px; font-size: 10px; color: var(--muted); }
-.redis-key-meta em { font-style: normal; color: var(--accent); }
+.redis-key-item { width: 100%; min-height: 30px; display: flex; justify-content: flex-start; align-items: center; gap: 7px; padding: 4px 8px; border: 1px solid transparent; border-radius: var(--radius-sm); text-align: left; color: var(--text); cursor: pointer; }
+.redis-key-item:hover { background: var(--surface-hover); }
+.redis-key-item.active { border-color: color-mix(in srgb, var(--accent) 22%, var(--border-subtle)); background: var(--accent-soft); }
+.redis-key-name { min-width: 0; flex: 1; font: 600 12px/1.35 var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.redis-key-badge { height: 16px; flex: 0 0 auto; display: inline-flex; align-items: center; padding: 0 5px; border: 1px solid var(--border-subtle); border-radius: 999px; background: var(--surface-1); color: var(--muted); font-size: 9px; font-weight: 650; line-height: 1; }
+.redis-key-item.active .redis-key-badge { border-color: color-mix(in srgb, var(--accent) 22%, var(--border-subtle)); background: color-mix(in srgb, var(--accent-soft) 72%, var(--surface-1)); color: var(--accent); }
+.redis-key-ttl { flex: 0 0 auto; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.redis-key-ttl.expired { color: var(--warning); }
+.redis-key-delete { width: 22px; height: 22px; flex: 0 0 auto; display: inline-grid; place-items: center; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--muted); opacity: 0; transition: opacity .12s ease, background .12s ease, color .12s ease; }
+.redis-key-item:hover .redis-key-delete, .redis-key-item:focus-within .redis-key-delete, .redis-key-delete:focus { opacity: 1; }
+.redis-key-delete:hover { background: color-mix(in srgb, var(--danger, #d9534f) 12%, transparent); color: var(--danger, #d9534f); }
 .redis-detail-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--surface-1); }
 .redis-section-tabs { display: flex; gap: 4px; padding: 7px 10px; border-bottom: 1px solid var(--border); background: var(--surface-2); }
 .redis-section-tabs button { min-height: 28px; height: 28px; gap: 5px; padding: 0 11px; border: 1px solid transparent; border-radius: var(--radius-sm); color: var(--muted); font-size: 11px; font-weight: 600; }

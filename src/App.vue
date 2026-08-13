@@ -3730,7 +3730,7 @@ async function importSqlFile(targetDatabase?: string) {
     />
 
     <main v-if="connections.length || activeWorkspaceTab || redisManagerConnection" class="workspace">
-      <RedisManager v-if="redisManagerConnection" :connection="redisManagerConnection" :initial-database="redisManagerDatabase ?? undefined" @close="closeRedisManager" />
+      <RedisManager v-if="redisManagerConnection" :key="redisManagerConnection.id" :connection="redisManagerConnection" :initial-database="redisManagerDatabase ?? undefined" @close="closeRedisManager" />
       <template v-if="!redisManagerConnection">
       <WorkspaceEmpty v-if="!activeWorkspaceTab" />
 
