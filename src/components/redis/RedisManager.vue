@@ -9,7 +9,7 @@ import type {
   RedisReply, RedisStringValue, RedisValue, ServerMetric,
 } from "@/types";
 
-const props = defineProps<{ connection: ConnectionProfile }>();
+const props = withDefaults(defineProps<{ connection: ConnectionProfile; initialDatabase?: number }>(), { initialDatabase: undefined });
 const emit = defineEmits<{ close: [] }>();
 
 const info = ref<ConnectionInfo | null>(null);
@@ -85,7 +85,9 @@ async function loadDatabases() {
   error.value = "";
   try {
     databases.value = await api.listRedisDatabases(props.connection.id);
-    selectedDatabase.value = databases.value[0]?.index ?? 0;
+    selectedDatabase.value = databases.value.find((db) => db.index === props.initialDatabase)?.index
+      ?? databases.value[0]?.index
+      ?? 0;
     await scanKeys(true);
   } catch (cause) {
     error.value = messageOf(cause);

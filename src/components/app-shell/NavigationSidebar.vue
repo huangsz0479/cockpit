@@ -11,7 +11,7 @@ import sqliteIconSvg from "../../../src-tauri/icons/database/sql-lite.svg?raw";
 import tableIcon from "../../../src-tauri/icons/database/Table.svg";
 import triggerIcon from "../../../src-tauri/icons/database/trigger.svg";
 import viewIcon from "../../../src-tauri/icons/database/view.svg";
-import type { ConnectionInfo, ConnectionProfile, DatabaseInfo, DatabaseKind, DatabaseObjectKind, EventInfo, RoutineInfo, RuntimeStats, TableInfo, TriggerInfo, UUID } from "@/types";
+import type { ConnectionInfo, ConnectionProfile, DatabaseInfo, DatabaseKind, DatabaseObjectKind, EventInfo, RedisDatabaseInfo, RoutineInfo, RuntimeStats, TableInfo, TriggerInfo, UUID } from "@/types";
 import type { NavigationContextTarget } from "./types";
 
 const props = defineProps<{
@@ -21,6 +21,8 @@ const props = defineProps<{
   selectedDatabase: string | null;
   activeConnectionId: UUID | null;
   connectionGroups: { name: string; connections: ConnectionProfile[] }[];
+  redisDatabases?: Partial<Record<UUID, RedisDatabaseInfo[]>>;
+  redisLoading?: Partial<Record<UUID, boolean>>;
   filteredDatabases: DatabaseInfo[];
   filteredBaseTables: TableInfo[];
   filteredViews: TableInfo[];
@@ -53,6 +55,7 @@ const emit = defineEmits<{
   "disconnect-connection": [id: UUID];
   "toggle-database": [database: string];
   "open-redis-manager": [connection: ConnectionProfile];
+  "open-redis-database": [connection: ConnectionProfile, database: number];
   "context-menu": [event: MouseEvent, target: NavigationContextTarget];
   "highlight-table": [table: TableInfo];
   "preview-table": [table: TableInfo];
@@ -172,8 +175,21 @@ function toggleConnectionGroup(name: string) {
           </div>
 
           <div v-if="expandedConnectionId === connection.id" class="tree-branch connection-children">
-            <div v-if="connection.driverKind === 'redis'" class="tree-empty redis-hint">
-              <button type="button" class="link" @click="$emit('open-redis-manager', connection)"><KeyRound :size="12" />打开 Redis 管理器</button>
+            <div v-if="connection.driverKind === 'redis'" class="redis-children">
+              <template v-if="redisLoading?.[connection.id]">
+                <div class="tree-loading">正在连接…</div>
+              </template>
+              <template v-else-if="redisDatabases?.[connection.id]?.length">
+                <button v-for="db in redisDatabases?.[connection.id]" :key="db.index" class="tree-row database-node redis-db-node" role="button" tabindex="0" @click="$emit('open-redis-database', connection, db.index)" @keydown.enter="$emit('open-redis-database', connection, db.index)" @keydown.space.prevent="$emit('open-redis-database', connection, db.index)">
+                  <ChevronRight class="tree-chevron" :size="13" />
+                  <Database :size="13" />
+                  <span class="node-name">DB {{ db.index }}</span>
+                  <small>{{ db.keyCount }} 个 key</small>
+                </button>
+              </template>
+              <template v-else>
+                <button type="button" class="link" @click="$emit('open-redis-manager', connection)"><KeyRound :size="12" />打开 Redis 管理器</button>
+              </template>
             </div>
             <div v-else-if="busy && !connectionInfo[connection.id]" class="tree-loading">正在连接…</div>
             <template v-else-if="connectionInfo[connection.id]">
@@ -237,3 +253,9 @@ function toggleConnectionGroup(name: string) {
     <div v-if="connections.length" class="navigation-resizer" role="separator" aria-label="调整连接面板宽度" aria-orientation="vertical" :aria-valuenow="navigationWidth" :aria-valuemin="minWidth" :aria-valuemax="maxWidth" tabindex="0" @pointerdown="$emit('resize-start', $event)" @pointermove="$emit('resize-move', $event)" @pointerup="$emit('resize-end', $event)" @pointercancel="$emit('resize-cancel', $event)" @dblclick="$emit('resize-reset')" @keydown="$emit('resize-key', $event)" />
   </aside>
 </template>
+
+<style scoped>
+.redis-children { padding: 2px 0; }
+.redis-db-node { gap: 7px; }
+.redis-db-node small { margin-left: auto; color: var(--muted); font-size: 10px; }
+</style>

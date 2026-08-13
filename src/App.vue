@@ -57,7 +57,7 @@ import { fetchLatestGitHubRelease, isNewerVersion } from "@/lib/githubRelease";
 import { alterTableSql, canAppendSelectQueryLimit, canPageSelectQuery, createDefaultTableDefinition, createTableSql, quoteIdentifier, quoteMysqlIdentifier, selectPreviewSql, selectQueryPageSql, selectTablePageSql, singleTableSelectAllTargets, tableDetailToDefinition } from "@/lib/sql";
 import type { CreateTableDefinition } from "@/lib/sql";
 import { useAppStore } from "@/stores/app";
-import type { AppSettings, BackupSchedule, CellValue, ColumnMeta, ConnectionProfile, DatabaseObjectDraft, DatabaseObjectKind, ExportFormat, QueryResultPage, QueryResultSet, QuerySnippet, RoutineInfo, RuntimeStats, TableDetail, TableInfo, TransferProgress, TransferTask, UUID } from "@/types";
+import type { AppSettings, BackupSchedule, CellValue, ColumnMeta, ConnectionProfile, DatabaseObjectDraft, DatabaseObjectKind, ExportFormat, QueryResultPage, QueryResultSet, QuerySnippet, RedisDatabaseInfo, RoutineInfo, RuntimeStats, TableDetail, TableInfo, TransferProgress, TransferTask, UUID } from "@/types";
 
 type ResultView = "result" | "summary";
 
@@ -136,6 +136,9 @@ const runtimeStatsState = ref<"loading" | "ready" | "unavailable">("__TAURI_INTE
 const showDiagnostics = ref(false);
 const showServerAdmin = ref(false);
 const redisManagerConnection = ref<ConnectionProfile | null>(null);
+const redisManagerDatabase = ref<number | null>(null);
+const redisDatabases = ref<Record<UUID, RedisDatabaseInfo[]>>({});
+const redisLoading = ref<Record<UUID, boolean>>({});
 const showImportDialog = ref(false);
 const showTransferCenter = ref(false);
 const showSnippetDialog = ref(false);
@@ -1202,8 +1205,14 @@ async function saveConnection(profile: ConnectionProfile, password?: string) {
 
 function editConnection(profile: ConnectionProfile) { editing.value = profile; showDialog.value = true; }
 
-function openRedisManager(connection: ConnectionProfile) {
+function openRedisManager(connection: ConnectionProfile, database?: number) {
   redisManagerConnection.value = connection;
+  redisManagerDatabase.value = database ?? null;
+}
+
+function closeRedisManager() {
+  redisManagerConnection.value = null;
+  redisManagerDatabase.value = null;
 }
 
 function openContextMenu(event: MouseEvent, target: ContextTarget) {
@@ -1578,18 +1587,33 @@ async function closeDatabaseWorkspaceTabs(connectionId: UUID, database?: string,
   return true;
 }
 
+async function loadRedisDatabases(connection: ConnectionProfile) {
+  redisLoading.value = { ...redisLoading.value, [connection.id]: true };
+  try {
+    await api.connectRedis(connection.id);
+    const databases = await api.listRedisDatabases(connection.id);
+    redisDatabases.value = { ...redisDatabases.value, [connection.id]: databases };
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    redisLoading.value = { ...redisLoading.value, [connection.id]: false };
+  }
+}
+
 async function toggleConnection(connection: ConnectionProfile) {
   if (connection.driverKind === "redis") {
     if (expandedConnectionId.value === connection.id) {
       expandedConnectionId.value = null;
       expandedDatabase.value = null;
       collapseObjectGroups();
+      void api.disconnectRedis(connection.id).catch(() => {});
       return;
     }
     if (expandedConnectionId.value && !await closeDatabaseWorkspaceTabs(expandedConnectionId.value)) return;
     expandedConnectionId.value = connection.id;
     expandedDatabase.value = null;
     collapseObjectGroups();
+    await loadRedisDatabases(connection);
     return;
   }
   if (expandedConnectionId.value === connection.id) {
@@ -3668,6 +3692,8 @@ async function importSqlFile(targetDatabase?: string) {
       :selected-database="selectedDatabase"
       :active-connection-id="activeConnectionId"
       :connection-groups="connectionGroups"
+      :redis-databases="redisDatabases"
+      :redis-loading="redisLoading"
       :filtered-databases="filteredDatabases"
       :filtered-base-tables="filteredBaseTables"
       :filtered-views="filteredViews"
@@ -3688,6 +3714,7 @@ async function importSqlFile(targetDatabase?: string) {
       @toggle-connection="toggleConnection"
       @edit-connection="editConnection"
       @open-redis-manager="openRedisManager"
+      @open-redis-database="openRedisManager"
       @disconnect-connection="disconnectConnection"
       @toggle-database="toggleDatabase"
       @context-menu="openContextMenu"
@@ -4207,7 +4234,7 @@ async function importSqlFile(targetDatabase?: string) {
     <DiagnosticsDialog v-if="showDiagnostics" @close="showDiagnostics = false" />
 
     <ServerAdminPanel v-if="showServerAdmin && activeConnectionId" :connection-id="activeConnectionId" :database-kind="activeConnectionKind" @close="showServerAdmin = false" @open-sql="openAdminSql" />
-    <RedisManager v-if="redisManagerConnection" :connection="redisManagerConnection" @close="redisManagerConnection = null" />
+    <RedisManager v-if="redisManagerConnection" :connection="redisManagerConnection" :initial-database="redisManagerDatabase ?? undefined" @close="closeRedisManager" />
 
     <TransferCenter
       v-if="showTransferCenter"
