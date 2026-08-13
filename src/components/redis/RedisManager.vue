@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import { RefreshCw, Search, Server, Terminal, Trash2, KeyRound, CircleGauge } from "lucide-vue-next";
-import AppDialog from "@/components/AppDialog.vue";
+import { RefreshCw, Search, Terminal, Trash2, KeyRound, CircleGauge, X } from "lucide-vue-next";
 import AppSelect from "@/components/AppSelect.vue";
 import { api } from "@/lib/api";
 import type {
@@ -256,8 +255,17 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <AppDialog :title="`Redis 管理器 · ${connection.name}`" title-id="redis-manager-title" :description="info ? `${info.serverVersion}${info.serverComment ? ` · ${info.serverComment}` : ''}` : '正在连接…'" dialog-class="redis-manager-dialog" close-label="关闭 Redis 管理器" @close="emit('close')">
-      <template #icon><KeyRound :size="18" :stroke-width="1.8" /></template>
+  <section class="redis-manager">
+      <header class="redis-manager-header">
+        <div class="redis-manager-heading">
+          <span class="redis-manager-icon" aria-hidden="true"><KeyRound :size="18" :stroke-width="1.8" /></span>
+          <div>
+            <h2>Redis 管理器 · {{ connection.name }}</h2>
+            <p>{{ info ? `${info.serverVersion}${info.serverComment ? ` · ${info.serverComment}` : ''}` : '正在连接…' }}</p>
+          </div>
+        </div>
+        <button type="button" class="icon-button" aria-label="关闭 Redis 管理器" @click="emit('close')"><X :size="16" /></button>
+      </header>
 
       <div class="redis-manager-body">
         <aside class="redis-key-pane">
@@ -332,16 +340,17 @@ onBeforeUnmount(() => {
         </section>
       </div>
 
-      <template #footer>
-        <span>{{ scanning || valueLoading || infoLoading ? '正在加载…' : '' }}</span>
-        <button class="secondary" @click="emit('close')">关闭</button>
-      </template>
-  </AppDialog>
+  </section>
 </template>
 
 <style scoped>
-.redis-manager-dialog { max-width: 1040px; height: min(760px, 88vh); }
-.redis-manager-body { display: grid; grid-template-columns: 320px 1fr; min-height: 0; flex: 1; gap: 0; border-top: 1px solid var(--border-strong); }
+.redis-manager { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--surface-1); }
+.redis-manager-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border-strong); }
+.redis-manager-heading { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.redis-manager-icon { display: inline-flex; color: var(--accent); }
+.redis-manager-heading h2 { margin: 0; font-size: 13px; font-weight: 650; }
+.redis-manager-heading p { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
+.redis-manager-body { display: grid; grid-template-columns: 320px 1fr; min-height: 0; flex: 1; gap: 0; }
 .redis-key-pane { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--border-strong); background: var(--surface-1); }
 .redis-manager-toolbar { padding: 8px; border-bottom: 1px solid var(--border-strong); }
 .redis-key-search { display: flex; align-items: center; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border-strong); }

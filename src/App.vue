@@ -3729,7 +3729,9 @@ async function importSqlFile(targetDatabase?: string) {
       @resize-key="resizeNavigationWithKeyboard"
     />
 
-    <main v-if="connections.length || activeWorkspaceTab" class="workspace">
+    <main v-if="connections.length || activeWorkspaceTab || redisManagerConnection" class="workspace">
+      <RedisManager v-if="redisManagerConnection" :connection="redisManagerConnection" :initial-database="redisManagerDatabase ?? undefined" @close="closeRedisManager" />
+      <template v-if="!redisManagerConnection">
       <WorkspaceEmpty v-if="!activeWorkspaceTab" />
 
       <WorkspaceTabs
@@ -4224,6 +4226,7 @@ async function importSqlFile(targetDatabase?: string) {
           </div>
         </div>
       </section>
+      </template>
     </main>
 
     <ConnectionDialog v-if="showDialog" :initial="editing" @close="showDialog = false; editing = null" @save="saveConnection" />
@@ -4234,7 +4237,6 @@ async function importSqlFile(targetDatabase?: string) {
     <DiagnosticsDialog v-if="showDiagnostics" @close="showDiagnostics = false" />
 
     <ServerAdminPanel v-if="showServerAdmin && activeConnectionId" :connection-id="activeConnectionId" :database-kind="activeConnectionKind" @close="showServerAdmin = false" @open-sql="openAdminSql" />
-    <RedisManager v-if="redisManagerConnection" :connection="redisManagerConnection" :initial-database="redisManagerDatabase ?? undefined" @close="closeRedisManager" />
 
     <TransferCenter
       v-if="showTransferCenter"
