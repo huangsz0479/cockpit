@@ -5,6 +5,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { join } from "@tauri-apps/api/path";
 import { getVersion } from "@tauri-apps/api/app";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { ArrowDownWideNarrow, ArrowUpDown, ArrowUpNarrowWide, Braces, ChevronDown, ChevronLeft, ChevronRight, CircleCheck, CircleMinus, Clipboard, Columns3, Copy, Database, Download, ExternalLink, Eye, FileCode2, FileUp, FolderOpen, ListFilter, MoreHorizontal, Pencil, Play, Plus, RefreshCw, RotateCcw, Search, Table2, Trash2, Unplug, X } from "lucide-vue-next";
 import commitIcon from "../src-tauri/icons/database/commit.svg";
 import databaseIcon from "../src-tauri/icons/database/database.svg";
@@ -51,6 +52,7 @@ import { columnIsNullable, hasDatabaseDefault, isGeneratedColumn, parseRowCell, 
 import { findSqlParameters } from "@/lib/sqlParameters";
 import { useActionDialog } from "@/lib/actionDialog";
 import { api } from "@/lib/api";
+import { fetchLatestGitHubRelease, isNewerVersion } from "@/lib/githubRelease";
 import { alterTableSql, canAppendSelectQueryLimit, canPageSelectQuery, createDefaultTableDefinition, createTableSql, quoteIdentifier, quoteMysqlIdentifier, selectPreviewSql, selectQueryPageSql, selectTablePageSql, singleTableSelectAllTargets, tableDetailToDefinition } from "@/lib/sql";
 import type { CreateTableDefinition } from "@/lib/sql";
 import { useAppStore } from "@/stores/app";
@@ -127,6 +129,7 @@ const { connections, connectionInfo, activeConnectionId, connected, databases, s
 const showDialog = ref(false);
 const showSettings = ref(false);
 const appVersion = ref("—");
+const updateCheckPending = ref(false);
 const runtimeStats = ref<RuntimeStats | null>(null);
 const runtimeStatsState = ref<"loading" | "ready" | "unavailable">("__TAURI_INTERNALS__" in window ? "loading" : "unavailable");
 const showDiagnostics = ref(false);
@@ -213,8 +216,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   editorFontSize: 12,
   editorTabSize: 2,
   confirmDestructiveQueries: true,
-  autoCheckUpdates: false,
-  updateManifestUrl: "",
+  autoCheckUpdates: true,
   defaultExportFormat: "excel",
   backupCompression: "none",
   backupEncryption: false,
@@ -560,7 +562,7 @@ onMounted(async () => {
     unlistenTransferProgress = await listen<TransferProgress>("transfer-progress", ({ payload }) => updateTransferProgress(payload));
     backupScheduleTimer = setInterval(() => { void checkBackupSchedule(); }, 60_000);
     await loadSettings();
-    if (settings.value.autoCheckUpdates && settings.value.updateManifestUrl?.trim()) void checkForUpdates(settings.value.updateManifestUrl, false);
+    if (settings.value.autoCheckUpdates) void checkForUpdates(false);
     await store.loadConnections();
     if (settings.value.autoSaveWorkspace) await restoreWorkspace();
     else workspaceRestored.value = true;
@@ -778,8 +780,9 @@ async function loadSettings() {
   try {
     const payload = await api.loadWorkspaceState(SETTINGS_STATE_KEY);
     if (payload) {
-      const loaded = { ...DEFAULT_SETTINGS, ...JSON.parse(payload) as Partial<AppSettings> } as AppSettings & { theme?: unknown };
+      const loaded = { ...DEFAULT_SETTINGS, ...JSON.parse(payload) as Partial<AppSettings> } as AppSettings & { theme?: unknown; updateManifestUrl?: unknown };
       delete loaded.theme;
+      delete loaded.updateManifestUrl;
       settings.value = loaded;
     }
     applySettingsEffects();
@@ -814,46 +817,45 @@ function applySettingsEffects() {
   document.documentElement.style.setProperty("--editor-font-size", `${settings.value.editorFontSize ?? 12}px`);
 }
 
-function compareVersions(left: string, right: string) {
-  const normalize = (value: string) => value.replace(/^v/i, "").split(/[.-]/).slice(0, 3).map((part) => Number.parseInt(part, 10) || 0);
-  const a = normalize(left); const b = normalize(right);
-  for (let index = 0; index < 3; index += 1) { if (a[index] !== b[index]) return (a[index] ?? 0) - (b[index] ?? 0); }
-  return 0;
-}
-
-async function checkForUpdates(manifestUrl: string, notifyWhenCurrent = true) {
+async function checkForUpdates(notifyWhenCurrent = true) {
+  if (updateCheckPending.value) return;
+  updateCheckPending.value = true;
+  let showFailure = notifyWhenCurrent;
   try {
-    const updateUrl = new URL(manifestUrl.trim());
-    const local = updateUrl.hostname === "localhost" || updateUrl.hostname === "127.0.0.1" || updateUrl.hostname === "::1";
-    if (updateUrl.protocol !== "https:" && !(updateUrl.protocol === "http:" && local)) throw new Error("更新地址必须使用 HTTPS");
-    const response = await fetch(updateUrl, { cache: "no-store", headers: { Accept: "application/json" } });
-    if (!response.ok) throw new Error(`更新服务返回 ${response.status}`);
-    const manifest = await response.json() as { version?: string; notes?: string; url?: string };
-    if (!manifest.version || !/^v?\d+\.\d+\.\d+(?:[-+].*)?$/.test(manifest.version)) throw new Error("更新清单缺少有效的 version");
-    const current = await getVersion();
-    if (compareVersions(manifest.version, current) > 0) {
-      const detail = [manifest.notes, manifest.url ? `下载地址：${manifest.url}` : ""].filter(Boolean).join("\n\n");
-      await showNotice({
-        title: "发现新版本",
-        message: `Cockpit ${manifest.version} 已发布（当前版本 ${current}）。`,
-        detail,
+    const [release, currentVersion] = await Promise.all([
+      fetchLatestGitHubRelease(),
+      getVersion(),
+    ]);
+    if (!isNewerVersion(release.version, currentVersion)) {
+      if (notifyWhenCurrent) await showNotice({
+        title: "已是最新版本",
+        message: `当前版本 ${currentVersion} 已是最新版本。`,
         tone: "success",
-        confirmLabel: "知道了",
       });
-    } else if (notifyWhenCurrent) await showNotice({
-      title: "已是最新版本",
-      message: `当前版本 ${current} 已是最新版本。`,
+      return;
+    }
+
+    showFailure = true;
+    const openDownloadPage = await confirmAction({
+      title: "发现新版本",
+      message: `Cockpit ${release.version} 已发布（当前版本 ${currentVersion}）。`,
+      detail: release.notes?.trim() || "可前往 GitHub Releases 查看说明并下载安装包。",
       tone: "success",
+      confirmLabel: "前往 GitHub 下载",
+      cancelLabel: "稍后",
     });
+    if (openDownloadPage) await openUrl(release.url);
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause);
-    if (notifyWhenCurrent) await showNotice({
+    if (showFailure) await showNotice({
       title: "检查更新失败",
       message,
-      detail: "请检查更新地址和网络连接后重试。",
+      detail: "请检查网络连接后重试，也可直接打开 Cockpit 的 GitHub Releases 页面。",
       tone: "warning",
     });
     else console.warn(`automatic update check failed: ${message}`);
+  } finally {
+    updateCheckPending.value = false;
   }
 }
 
@@ -4180,7 +4182,7 @@ async function importSqlFile(targetDatabase?: string) {
 
     <QueryExportDialog v-if="showQueryExportDialog && displayedResult?.columns.length" v-model="exportFormat" :options="EXPORT_FORMATS" :busy="busy" :full-disabled="!activeWorkspaceTab?.pagingSql" @close="showQueryExportDialog = false" @export-page="showQueryExportDialog = false; exportCurrentPage()" @export-full="showQueryExportDialog = false; exportFullQuery()" />
 
-    <SettingsDialog v-if="showSettings" :initial="settings" :version="appVersion" @close="showSettings = false" @save="saveSettings" @diagnostics="showDiagnostics = true" @check-update="checkForUpdates($event)" />
+    <SettingsDialog v-if="showSettings" :initial="settings" :version="appVersion" :checking-update="updateCheckPending" @close="showSettings = false" @save="saveSettings" @diagnostics="showDiagnostics = true" @check-update="checkForUpdates()" />
     <DiagnosticsDialog v-if="showDiagnostics" @close="showDiagnostics = false" />
 
     <ServerAdminPanel v-if="showServerAdmin && activeConnectionId" :connection-id="activeConnectionId" :database-kind="activeConnectionKind" @close="showServerAdmin = false" @open-sql="openAdminSql" />

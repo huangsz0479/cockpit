@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { reactive, ref } from "vue";
 import {
   Check,
   Code2,
@@ -14,36 +14,18 @@ import AppDialog from "@/components/AppDialog.vue";
 import AppSelect from "@/components/AppSelect.vue";
 import type { AppSettings } from "@/types";
 
-const props = withDefaults(defineProps<{ initial: AppSettings; version?: string }>(), { version: "—" });
+const props = withDefaults(defineProps<{ initial: AppSettings; version?: string; checkingUpdate?: boolean }>(), { version: "—", checkingUpdate: false });
 const emit = defineEmits<{
   close: [];
   save: [settings: AppSettings];
   diagnostics: [];
-  checkUpdate: [manifestUrl: string];
+  checkUpdate: [];
 }>();
 
 const draft = reactive<AppSettings>({ ...props.initial });
-if (!draft.updateManifestUrl?.trim()) draft.autoCheckUpdates = false;
 const activeSection = ref<"general" | "editor" | "backup" | "security" | "about">("general");
-const updateManifestUrlError = computed(() => {
-  const value = draft.updateManifestUrl?.trim() ?? "";
-  if (!value) return draft.autoCheckUpdates ? "启用自动检查前，请填写更新清单地址" : "";
-  try {
-    const url = new URL(value);
-    const local = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "::1";
-    return url.protocol === "https:" || (url.protocol === "http:" && local)
-      ? ""
-      : "更新地址必须使用 HTTPS";
-  } catch {
-    return "请输入有效的更新清单地址";
-  }
-});
 
 function submit() {
-  if (updateManifestUrlError.value) {
-    activeSection.value = "security";
-    return;
-  }
   emit("save", { ...draft });
 }
 </script>
@@ -146,12 +128,9 @@ function submit() {
               <div class="settings-group">
                 <h4>应用更新</h4>
                 <div class="settings-toggle-list">
-                  <label class="setting-toggle"><input v-model="draft.autoCheckUpdates" type="checkbox" /><span><strong>启动时检查更新</strong><small>应用启动后自动检查是否存在新版本</small></span></label>
+                  <label class="setting-toggle"><input v-model="draft.autoCheckUpdates" type="checkbox" /><span><strong>启动时检查更新</strong><small>从 Cockpit 的 GitHub Releases 检查正式版本，不会自动下载或安装</small></span></label>
                 </div>
-                <label class="setting-field setting-field-wide"><span>更新清单地址</span>
-                  <span class="settings-inline-field"><input v-model="draft.updateManifestUrl" type="url" placeholder="https://…/latest.json" :aria-invalid="Boolean(updateManifestUrlError)" aria-describedby="settings-update-url-error" /><button type="button" class="ghost compact" :disabled="Boolean(updateManifestUrlError) || !draft.updateManifestUrl?.trim()" @click="emit('checkUpdate', draft.updateManifestUrl || '')">检查</button></span>
-                  <small v-if="updateManifestUrlError" id="settings-update-url-error" class="settings-field-error" role="alert">{{ updateManifestUrlError }}</small>
-                </label>
+                <button type="button" class="ghost compact" :disabled="checkingUpdate" @click="emit('checkUpdate')">{{ checkingUpdate ? '正在检查…' : '立即检查' }}</button>
               </div>
             </section>
 

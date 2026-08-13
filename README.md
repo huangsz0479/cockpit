@@ -272,7 +272,7 @@ Click **Settings** in the top toolbar to configure:
 - Editor font size and tab width
 - Default export format, backup content, compression, and encryption
 - High-risk SQL confirmation
-- Update manifest URL and update checks on startup
+- GitHub Releases update checks on startup
 
 Use **Diagnostic Logs** in Settings to investigate connection or execution issues. Logs redact sensitive connection information, but you should still check for business table names, SQL, or other internal information before sharing them.
 
@@ -325,7 +325,7 @@ Scheduled backups require Cockpit to remain open and the target connection to st
 ## 15. Known Limitations
 
 - PostgreSQL does not currently support SSH tunneling.
-- Update checks only read a user-configured HTTPS JSON manifest and display a notification. They do not automatically download or install updates.
+- Cockpit checks stable releases on GitHub and displays a notification when a newer version is available. Downloads and installation remain manual.
 - Scheduled backups only run while Cockpit is open.
 - CSV and Excel imports retain parsed data in memory until submission. Split very large files into smaller batches.
 - Some metadata or management features may be unavailable depending on the database version and account permissions.

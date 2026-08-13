@@ -9,6 +9,14 @@ import mysqlIcon from "../src-tauri/icons/database/mysql.svg";
 import App from "./App.vue";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn() }));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
+vi.mock("@/lib/githubRelease", () => ({
+  fetchLatestGitHubRelease: vi.fn().mockResolvedValue({
+    version: "0.1.5",
+    url: "https://github.com/huangsz0479/cockpit/releases/tag/v0.1.5",
+  }),
+  isNewerVersion: vi.fn().mockReturnValue(false),
+}));
 vi.mock("@tauri-apps/api/app", () => ({ getVersion: vi.fn().mockResolvedValue("0.1.5") }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 

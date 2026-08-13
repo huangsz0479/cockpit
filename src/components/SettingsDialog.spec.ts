@@ -105,4 +105,37 @@ describe("SettingsDialog", () => {
     expect(host.querySelector(".settings-about")?.textContent).toContain("Apache License 2.0");
     app.unmount();
   });
+
+  it("checks the fixed GitHub release source without asking for a manifest URL", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const checkUpdate = vi.fn();
+    const app = createApp({
+      render: () => h(SettingsDialog, {
+        initial: {
+          queryPageSize: 500,
+          tablePageSize: 100,
+          showSystemDatabases: false,
+          autoSaveWorkspace: true,
+          backupIncludeData: true,
+          autoCheckUpdates: true,
+        },
+        onCheckUpdate: checkUpdate,
+      }),
+    });
+    app.mount(host);
+
+    Array.from(host.querySelectorAll<HTMLButtonElement>(".settings-navigation button"))
+      .find((button) => button.textContent?.includes("安全与更新"))!
+      .click();
+    await nextTick();
+
+    expect(host.textContent).toContain("GitHub Releases");
+    expect(host.textContent).not.toContain("更新清单地址");
+    Array.from(host.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent === "立即检查")!
+      .click();
+    expect(checkUpdate).toHaveBeenCalledOnce();
+    app.unmount();
+  });
 });

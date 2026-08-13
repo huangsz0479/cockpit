@@ -195,7 +195,6 @@ export interface AppSettings {
   editorTabSize?: number;
   confirmDestructiveQueries?: boolean;
   autoCheckUpdates?: boolean;
-  updateManifestUrl?: string;
   defaultExportFormat?: ExportFormat;
   backupCompression?: "none" | "gzip";
   backupEncryption?: boolean;
