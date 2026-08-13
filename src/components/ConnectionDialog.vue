@@ -38,11 +38,17 @@ const testing = ref(false);
 const testMessage = ref("");
 const testState = ref<"success" | "error" | null>(null);
 const needsPassword = computed(() => profile.driverKind !== "sqlite");
-const valid = computed(() => profile.name.trim() && profile.host.trim() && (
-  profile.driverKind === "sqlite" || (profile.username.trim() && profile.port > 0)
-));
+const valid = computed(() => Boolean(profile.name.trim() && profile.host.trim() && (
+  profile.driverKind === "sqlite"
+    || (profile.driverKind === "redis"
+      ? profile.port > 0
+      : (profile.username.trim() && profile.port > 0))
+)));
 const canSave = computed(() => Boolean(valid.value) && (
-  !needsPassword.value || !props.initial || (passwordStored.value !== null && (passwordStored.value || password.value.length > 0))
+  profile.driverKind === "redis"
+    || !needsPassword.value
+    || !props.initial
+    || (passwordStored.value !== null && (passwordStored.value || password.value.length > 0))
 ));
 const passwordPlaceholder = computed(() => props.initial && passwordStored.value !== false ? "留空则保留原密码" : "请输入密码");
 
@@ -73,7 +79,7 @@ async function test() {
   try {
     const info = await api.testConnection(profile, password.value || undefined);
     testState.value = "success";
-    const label = profile.driverKind === "mariadb" ? "MariaDB" : profile.driverKind === "postgresql" ? "PostgreSQL" : profile.driverKind === "sqlite" ? "SQLite" : "MySQL";
+    const label = profile.driverKind === "mariadb" ? "MariaDB" : profile.driverKind === "postgresql" ? "PostgreSQL" : profile.driverKind === "sqlite" ? "SQLite" : profile.driverKind === "redis" ? "Redis" : "MySQL";
     testMessage.value = `连接成功 · ${label} ${info.serverVersion}${info.tlsCipher ? ` · TLS ${info.tlsCipher}` : ""}`;
   } catch (error) {
     const message = messageOf(error);
@@ -122,17 +128,25 @@ function changeDriver(kind: DatabaseKind) {
     profile.username = "";
     profile.database = "main";
     passwordStored.value = true;
-  } else {
-    if (!profile.username) profile.username = kind === "postgresql" ? "postgres" : "root";
-    if (profile.port <= 1) profile.port = kind === "postgresql" ? 5432 : 3306;
-    if (kind !== "postgresql" && profile.port === 5432) profile.port = 3306;
-    if (kind === "postgresql" && profile.port === 3306) profile.port = 5432;
-    if (!props.initial) passwordStored.value = false;
+    return;
   }
+  if (kind === "redis") {
+    profile.tls.mode = "disabled";
+    if (!profile.username) profile.username = "";
+    if (profile.port <= 1 || profile.port === 3306 || profile.port === 5432) profile.port = 6379;
+    if (!profile.database) profile.database = "0";
+    if (!props.initial) passwordStored.value = true;
+    return;
+  }
+  if (!profile.username) profile.username = kind === "postgresql" ? "postgres" : "root";
+  if (profile.port <= 1) profile.port = kind === "postgresql" ? 5432 : 3306;
+  if (kind !== "postgresql" && profile.port === 5432) profile.port = 3306;
+  if (kind === "postgresql" && profile.port === 3306) profile.port = 5432;
+  if (!props.initial) passwordStored.value = false;
 }
 
 function onDriverChange(kind: unknown) {
-  if (["mysql", "mariadb", "postgresql", "sqlite"].includes(String(kind))) changeDriver(kind as DatabaseKind);
+  if (["mysql", "mariadb", "postgresql", "sqlite", "redis"].includes(String(kind))) changeDriver(kind as DatabaseKind);
 }
 
 function toggleSsh(enabled: boolean) {
@@ -152,15 +166,15 @@ function onSshToggle(event: Event) {
 
       <div class="connection-dialog-body">
         <div class="form-grid connection-basics-grid">
-          <label><span>数据库类型</span><AppSelect :model-value="profile.driverKind" :options="[{ value: 'mysql', label: 'MySQL' }, { value: 'mariadb', label: 'MariaDB' }, { value: 'postgresql', label: 'PostgreSQL' }, { value: 'sqlite', label: 'SQLite' }]" label="数据库类型" @update:model-value="onDriverChange" /></label>
+          <label><span>数据库类型</span><AppSelect :model-value="profile.driverKind" :options="[{ value: 'mysql', label: 'MySQL' }, { value: 'mariadb', label: 'MariaDB' }, { value: 'postgresql', label: 'PostgreSQL' }, { value: 'sqlite', label: 'SQLite' }, { value: 'redis', label: 'Redis' }]" label="数据库类型" @update:model-value="onDriverChange" /></label>
           <label><span>连接分组</span><input v-model="profile.group" placeholder="例如：生产 / 测试" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
           <label class="wide"><span>连接名称 <b>*</b></span><input v-model="profile.name" placeholder="请输入连接名称" autofocus required autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
           <label v-if="profile.driverKind === 'sqlite'" class="wide"><span>数据库文件 <b>*</b></span><div class="path-field"><input v-model="profile.host" required autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><button type="button" class="secondary compact" @click="pickSqliteFile">选择</button></div></label>
           <template v-else><label class="wide"><span>主机 <b>*</b></span><input v-model="profile.host" placeholder="127.0.0.1" required autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
           <label><span>端口</span><input v-model.number="profile.port" type="number" min="1" max="65535" /></label>
-          <label><span>默认数据库</span><input v-model="profile.database" placeholder="可选" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
-          <label><span>用户名 <b>*</b></span><input v-model="profile.username" autocomplete="username" required autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
-          <label><span>密码 <b v-if="!initial || passwordStored === false">*</b></span><input v-model="password" type="password" autocomplete="current-password" :required="!initial || passwordStored === false" :placeholder="passwordPlaceholder" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><small v-if="initial && passwordStored === false && !password" class="password-warning">重启后未找到已保存密码，请重新输入</small></label>
+          <label><span>{{ profile.driverKind === 'redis' ? '逻辑库（0–15）' : '默认数据库' }}</span><input v-model="profile.database" placeholder="可选" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
+          <label><span>用户名 <b v-if="profile.driverKind !== 'redis'">*</b></span><input v-model="profile.username" autocomplete="username" :required="profile.driverKind !== 'redis'" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
+          <label><span>密码 <b v-if="profile.driverKind !== 'redis' && (!initial || passwordStored === false)">*</b></span><input v-model="password" type="password" autocomplete="current-password" :required="profile.driverKind !== 'redis' && (!initial || passwordStored === false)" :placeholder="profile.driverKind === 'redis' ? '密码（可选）' : passwordPlaceholder" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><small v-if="initial && passwordStored === false && !password" class="password-warning">重启后未找到已保存密码，请重新输入</small></label>
           </template>
         </div>
 
@@ -194,10 +208,12 @@ function onSshToggle(event: Event) {
             <ChevronRight class="connection-options-chevron" :size="15" aria-hidden="true" />
           </summary>
           <div class="form-grid connection-advanced">
-          <label><span>TLS 模式</span><AppSelect v-model="profile.tls.mode" :options="[{ value: 'disabled', label: '关闭' }, { value: 'preferred', label: '优先' }, { value: 'required', label: '必须' }, { value: 'verify_ca', label: '校验 CA' }, { value: 'verify_identity', label: '校验主机名' }]" label="TLS 模式" /></label>
-          <label v-if="profile.tls.mode === 'verify_ca' || profile.tls.mode === 'verify_identity'" class="wide"><span>CA 证书</span><div class="path-field"><input v-model="profile.tls.caCertPath" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><button type="button" class="secondary compact" @click="pickCertificate('caCertPath')">选择</button></div></label>
-          <label v-if="profile.tls.mode !== 'disabled'" class="wide"><span>客户端证书（可选）</span><div class="path-field"><input v-model="profile.tls.clientCertPath" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><button type="button" class="secondary compact" @click="pickCertificate('clientCertPath')">选择</button></div></label>
-          <label v-if="profile.tls.mode !== 'disabled'" class="wide"><span>客户端私钥（可选）</span><div class="path-field"><input v-model="profile.tls.clientKeyPath" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><button type="button" class="secondary compact" @click="pickCertificate('clientKeyPath')">选择</button></div></label>
+          <template v-if="profile.driverKind !== 'redis'">
+            <label><span>TLS 模式</span><AppSelect v-model="profile.tls.mode" :options="[{ value: 'disabled', label: '关闭' }, { value: 'preferred', label: '优先' }, { value: 'required', label: '必须' }, { value: 'verify_ca', label: '校验 CA' }, { value: 'verify_identity', label: '校验主机名' }]" label="TLS 模式" /></label>
+            <label v-if="profile.tls.mode === 'verify_ca' || profile.tls.mode === 'verify_identity'" class="wide"><span>CA 证书</span><div class="path-field"><input v-model="profile.tls.caCertPath" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><button type="button" class="secondary compact" @click="pickCertificate('caCertPath')">选择</button></div></label>
+            <label v-if="profile.tls.mode !== 'disabled'" class="wide"><span>客户端证书（可选）</span><div class="path-field"><input v-model="profile.tls.clientCertPath" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><button type="button" class="secondary compact" @click="pickCertificate('clientCertPath')">选择</button></div></label>
+            <label v-if="profile.tls.mode !== 'disabled'" class="wide"><span>客户端私钥（可选）</span><div class="path-field"><input v-model="profile.tls.clientKeyPath" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><button type="button" class="secondary compact" @click="pickCertificate('clientKeyPath')">选择</button></div></label>
+          </template>
           <label><span>连接超时（秒）</span><input v-model.number="profile.connectTimeoutSecs" type="number" min="1" max="300" /></label>
           <label><span>查询超时（秒）</span><input v-model.number="profile.queryTimeoutSecs" type="number" min="1" max="86400" /></label>
           <label><span>连接池上限</span><input v-model.number="profile.poolSize" type="number" min="1" max="32" /></label>

@@ -6,7 +6,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { join } from "@tauri-apps/api/path";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ArrowDownWideNarrow, ArrowUpDown, ArrowUpNarrowWide, Braces, ChevronDown, ChevronLeft, ChevronRight, CircleCheck, CircleMinus, Clipboard, Columns3, Copy, Database, Download, ExternalLink, Eye, FileCode2, FileUp, FolderOpen, ListFilter, MoreHorizontal, Pencil, Play, Plus, RefreshCw, RotateCcw, Search, Table2, Trash2, Unplug, X } from "lucide-vue-next";
+import { ArrowDownWideNarrow, ArrowUpDown, ArrowUpNarrowWide, Braces, ChevronDown, ChevronLeft, ChevronRight, CircleCheck, CircleMinus, Clipboard, Columns3, Copy, Database, Download, ExternalLink, Eye, FileCode2, FileUp, FolderOpen, KeyRound, ListFilter, MoreHorizontal, Pencil, Play, Plus, RefreshCw, RotateCcw, Search, Table2, Trash2, Unplug, X } from "lucide-vue-next";
 import commitIcon from "../src-tauri/icons/database/commit.svg";
 import databaseIcon from "../src-tauri/icons/database/database.svg";
 import exportIcon from "../src-tauri/icons/database/export.svg";
@@ -37,6 +37,7 @@ import DatabaseObjectEditor from "@/components/DatabaseObjectEditor.vue";
 import SettingsDialog from "@/components/SettingsDialog.vue";
 import DiagnosticsDialog from "@/components/DiagnosticsDialog.vue";
 import ServerAdminPanel from "@/components/ServerAdminPanel.vue";
+import RedisManager from "@/components/redis/RedisManager.vue";
 import SchemaCompareDialog from "@/components/SchemaCompareDialog.vue";
 import ActionDialog from "@/components/ActionDialog.vue";
 import AppSelect from "@/components/AppSelect.vue";
@@ -134,6 +135,7 @@ const runtimeStats = ref<RuntimeStats | null>(null);
 const runtimeStatsState = ref<"loading" | "ready" | "unavailable">("__TAURI_INTERNALS__" in window ? "loading" : "unavailable");
 const showDiagnostics = ref(false);
 const showServerAdmin = ref(false);
+const redisManagerConnection = ref<ConnectionProfile | null>(null);
 const showImportDialog = ref(false);
 const showTransferCenter = ref(false);
 const showSnippetDialog = ref(false);
@@ -1200,6 +1202,10 @@ async function saveConnection(profile: ConnectionProfile, password?: string) {
 
 function editConnection(profile: ConnectionProfile) { editing.value = profile; showDialog.value = true; }
 
+function openRedisManager(connection: ConnectionProfile) {
+  redisManagerConnection.value = connection;
+}
+
 function openContextMenu(event: MouseEvent, target: ContextTarget) {
   contextMenu.value = { x: event.clientX, y: event.clientY, target };
 }
@@ -1216,12 +1222,13 @@ async function copyText(value: string) {
   }
 }
 
-async function runConnectionContextAction(action: "toggle" | "edit" | "disconnect" | "remove") {
+async function runConnectionContextAction(action: "toggle" | "edit" | "disconnect" | "remove" | "redis") {
   const target = contextMenu.value?.target;
   if (!target || target.kind !== "connection") return;
   const connection = target.connection;
   closeContextMenu();
   if (action === "toggle") await toggleConnection(connection);
+  else if (action === "redis") openRedisManager(connection);
   else if (action === "edit") editConnection(connection);
   else if (action === "disconnect") await disconnectConnection(connection.id);
   else await removeConnection(connection);
@@ -1572,6 +1579,19 @@ async function closeDatabaseWorkspaceTabs(connectionId: UUID, database?: string,
 }
 
 async function toggleConnection(connection: ConnectionProfile) {
+  if (connection.driverKind === "redis") {
+    if (expandedConnectionId.value === connection.id) {
+      expandedConnectionId.value = null;
+      expandedDatabase.value = null;
+      collapseObjectGroups();
+      return;
+    }
+    if (expandedConnectionId.value && !await closeDatabaseWorkspaceTabs(expandedConnectionId.value)) return;
+    expandedConnectionId.value = connection.id;
+    expandedDatabase.value = null;
+    collapseObjectGroups();
+    return;
+  }
   if (expandedConnectionId.value === connection.id) {
     if (!await closeDatabaseWorkspaceTabs(connection.id)) return;
     if (activeConnectionId.value === connection.id) store.closeDatabase();
@@ -3667,6 +3687,7 @@ async function importSqlFile(targetDatabase?: string) {
       @load-more="loadMoreTables"
       @toggle-connection="toggleConnection"
       @edit-connection="editConnection"
+      @open-redis-manager="openRedisManager"
       @disconnect-connection="disconnectConnection"
       @toggle-database="toggleDatabase"
       @context-menu="openContextMenu"
@@ -4186,6 +4207,7 @@ async function importSqlFile(targetDatabase?: string) {
     <DiagnosticsDialog v-if="showDiagnostics" @close="showDiagnostics = false" />
 
     <ServerAdminPanel v-if="showServerAdmin && activeConnectionId" :connection-id="activeConnectionId" :database-kind="activeConnectionKind" @close="showServerAdmin = false" @open-sql="openAdminSql" />
+    <RedisManager v-if="redisManagerConnection" :connection="redisManagerConnection" @close="redisManagerConnection = null" />
 
     <TransferCenter
       v-if="showTransferCenter"
@@ -4234,6 +4256,7 @@ async function importSqlFile(targetDatabase?: string) {
       <template v-if="contextMenu.target.kind === 'connection'">
         <div class="context-menu-title">{{ contextMenu.target.connection.name }}</div>
         <button role="menuitem" @click="runConnectionContextAction('toggle')"><Database :size="14" />{{ expandedConnectionId === contextMenu.target.connection.id ? '收起连接' : '连接并展开' }}</button>
+        <button v-if="contextMenu.target.connection.driverKind === 'redis'" role="menuitem" @click="runConnectionContextAction('redis')"><KeyRound :size="14" />打开 Redis 管理器</button>
         <button role="menuitem" @click="runConnectionContextAction('edit')"><Pencil :size="14" />编辑连接</button>
         <button v-if="connectionInfo[contextMenu.target.connection.id]" role="menuitem" @click="runConnectionContextAction('disconnect')"><Unplug :size="14" />断开连接</button>
         <div class="context-menu-separator" />

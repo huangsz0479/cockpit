@@ -4,6 +4,7 @@ members = [
   "crates/cockpit-core",
   "crates/cockpit-mysql",
   "crates/cockpit-postgres",
+  "crates/cockpit-redis",
   "crates/cockpit-sqlite",
   "src-tauri",
 ]
@@ -29,6 +30,7 @@ mysql_async = { version = "0.37", default-features = false, features = ["default
 native-tls = "0.2"
 postgres-native-tls = "0.5"
 rand_core = { version = "0.6", features = ["getrandom"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rust_xlsxwriter = "0.96"
 regex = "1"

@@ -1,5 +1,5 @@
 export type UUID = string;
-export type DatabaseKind = "mysql" | "mariadb" | "postgresql" | "sqlite";
+export type DatabaseKind = "mysql" | "mariadb" | "postgresql" | "sqlite" | "redis";
 
 export type TlsMode = "disabled" | "preferred" | "required" | "verify_ca" | "verify_identity";
 export type SshAuthMethod = "password" | "private_key" | "agent";
@@ -308,3 +308,40 @@ export interface RowMutationRequest {
 export interface RowMutationResult { affectedRows: number; concurrentChange: boolean }
 
 export interface CommandError { code: string; message: string }
+
+export type RedisKeyType = "string" | "list" | "set" | "zset" | "hash" | "stream" | "none";
+export interface RedisDatabaseInfo { index: number; keyCount: number }
+export interface RedisKeyInfo {
+  key: string;
+  kind: RedisKeyType;
+  ttlSecs: number;
+  sizeBytes?: number | null;
+}
+export interface RedisScanPage {
+  cursor: number;
+  complete: boolean;
+  keys: RedisKeyInfo[];
+}
+export interface RedisStringValue {
+  valueBase64: string;
+  preview?: string | null;
+  length: number;
+}
+export interface RedisHashField { field: RedisStringValue; value: RedisStringValue }
+export interface RedisZSetMember { value: RedisStringValue; score: string }
+export interface RedisStreamEntry { id: string; fields: RedisHashField[] }
+export type RedisValue =
+  | { kind: "none"; ttlSecs: number }
+  | { kind: "string"; value: RedisStringValue; ttlSecs: number }
+  | { kind: "hash"; fields: RedisHashField[]; length: number; truncated: boolean; ttlSecs: number }
+  | { kind: "list"; values: RedisStringValue[]; length: number; truncated: boolean; ttlSecs: number }
+  | { kind: "set"; values: RedisStringValue[]; length: number; truncated: boolean; ttlSecs: number }
+  | { kind: "zset"; members: RedisZSetMember[]; length: number; truncated: boolean; ttlSecs: number }
+  | { kind: "stream"; entries: RedisStreamEntry[]; length: number; truncated: boolean; ttlSecs: number };
+export type RedisReply =
+  | { kind: "nil" }
+  | { kind: "status"; text: string }
+  | { kind: "integer"; value: number }
+  | { kind: "bulk_string"; base64: string; preview?: string | null; length: number }
+  | { kind: "array"; items: RedisReply[] }
+  | { kind: "error"; message: string };

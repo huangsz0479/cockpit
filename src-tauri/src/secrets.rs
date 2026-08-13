@@ -72,7 +72,12 @@ impl SecretStore {
 
     pub fn delete_connection(&self, connection_id: Uuid) {
         if let Ok(mut values) = self.session_values.write() {
-            for key in ["mysql_password", "ssh_password", "ssh_key_passphrase"] {
+            for key in [
+                "mysql_password",
+                "redis_password",
+                "ssh_password",
+                "ssh_key_passphrase",
+            ] {
                 values.remove(&Self::account(connection_id, key));
             }
             let _ = persist_vault(&self.vault_file, &self.device_key, &values);

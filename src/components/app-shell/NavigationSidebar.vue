@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { Activity, Cable, ChevronDown, ChevronRight, Database, LockKeyhole, MemoryStick, Pencil, Plus, Unplug } from "lucide-vue-next";
+import { Activity, Cable, ChevronDown, ChevronRight, Database, KeyRound, LockKeyhole, MemoryStick, Pencil, Plus, Unplug } from "lucide-vue-next";
 import databaseIcon from "../../../src-tauri/icons/database/database.svg";
 import databaseIconSvg from "../../../src-tauri/icons/database/database.svg?raw";
 import eventIcon from "../../../src-tauri/icons/database/event.svg";
@@ -52,6 +52,7 @@ const emit = defineEmits<{
   "edit-connection": [connection: ConnectionProfile];
   "disconnect-connection": [id: UUID];
   "toggle-database": [database: string];
+  "open-redis-manager": [connection: ConnectionProfile];
   "context-menu": [event: MouseEvent, target: NavigationContextTarget];
   "highlight-table": [table: TableInfo];
   "preview-table": [table: TableInfo];
@@ -78,6 +79,7 @@ const databaseTypeIcons = {
   mysql: inlineSvg(mysqlIconSvg),
   postgresql: inlineSvg(postgresqlIconSvg),
   sqlite: inlineSvg(sqliteIconSvg),
+  redis: inlineSvg(databaseIconSvg),
 };
 const connectedCount = computed(() => props.connections.filter((connection) => Boolean(props.connectionInfo[connection.id])).length);
 
@@ -94,6 +96,7 @@ function formatMemory(bytes: number | null | undefined) {
 function connectionIcon(kind?: DatabaseKind) {
   if (kind === "postgresql") return databaseTypeIcons.postgresql;
   if (kind === "sqlite") return databaseTypeIcons.sqlite;
+  if (kind === "redis") return databaseTypeIcons.redis;
   if (kind === "mysql" || !kind) return databaseTypeIcons.mysql;
   return databaseTypeIcons.generic;
 }
@@ -128,10 +131,11 @@ function toggleConnectionGroup(name: string) {
         <p>添加连接，立即浏览数据结构、编写 SQL 并轻松管理数据。</p>
       </div>
 
-      <div class="navigation-empty-databases" aria-label="支持 MySQL、PostgreSQL 和 SQLite">
+      <div class="navigation-empty-databases" aria-label="支持 MySQL、PostgreSQL、SQLite 和 Redis">
         <span><i v-html="databaseTypeIcons.mysql" />MySQL</span>
         <span><i v-html="databaseTypeIcons.postgresql" />PostgreSQL</span>
         <span><i v-html="databaseTypeIcons.sqlite" />SQLite</span>
+        <span><i v-html="databaseTypeIcons.redis" />Redis</span>
       </div>
 
       <button type="button" class="navigation-empty-action" @click="$emit('add-connection')">
@@ -161,14 +165,17 @@ function toggleConnectionGroup(name: string) {
                 v-html="connectionIcon(connection.driverKind)"
               />
               <span class="tree-label"><strong>{{ connection.name }}</strong><span v-if="connection.production || connection.readOnly" class="connection-badges"><span v-if="connection.production" class="connection-badge production">生产</span><span v-if="connection.readOnly" class="connection-badge readonly">只读</span></span></span>
-              <span class="connection-kind">{{ connection.driverKind === 'postgresql' ? 'PG' : connection.driverKind === 'sqlite' ? 'SQLite' : connection.driverKind === 'mariadb' ? 'MariaDB' : 'MySQL' }}</span>
+              <span class="connection-kind">{{ connection.driverKind === 'postgresql' ? 'PG' : connection.driverKind === 'sqlite' ? 'SQLite' : connection.driverKind === 'mariadb' ? 'MariaDB' : connection.driverKind === 'redis' ? 'Redis' : 'MySQL' }}</span>
             </button>
-            <span class="tree-row-actions"><button type="button" class="tree-action" aria-label="编辑连接" @mousedown.stop @click.stop="$emit('edit-connection', connection)"><Pencil :size="13" /></button><button v-if="connectionInfo[connection.id]" type="button" class="tree-action" aria-label="断开连接" @mousedown.stop @click.stop="$emit('disconnect-connection', connection.id)"><Unplug :size="13" /></button></span>
+            <span class="tree-row-actions"><button v-if="connection.driverKind === 'redis'" type="button" class="tree-action" aria-label="打开 Redis 管理器" @mousedown.stop @click.stop="$emit('open-redis-manager', connection)"><KeyRound :size="13" /></button><button type="button" class="tree-action" aria-label="编辑连接" @mousedown.stop @click.stop="$emit('edit-connection', connection)"><Pencil :size="13" /></button><button v-if="connectionInfo[connection.id]" type="button" class="tree-action" aria-label="断开连接" @mousedown.stop @click.stop="$emit('disconnect-connection', connection.id)"><Unplug :size="13" /></button></span>
             <span class="status-dot" :class="{ online: connectionInfo[connection.id] }" />
           </div>
 
           <div v-if="expandedConnectionId === connection.id" class="tree-branch connection-children">
-            <div v-if="busy && !connectionInfo[connection.id]" class="tree-loading">正在连接…</div>
+            <div v-if="connection.driverKind === 'redis'" class="tree-empty redis-hint">
+              <button type="button" class="link" @click="$emit('open-redis-manager', connection)"><KeyRound :size="12" />打开 Redis 管理器</button>
+            </div>
+            <div v-else-if="busy && !connectionInfo[connection.id]" class="tree-loading">正在连接…</div>
             <template v-else-if="connectionInfo[connection.id]">
               <div v-for="database in filteredDatabases" :key="database.name" class="database-tree">
                 <div class="tree-row database-node" :class="{ active: selectedDatabase === database.name }" role="button" tabindex="0" @click="$emit('toggle-database', database.name)" @keydown.enter="$emit('toggle-database', database.name)" @keydown.space.prevent="$emit('toggle-database', database.name)" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'database', database: database.name })">

@@ -475,7 +475,7 @@ fn quote_identifier(identifier: &str, database_kind: DatabaseKind) -> String {
         DatabaseKind::MySql | DatabaseKind::MariaDb => {
             format!("`{}`", identifier.replace('`', "``"))
         }
-        DatabaseKind::PostgreSql | DatabaseKind::Sqlite => {
+        DatabaseKind::PostgreSql | DatabaseKind::Sqlite | DatabaseKind::Redis => {
             format!("\"{}\"", identifier.replace('"', "\"\""))
         }
     }
@@ -499,13 +499,18 @@ fn sql_literal(value: &CellValue, database_kind: DatabaseKind) -> Result<String>
         | CellValue::DateTime(value)
         | CellValue::Json(value) => Ok(match database_kind {
             DatabaseKind::MySql | DatabaseKind::MariaDb => mysql_utf8_literal(value),
-            DatabaseKind::PostgreSql | DatabaseKind::Sqlite => quote_sql_string(value),
+            DatabaseKind::PostgreSql | DatabaseKind::Sqlite | DatabaseKind::Redis => {
+                quote_sql_string(value)
+            }
         }),
         CellValue::Bytes { base64, .. } => {
             let hex = decode_hex(base64)?;
             Ok(match database_kind {
                 DatabaseKind::PostgreSql => format!("decode('{hex}', 'hex')"),
-                DatabaseKind::MySql | DatabaseKind::MariaDb | DatabaseKind::Sqlite => {
+                DatabaseKind::MySql
+                | DatabaseKind::MariaDb
+                | DatabaseKind::Sqlite
+                | DatabaseKind::Redis => {
                     format!("X'{hex}'")
                 }
             })
@@ -514,7 +519,10 @@ fn sql_literal(value: &CellValue, database_kind: DatabaseKind) -> Result<String>
             let hex = decode_hex(wkb_base64)?;
             let bytes = match database_kind {
                 DatabaseKind::PostgreSql => format!("decode('{hex}', 'hex')"),
-                DatabaseKind::MySql | DatabaseKind::MariaDb | DatabaseKind::Sqlite => {
+                DatabaseKind::MySql
+                | DatabaseKind::MariaDb
+                | DatabaseKind::Sqlite
+                | DatabaseKind::Redis => {
                     format!("X'{hex}'")
                 }
             };

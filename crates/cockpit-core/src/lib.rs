@@ -2,6 +2,7 @@ pub mod driver;
 pub mod error;
 pub mod exchange;
 pub mod models;
+pub mod redis;
 pub mod safety;
 pub mod storage;
 
@@ -12,4 +13,8 @@ pub use exchange::{
     write_result_page,
 };
 pub use models::*;
+pub use redis::{
+    RedisDatabaseInfo, RedisDriverTrait, RedisHashField, RedisKeyInfo, RedisKeyType, RedisReply,
+    RedisScanPage, RedisSession, RedisStreamEntry, RedisStringValue, RedisValue, RedisZSetMember,
+};
 pub use storage::Storage;

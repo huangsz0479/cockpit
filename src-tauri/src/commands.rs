@@ -18,6 +18,8 @@ use cockpit_core::{
     CellValue, CockpitError, ColumnInfo, ConnectionInfo, ConnectionProfile, DatabaseDriver,
     DatabaseInfo, DatabaseKind, DatabaseObjectDefinition, DatabaseObjectKind, ErrorPayload,
     EventInfo, ExecuteQueryRequest, ExportFormat, ImportConflictPolicy, QueryResultPage,
+    RedisDatabaseInfo, RedisDriverTrait, RedisKeyInfo, RedisReply, RedisScanPage, RedisSession,
+    RedisValue,
     ResultExportOptions, ResultStreamWriter, RoutineInfo, RoutineParameter, RowMutationRequest,
     RowMutationResult, ServerLockInfo, ServerMetric, ServerProcessInfo, ServerVariable,
     SqlAssessment, TableDetail, TableInfo, TriggerInfo, UserAccount, safety::assess_sql,
@@ -25,6 +27,7 @@ use cockpit_core::{
 };
 use cockpit_mysql::MySqlDriver;
 use cockpit_postgres::PostgresDriver;
+use cockpit_redis::RedisDriver;
 use cockpit_sqlite::SqliteDriver;
 use encoding_rs::GB18030;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
@@ -41,6 +44,13 @@ type CommandResult<T> = std::result::Result<T, ErrorPayload>;
 
 fn payload(error: CockpitError) -> ErrorPayload {
     error.payload()
+}
+
+fn password_key(kind: DatabaseKind) -> &'static str {
+    match kind {
+        DatabaseKind::Redis => "redis_password",
+        _ => "mysql_password",
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -331,10 +341,15 @@ pub async fn has_connection_password(
     state: State<'_, Arc<AppState>>,
     connection_id: Uuid,
 ) -> CommandResult<bool> {
-    state
+    let has_mysql = state
         .secrets
         .contains(connection_id, "mysql_password")
-        .map_err(payload)
+        .map_err(payload)?;
+    let has_redis = state
+        .secrets
+        .contains(connection_id, "redis_password")
+        .map_err(payload)?;
+    Ok(has_mysql || has_redis)
 }
 
 #[tauri::command]
@@ -357,7 +372,7 @@ pub async fn save_connection(
     {
         Some(password) => state
             .secrets
-            .set(profile.id, "mysql_password", password)
+            .set(profile.id, password_key(profile.driver_kind), password)
             .map_err(payload)?,
         None => true,
     };
@@ -373,6 +388,9 @@ pub async fn delete_connection(
     connection_id: Uuid,
 ) -> CommandResult<()> {
     if let Some(session) = state.sessions.write().await.remove(&connection_id) {
+        let _ = session.close().await;
+    }
+    if let Some(session) = state.redis_sessions.write().await.remove(&connection_id) {
         let _ = session.close().await;
     }
     close_tab_sessions_for_connection(&state, connection_id).await;
@@ -400,7 +418,7 @@ pub async fn test_connection(
         Some(password) => password,
         None => state
             .secrets
-            .get(request.profile.id, "mysql_password")
+            .get(request.profile.id, password_key(request.profile.driver_kind))
             .map_err(payload)?
             .unwrap_or_default(),
     };
@@ -410,6 +428,7 @@ pub async fn test_connection(
         }
         DatabaseKind::Sqlite => SqliteDriver.test(&request.profile, "").await,
         DatabaseKind::PostgreSql => PostgresDriver.test(&request.profile, &password).await,
+        DatabaseKind::Redis => RedisDriver.test(&request.profile, &password).await,
     }
     .map_err(payload)
 }
@@ -429,13 +448,18 @@ async fn open_driver_session(
     }
     let password = state
         .secrets
-        .get(connection_id, "mysql_password")
+        .get(connection_id, password_key(profile.driver_kind))
         .map_err(payload)?
         .unwrap_or_default();
     match profile.driver_kind {
         DatabaseKind::MySql | DatabaseKind::MariaDb => MySqlDriver.open(profile, password).await,
         DatabaseKind::Sqlite => SqliteDriver.open(profile, String::new()).await,
         DatabaseKind::PostgreSql => PostgresDriver.open(profile, password).await,
+        DatabaseKind::Redis => {
+            return Err(payload(CockpitError::Unsupported(
+                "Redis 连接请使用 Redis 会话入口".into(),
+            )));
+        }
     }
     .map_err(payload)
 }
@@ -540,6 +564,217 @@ pub async fn disconnect_connection(
     };
     close_tab_sessions_for_connection(&state, connection_id).await;
     close_result
+}
+
+async fn open_redis_session(
+    state: &AppState,
+    connection_id: Uuid,
+) -> CommandResult<Arc<dyn RedisSession>> {
+    let profile = state
+        .storage
+        .get_connection(connection_id)
+        .map_err(payload)?
+        .ok_or_else(|| payload(CockpitError::NotFound("连接配置不存在".into())))?;
+    let password = state
+        .secrets
+        .get(connection_id, password_key(profile.driver_kind))
+        .map_err(payload)?
+        .unwrap_or_default();
+    RedisDriver.open(profile, password).await.map_err(payload)
+}
+
+async fn redis_session(
+    state: &AppState,
+    connection_id: Uuid,
+) -> CommandResult<Arc<dyn RedisSession>> {
+    state
+        .redis_sessions
+        .read()
+        .await
+        .get(&connection_id)
+        .cloned()
+        .ok_or_else(|| payload(CockpitError::Connection("Redis 连接尚未打开".into())))
+}
+
+#[tauri::command]
+pub async fn connect_redis_connection(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+) -> CommandResult<ConnectionInfo> {
+    if let Some(session) = state.redis_sessions.read().await.get(&connection_id).cloned() {
+        return session.connection_info().await.map_err(payload);
+    }
+    let session = open_redis_session(&state, connection_id).await?;
+    let info = session.connection_info().await.map_err(payload)?;
+    state
+        .redis_sessions
+        .write()
+        .await
+        .insert(connection_id, session);
+    Ok(info)
+}
+
+#[tauri::command]
+pub async fn disconnect_redis_connection(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+) -> CommandResult<()> {
+    if let Some(session) = state.redis_sessions.write().await.remove(&connection_id) {
+        session.close().await.map_err(payload)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_redis_databases(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+) -> CommandResult<Vec<RedisDatabaseInfo>> {
+    redis_session(&state, connection_id)
+        .await?
+        .list_databases()
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn scan_redis_keys(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    database: u32,
+    cursor: u64,
+    pattern: Option<String>,
+    count: Option<usize>,
+) -> CommandResult<RedisScanPage> {
+    redis_session(&state, connection_id)
+        .await?
+        .scan_keys(
+            database,
+            cursor,
+            pattern.as_deref(),
+            count.unwrap_or(200),
+        )
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn get_redis_key_info(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    database: u32,
+    key: String,
+) -> CommandResult<RedisKeyInfo> {
+    redis_session(&state, connection_id)
+        .await?
+        .key_info(database, &key)
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn get_redis_value(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    database: u32,
+    key: String,
+    limit: Option<usize>,
+) -> CommandResult<RedisValue> {
+    redis_session(&state, connection_id)
+        .await?
+        .get_value(database, &key, limit.unwrap_or(500))
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn set_redis_string(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    database: u32,
+    key: String,
+    value_base64: String,
+    ttl_secs: Option<i64>,
+) -> CommandResult<()> {
+    let value = BASE64_STANDARD
+        .decode(value_base64)
+        .map_err(|error| payload(CockpitError::InvalidConfig(error.to_string())))?;
+    redis_session(&state, connection_id)
+        .await?
+        .set_string(database, &key, &value, ttl_secs)
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn delete_redis_keys(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    database: u32,
+    keys: Vec<String>,
+) -> CommandResult<u64> {
+    redis_session(&state, connection_id)
+        .await?
+        .delete_keys(database, &keys)
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn expire_redis_key(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    database: u32,
+    key: String,
+    seconds: i64,
+) -> CommandResult<bool> {
+    redis_session(&state, connection_id)
+        .await?
+        .expire(database, &key, seconds)
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn rename_redis_key(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    database: u32,
+    from: String,
+    to: String,
+) -> CommandResult<()> {
+    redis_session(&state, connection_id)
+        .await?
+        .rename(database, &from, &to)
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn run_redis_command(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    database: u32,
+    args: Vec<String>,
+    allow_write: bool,
+) -> CommandResult<RedisReply> {
+    redis_session(&state, connection_id)
+        .await?
+        .run_command(database, &args, allow_write)
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn get_redis_server_info(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+) -> CommandResult<Vec<ServerMetric>> {
+    redis_session(&state, connection_id)
+        .await?
+        .server_info()
+        .await
+        .map_err(payload)
 }
 
 async fn session(
@@ -1568,6 +1803,7 @@ pub async fn backup_database(
             DatabaseKind::Sqlite => {
                 writeln!(output, "PRAGMA foreign_keys=OFF;\n").map_err(exchange_error)?;
             }
+            DatabaseKind::Redis => {}
         }
 
         let tables = list_all_tables(&session, &database).await?;
@@ -1899,6 +2135,7 @@ pub async fn backup_database(
                 writeln!(output, "PRAGMA foreign_keys=ON;").map_err(exchange_error)?
             }
             DatabaseKind::PostgreSql => {}
+            DatabaseKind::Redis => {}
         }
         output.flush().map_err(exchange_error)?;
         output.get_ref().sync_all().map_err(exchange_error)?;
@@ -3190,7 +3427,7 @@ fn quote_identifier(value: &str) -> String {
 fn backup_quote_identifier(value: &str, database_kind: DatabaseKind) -> String {
     match database_kind {
         DatabaseKind::MySql | DatabaseKind::MariaDb => quote_identifier(value),
-        DatabaseKind::PostgreSql | DatabaseKind::Sqlite => {
+        DatabaseKind::PostgreSql | DatabaseKind::Sqlite | DatabaseKind::Redis => {
             format!("\"{}\"", value.replace('"', "\"\""))
         }
     }

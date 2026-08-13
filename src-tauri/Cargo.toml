@@ -24,6 +24,7 @@ flate2.workspace = true
 cockpit-core = { path = "../crates/cockpit-core" }
 cockpit-mysql = { path = "../crates/cockpit-mysql" }
 cockpit-postgres = { path = "../crates/cockpit-postgres" }
+cockpit-redis = { path = "../crates/cockpit-redis" }
 cockpit-sqlite = { path = "../crates/cockpit-sqlite" }
 log = "0.4"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }

@@ -60,6 +60,7 @@ pub enum DatabaseKind {
     MariaDb,
     PostgreSql,
     Sqlite,
+    Redis,
 }
 
 impl ConnectionProfile {
@@ -72,7 +73,9 @@ impl ConnectionProfile {
         if self.host.trim().is_empty() {
             return Err(crate::CockpitError::InvalidConfig("主机不能为空".into()));
         }
-        if self.driver_kind != DatabaseKind::Sqlite && self.username.trim().is_empty() {
+        if !matches!(self.driver_kind, DatabaseKind::Sqlite | DatabaseKind::Redis)
+            && self.username.trim().is_empty()
+        {
             return Err(crate::CockpitError::InvalidConfig("用户名不能为空".into()));
         }
         if self.port == 0 {

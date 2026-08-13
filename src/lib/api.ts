@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   BackupOptions, BackupSummary, ColumnInfo, ConnectionInfo, ConnectionProfile, DatabaseInfo, DatabaseObjectDefinition, DatabaseObjectKind, DiagnosticsInfo, EventInfo, ExecuteQueryRequest, ExportSummary, ImportDataRequest, ImportPreview, ImportPreviewRequest, ImportSummary,
   QueryResultPage, ResultExportOptions, RoutineInfo, RowMutationRequest, RuntimeStats,
-  RoutineParameter, RowMutationResult, ServerLockInfo, ServerMetric, ServerProcessInfo, ServerVariable, SqlAssessment, TableDetail, TableInfo, TextFileContent, TriggerInfo, UserAccount, UUID,
+  RoutineParameter, RowMutationResult, RedisDatabaseInfo, RedisKeyInfo, RedisReply, RedisScanPage, RedisValue, ServerLockInfo, ServerMetric, ServerProcessInfo, ServerVariable, SqlAssessment, TableDetail, TableInfo, TextFileContent, TriggerInfo, UserAccount, UUID,
 } from "@/types";
 
 export const api = {
@@ -18,6 +18,26 @@ export const api = {
     invoke<void>("open_tab_session", { connectionId, sessionId }),
   closeTabSession: (sessionId: UUID) => invoke<void>("close_tab_session", { sessionId }),
   disconnect: (connectionId: UUID) => invoke<void>("disconnect_connection", { connectionId }),
+  connectRedis: (connectionId: UUID) => invoke<ConnectionInfo>("connect_redis_connection", { connectionId }),
+  disconnectRedis: (connectionId: UUID) => invoke<void>("disconnect_redis_connection", { connectionId }),
+  listRedisDatabases: (connectionId: UUID) => invoke<RedisDatabaseInfo[]>("list_redis_databases", { connectionId }),
+  scanRedisKeys: (connectionId: UUID, database: number, cursor: number, pattern?: string, count = 200) =>
+    invoke<RedisScanPage>("scan_redis_keys", { connectionId, database, cursor, pattern: pattern ?? null, count }),
+  redisKeyInfo: (connectionId: UUID, database: number, key: string) =>
+    invoke<RedisKeyInfo>("get_redis_key_info", { connectionId, database, key }),
+  redisValue: (connectionId: UUID, database: number, key: string, limit = 500) =>
+    invoke<RedisValue>("get_redis_value", { connectionId, database, key, limit }),
+  setRedisString: (connectionId: UUID, database: number, key: string, valueBase64: string, ttlSecs?: number | null) =>
+    invoke<void>("set_redis_string", { connectionId, database, key, valueBase64, ttlSecs: ttlSecs ?? null }),
+  deleteRedisKeys: (connectionId: UUID, database: number, keys: string[]) =>
+    invoke<number>("delete_redis_keys", { connectionId, database, keys }),
+  expireRedisKey: (connectionId: UUID, database: number, key: string, seconds: number) =>
+    invoke<boolean>("expire_redis_key", { connectionId, database, key, seconds }),
+  renameRedisKey: (connectionId: UUID, database: number, from: string, to: string) =>
+    invoke<void>("rename_redis_key", { connectionId, database, from, to }),
+  runRedisCommand: (connectionId: UUID, database: number, args: string[], allowWrite: boolean) =>
+    invoke<RedisReply>("run_redis_command", { connectionId, database, args, allowWrite }),
+  redisServerInfo: (connectionId: UUID) => invoke<ServerMetric[]>("get_redis_server_info", { connectionId }),
   listDatabases: (connectionId: UUID) => invoke<DatabaseInfo[]>("list_databases", { connectionId }),
   listTables: (connectionId: UUID, database: string, filter = "", limit = 500, offset = 0) =>
     invoke<TableInfo[]>("list_tables", { connectionId, database, filter, limit, offset }),
