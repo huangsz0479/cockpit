@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Cable, Database, FilePlus2, FolderOpen, Settings2 } from "lucide-vue-next";
+import { Cable, Database, FilePlus2, FolderOpen, Play, Settings2 } from "lucide-vue-next";
 
 defineProps<{
   settingsActive?: boolean;
@@ -9,6 +9,7 @@ defineEmits<{
   "new-query": [];
   "add-connection": [];
   "open-sql": [];
+  "execute-sql-file": [];
   settings: [];
 }>();
 </script>
@@ -34,6 +35,10 @@ defineEmits<{
         <button type="button" class="window-tool window-tool-accent tool-file" aria-label="打开 SQL" @mousedown.stop @click.stop="$emit('open-sql')">
           <span class="window-tool-symbol" aria-hidden="true"><FolderOpen :size="14" /></span>
           <span>打开 SQL</span>
+        </button>
+        <button type="button" class="window-tool window-tool-accent tool-file" aria-label="执行 SQL 文件" @mousedown.stop @click.stop="$emit('execute-sql-file')">
+          <span class="window-tool-symbol" aria-hidden="true"><Play :size="14" /></span>
+          <span>执行 SQL</span>
         </button>
       </div>
       <div class="window-trailing-space" data-tauri-drag-region />

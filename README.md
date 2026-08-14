@@ -39,7 +39,7 @@ The first launch downloads and compiles dependencies, so it usually takes longer
 
 The Cockpit window has three main areas:
 
-1. Top toolbar: create a connection, create a query, open an SQL file, or open Settings.
+1. Top toolbar: create a connection, create a query, open or directly execute an SQL file, or open Settings.
 2. Left explorer: manage connections and browse databases, tables, views, functions, stored procedures, events, and triggers.
 3. Center workspace: display the SQL editor, query results, table data, and object designers in tabs.
 
@@ -105,7 +105,7 @@ Common operations:
 - Right-click an object group to create an object, create a query, or refresh the list.
 - Right-click a database to open or refresh it, create a backup, restore an SQL backup, or compare schemas.
 
-Truncating a table, dropping a table, and dropping a database cannot be undone. Carefully verify the target name in the confirmation dialog before continuing.
+UI actions that truncate a table, drop a table, or drop a database cannot be undone and require a second confirmation.
 
 ## 6. Using the SQL Workspace
 
@@ -113,6 +113,8 @@ Truncating a table, dropping a table, and dropping a database cannot be undone. 
 
 - Click **New Query** in the top toolbar to create an empty SQL tab.
 - Click **Open SQL** to load a local `.sql` file.
+- Click **Run SQL** to select and execute a local `.sql` file against the selected database without loading it into the editor or showing a second confirmation.
+- SQL files are read as a stream. The lower-right task card shows processed bytes, percentage, and executed statements, and allows cancellation. Memory use is bounded mainly by the largest individual statement; a single extremely large `INSERT` still has to be retained while it executes.
 - Select the connection and database to use from the query toolbar.
 - Click **Save** to save the current SQL. The first save prompts you to choose a file location.
 
@@ -123,7 +125,7 @@ When workspace autosave is enabled, Cockpit restores query tabs, SQL content, an
 The editor provides syntax highlighting, completion, and formatting for the current database:
 
 1. Enter SQL and verify the connection and database in the query toolbar.
-2. To run only part of the content, select the target SQL first. When no text is selected, Cockpit runs the statement at the cursor.
+2. To run only part of the content, select the target SQL first. Both the **Run** button and the keyboard shortcut execute only the selected text; when no text is selected, Cockpit runs all SQL in the editor.
 3. Click **Run**, or press `Ctrl+Enter`; on macOS, press `⌘+Enter`.
 4. Review data, affected-row counts, execution information, or multiple result sets in the results area below.
 5. Click **Stop** to cancel a long-running query.
@@ -271,7 +273,6 @@ Click **Settings** in the top toolbar to configure:
 - Workspace autosave
 - Editor font size and tab width
 - Default export format, backup content, compression, and encryption
-- High-risk SQL confirmation
 - GitHub Releases update checks on startup
 
 Use **Diagnostic Logs** in Settings to investigate connection or execution issues. Logs redact sensitive connection information, but you should still check for business table names, SQL, or other internal information before sharing them.
@@ -284,6 +285,7 @@ Windows and Linux use `Ctrl`; macOS uses `⌘`.
 | --- | --- | --- |
 | New query | `Ctrl+N` | `⌘+N` |
 | Open SQL file | `Ctrl+O` | `⌘+O` |
+| Run SQL file directly | `Ctrl+Shift+O` | `⌘+Shift+O` |
 | Save current SQL | `Ctrl+S` | `⌘+S` |
 | Save current SQL as | `Ctrl+Shift+S` | `⌘+Shift+S` |
 | Run the selection; when there is no selection, run all SQL | `Ctrl+Enter` | `⌘+Enter` |
@@ -294,9 +296,9 @@ Windows and Linux use `Ctrl`; macOS uses `⌘`.
 ## 13. Security Recommendations
 
 - Enable the **Production Environment** label for production connections. Prefer a **Read-only Connection** for routine queries.
-- Carefully review confirmation prompts before running `UPDATE`, `DELETE`, DDL, or SQL that cannot be reliably classified.
-- Cockpit marks `UPDATE` / `DELETE` statements without a `WHERE` clause and `DROP` / `TRUNCATE` statements as high risk.
-- Do not disable high-risk SQL confirmation to speed up bulk operations. Validate statements in a transaction or test environment first.
+- Direct SQL execution—including `UPDATE`, `DELETE`, and DDL—SQL files, and restore jobs do not show a second confirmation. Verify the SQL, current connection, and target database first.
+- Delete and truncate actions started from the explorer, data grid, or table designer still require a second confirmation.
+- In SQL, `UPDATE` / `DELETE` statements without a `WHERE` clause and `DROP` / `TRUNCATE` statements run immediately. Validate them in a transaction or test environment first.
 - Create a usable backup before importing, restoring, migrating schemas, or making bulk changes.
 - Do not put connection passwords, SSH private keys, or backup passwords in SQL files, screenshots, or issue reports.
 

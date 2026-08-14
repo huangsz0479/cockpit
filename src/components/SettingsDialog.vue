@@ -52,7 +52,7 @@ function submit() {
             <span class="settings-navigation-icon" aria-hidden="true"><DatabaseBackup :size="16" /></span><span class="settings-navigation-copy"><strong>备份与导出</strong><small>文件输出设置</small></span>
           </button>
           <button id="settings-tab-security" type="button" role="tab" class="settings-tone-security" aria-controls="settings-panel-security" :aria-selected="activeSection === 'security'" :class="{ active: activeSection === 'security' }" @click="activeSection = 'security'">
-            <span class="settings-navigation-icon" aria-hidden="true"><ShieldCheck :size="16" /></span><span class="settings-navigation-copy"><strong>安全与更新</strong><small>确认和版本检查</small></span>
+            <span class="settings-navigation-icon" aria-hidden="true"><ShieldCheck :size="16" /></span><span class="settings-navigation-copy"><strong>安全与更新</strong><small>版本检查</small></span>
           </button>
           <button id="settings-tab-about" type="button" role="tab" class="settings-tone-about" aria-controls="settings-panel-about" :aria-selected="activeSection === 'about'" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'">
             <span class="settings-navigation-icon" aria-hidden="true"><Info :size="16" /></span><span class="settings-navigation-copy"><strong>关于</strong><small>版本与许可证</small></span>
@@ -118,13 +118,7 @@ function submit() {
             </section>
 
             <section id="settings-panel-security" v-show="activeSection === 'security'" class="settings-section settings-tone-security" role="tabpanel" aria-labelledby="settings-tab-security settings-security-title">
-              <div class="settings-section-heading"><span class="settings-section-icon" aria-hidden="true"><ShieldCheck :size="17" /></span><div><h3 id="settings-security-title">安全与更新</h3><p>管理高风险操作确认和应用更新检查。</p></div></div>
-              <div class="settings-group">
-                <h4>操作保护</h4>
-                <div class="settings-toggle-list">
-                  <label class="setting-toggle"><input v-model="draft.confirmDestructiveQueries" type="checkbox" /><span><strong>执行高风险 SQL 前要求确认</strong><small>删除操作无论此项是否开启都始终需要确认</small></span></label>
-                </div>
-              </div>
+              <div class="settings-section-heading"><span class="settings-section-icon" aria-hidden="true"><ShieldCheck :size="17" /></span><div><h3 id="settings-security-title">安全与更新</h3><p>管理应用更新检查。</p></div></div>
               <div class="settings-group">
                 <h4>应用更新</h4>
                 <div class="settings-toggle-list">
@@ -142,7 +136,7 @@ function submit() {
               </div>
               <div class="settings-about-list">
                 <div><strong>本地优先</strong><span>连接配置和工作区数据保存在本机；数据库密码交由系统凭据库保存。</span></div>
-                <div><strong>安全边界</strong><span>只读限制、危险 SQL 确认和行级并发校验会在执行链路中生效。</span></div>
+                <div><strong>安全边界</strong><span>只读限制和行级并发校验会在执行链路中生效。</span></div>
                 <div><strong>开源许可</strong><span>Cockpit 根据 Apache License 2.0 授权发布。</span></div>
               </div>
               <p class="settings-about-note">诊断日志会对密码、令牌和连接字符串中的敏感字段进行脱敏。</p>

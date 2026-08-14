@@ -5,7 +5,11 @@ import path from "node:path";
 export default defineConfig({
   plugins: [vue()],
   resolve: { alias: { "@": path.resolve(__dirname, "src") } },
-  server: { port: 1420, strictPort: true },
+  server: {
+    port: 1420,
+    strictPort: true,
+    watch: { ignored: ["**/target/**"] },
+  },
   clearScreen: false,
   build: {
     target: "es2022",

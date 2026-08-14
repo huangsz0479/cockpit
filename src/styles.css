@@ -319,6 +319,7 @@ kbd { padding: 1px 4px; border: 1px solid var(--accent-border); border-radius: 4
 .export-progress-copy strong, .export-progress-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .export-progress-copy progress { width: 100%; height: 5px; accent-color: var(--accent); }
 .export-progress-notice > .link { flex: 0 0 auto; white-space: nowrap; }
+.sql-file-progress-notice.stacked { bottom: 78px; }
 .export-progress-close { width: 20px; min-width: 20px; height: 20px; min-height: 20px; padding: 0; border: 0; background: transparent; color: inherit; }
 .empty-result { margin: auto; color: var(--muted); font-size: 11.5px; text-align: center; }
 .empty-result svg { width: 42px; height: 42px; margin-bottom: 6px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-2); color: var(--muted); }

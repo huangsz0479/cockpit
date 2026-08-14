@@ -291,6 +291,7 @@ defineExpose({
     if (view) flushCodeMirrorTextInput(view);
   },
   currentValue,
+  sqlForExecution: () => view ? sqlForExecution(view) : props.modelValue.trim(),
   hasPendingTextInput: () => Boolean(view && isCodeMirrorTextInputPending(view)),
 });
 </script>

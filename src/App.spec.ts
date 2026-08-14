@@ -8,6 +8,8 @@ import { useAppStore } from "@/stores/app";
 import mysqlIcon from "../src-tauri/icons/database/mysql.svg";
 import App from "./App.vue";
 
+const sqlEditorMockState = vi.hoisted(() => ({ executionSql: null as string | null }));
+
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 vi.mock("@/lib/githubRelease", () => ({
@@ -23,6 +25,12 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() =
 vi.mock("@/components/SqlEditor.vue", () => ({
   default: defineComponent({
     props: { modelValue: { type: String, default: "" } },
+    setup(props, { expose }) {
+      expose({
+        currentValue: () => props.modelValue,
+        sqlForExecution: () => sqlEditorMockState.executionSql ?? props.modelValue,
+      });
+    },
     template: '<div data-testid="sql-editor" :data-model-value="modelValue" />',
   }),
 }));
@@ -56,6 +64,7 @@ afterEach(() => {
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   vi.useRealTimers();
   vi.clearAllMocks();
+  sqlEditorMockState.executionSql = null;
 });
 
 function profile(): ConnectionProfile {
@@ -315,12 +324,13 @@ describe("App connection actions", () => {
     app.unmount();
   });
 
-  it("always confirms destructive SQL even when optional risk prompts are disabled", async () => {
+  it("executes destructive SQL directly without a confirmation dialog", async () => {
     const assess = vi.spyOn(api, "assess").mockResolvedValue({
       statementKind: "DELETE", risk: "destructive", requiresConfirmation: true, reason: "该语句会删除数据",
     });
     const { app, host, store } = mountApp();
     const connection = profile();
+    connection.production = true;
     store.connections.push(connection);
     store.activeConnectionId = connection.id;
     store.connectionInfo[connection.id] = { serverVersion: "8.0", connectionId: 1, currentDatabase: "demo" };
@@ -328,26 +338,19 @@ describe("App connection actions", () => {
     await nextTick();
 
     Array.from(host.querySelectorAll<HTMLButtonElement>(".window-tool"))
-      .find((button) => button.textContent?.includes("设置"))!.click();
-    await nextTick();
-    const riskSetting = Array.from(host.querySelectorAll<HTMLLabelElement>(".settings-form label"))
-      .find((label) => label.textContent?.includes("高风险 SQL"))!;
-    riskSetting.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click();
-    Array.from(host.querySelectorAll<HTMLButtonElement>(".settings-dialog button"))
-      .find((button) => button.textContent === "保存设置")!.click();
-    await nextTick();
-
-    Array.from(host.querySelectorAll<HTMLButtonElement>(".window-tool"))
       .find((button) => button.textContent?.includes("新建查询"))!.click();
     await nextTick();
+    sqlEditorMockState.executionSql = "DELETE FROM users;";
     host.querySelector<HTMLButtonElement>(".execute-button")!.click();
-    await vi.waitFor(() => expect(assess).toHaveBeenCalled());
-    await nextTick();
-    expect(host.querySelector(".action-dialog")?.textContent).toContain("该语句会删除数据");
-    expect(execute).not.toHaveBeenCalled();
-    Array.from(host.querySelectorAll<HTMLButtonElement>(".action-dialog button"))
-      .find((button) => button.textContent === "取消")!.click();
-    await nextTick();
+    await vi.waitFor(() => expect(assess).toHaveBeenCalledWith("DELETE FROM users;"));
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledWith(
+      expect.any(String),
+      "DELETE FROM users;",
+      true,
+      0,
+      500,
+    ));
+    expect(host.querySelector(".action-dialog")).toBeNull();
 
     assess.mockRestore();
     app.unmount();
@@ -993,6 +996,37 @@ describe("App connection actions", () => {
     app.unmount();
   });
 
+  it("executes only the selected SQL from the query toolbar", async () => {
+    const { app, host, store } = mountApp();
+    const connection = profile();
+    const sql = "SELECT 1;\nSELECT 2;";
+    store.connections.push(connection);
+    store.activeConnectionId = connection.id;
+    store.connectionInfo[connection.id] = { serverVersion: "8.0", connectionId: 1, currentDatabase: "demo" };
+    store.databases = [{ name: "demo" }];
+    store.selectedDatabase = "demo";
+    vi.mocked(openDialog).mockResolvedValueOnce("/tmp/selected-query.sql");
+    vi.spyOn(api, "readTextFile").mockResolvedValue({ path: "/tmp/selected-query.sql", contents: sql });
+    const assess = vi.spyOn(api, "assess").mockResolvedValue({
+      statementKind: "SELECT", risk: "safe", requiresConfirmation: false,
+    });
+    const execute = vi.spyOn(store, "execute").mockResolvedValue(undefined);
+    await nextTick();
+
+    host.querySelector<HTMLButtonElement>('.window-primary-actions .window-tool[aria-label="打开 SQL"]')!.click();
+    await vi.waitFor(() => expect(host.querySelector("[data-testid='sql-editor']")).not.toBeNull());
+    sqlEditorMockState.executionSql = "SELECT 2;";
+    host.querySelector<HTMLButtonElement>(".execute-button")!.click();
+
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledWith(
+      expect.any(String), "SELECT 2\nLIMIT 501 OFFSET 0;", false, 0, 500,
+    ));
+    expect(assess).toHaveBeenCalledWith("SELECT 2;");
+
+    assess.mockRestore();
+    app.unmount();
+  });
+
   it("keeps single-table SELECT * editable in the standard query result layout", async () => {
     const { app, host, store } = mountApp();
     const connection = profile();
@@ -1459,15 +1493,104 @@ describe("App connection actions", () => {
     app.unmount();
   });
 
+  it("executes an SQL file directly without opening it in the editor", async () => {
+    const { app, host, store } = mountApp();
+    const connection = profile();
+    store.connections.push(connection);
+    store.activeConnectionId = connection.id;
+    store.connectionInfo[connection.id] = { serverVersion: "8.0", connectionId: 1, currentDatabase: "demo" };
+    store.databases = [{ name: "demo" }];
+    store.selectedDatabase = "demo";
+    vi.mocked(openDialog).mockResolvedValueOnce("/tmp/migrate.sql");
+    const importData = vi.spyOn(api, "importData").mockResolvedValue({
+      rowsImported: 0,
+      rowsSkipped: 0,
+      statementsExecuted: 3,
+      errors: [],
+    });
+    const loadTables = vi.spyOn(store, "loadTables").mockResolvedValue(undefined);
+    const loadDatabaseObjects = vi.spyOn(store, "loadDatabaseObjects").mockResolvedValue(undefined);
+    await nextTick();
+
+    host.querySelector<HTMLButtonElement>('.window-primary-actions .window-tool[aria-label="执行 SQL 文件"]')!.click();
+    expect(openDialog).toHaveBeenCalledWith(expect.objectContaining({
+      title: "选择要执行的 SQL 文件",
+      filters: [{ name: "SQL 文件", extensions: ["sql"] }],
+    }));
+    expect(host.querySelector("[data-testid='sql-editor']")).toBeNull();
+    expect(host.querySelectorAll(".workspace-tab")).toHaveLength(0);
+
+    await vi.waitFor(() => expect(importData).toHaveBeenCalledTimes(1));
+    expect(host.querySelector(".action-dialog")?.textContent).not.toContain("确认执行 SQL 文件");
+    expect(importData).toHaveBeenCalledWith(expect.objectContaining({
+      connectionId: connection.id,
+      database: "demo",
+      inputPath: "/tmp/migrate.sql",
+      format: "sql",
+      hasHeaders: false,
+      encryptionPassword: null,
+    }));
+    expect(loadTables).toHaveBeenCalledWith("", false);
+    expect(loadDatabaseObjects).toHaveBeenCalledWith("demo");
+    expect(host.querySelector("[data-testid='sql-editor']")).toBeNull();
+    expect(host.querySelectorAll(".workspace-tab")).toHaveLength(0);
+    await vi.waitFor(() => expect(host.querySelector(".sql-file-progress-notice")?.textContent).toContain("SQL 文件执行成功"));
+    expect(host.querySelector(".sql-file-progress-notice")?.textContent).toContain("已执行 3 条语句");
+    await vi.waitFor(() => expect(host.querySelector(".action-dialog")?.textContent).toContain("已成功执行 3 条语句"));
+
+    Array.from(host.querySelectorAll<HTMLButtonElement>(".action-dialog button"))
+      .find((button) => button.textContent === "完成")!.click();
+    await nextTick();
+    importData.mockRestore();
+    loadTables.mockRestore();
+    loadDatabaseObjects.mockRestore();
+    app.unmount();
+  });
+
+  it("cancels an SQL file while it is being streamed", async () => {
+    const { app, host, store } = mountApp();
+    const connection = profile();
+    store.connections.push(connection);
+    store.activeConnectionId = connection.id;
+    store.connectionInfo[connection.id] = { serverVersion: "8.0", connectionId: 1, currentDatabase: "demo" };
+    store.databases = [{ name: "demo" }];
+    store.selectedDatabase = "demo";
+    vi.mocked(openDialog).mockResolvedValueOnce("/tmp/huge.sql");
+    let rejectImport!: (reason?: unknown) => void;
+    const importData = vi.spyOn(api, "importData").mockImplementation(() => new Promise((_, reject) => {
+      rejectImport = reject;
+    }));
+    const cancelTransfer = vi.spyOn(api, "cancelTransfer").mockResolvedValue(true);
+    await nextTick();
+
+    host.querySelector<HTMLButtonElement>('.window-primary-actions .window-tool[aria-label="执行 SQL 文件"]')!.click();
+    await vi.waitFor(() => expect(importData).toHaveBeenCalledTimes(1));
+    expect(host.querySelector(".action-dialog")).toBeNull();
+    await vi.waitFor(() => expect(host.querySelector(".sql-file-progress-notice")?.textContent).toContain("正在执行 SQL 文件"));
+    const taskId = importData.mock.calls[0]![0].taskId!;
+    Array.from(host.querySelectorAll<HTMLButtonElement>(".sql-file-progress-notice button"))
+      .find((button) => button.textContent === "取消")!.click();
+    await vi.waitFor(() => expect(cancelTransfer).toHaveBeenCalledWith(taskId));
+    await vi.waitFor(() => {
+      expect(host.querySelector(".sql-file-progress-notice")?.textContent).toContain("SQL 文件执行已取消");
+    });
+
+    rejectImport({ message: "SQL 文件执行已取消" });
+    await nextTick();
+    importData.mockRestore();
+    cancelTransfer.mockRestore();
+    app.unmount();
+  });
+
   it("creates a new query tab from the primary toolbar", async () => {
     const { app, host } = mountApp();
     const toolbarActions = host.querySelector(".window-primary-actions");
     const buttons = Array.from(toolbarActions!.querySelectorAll<HTMLButtonElement>("button"));
 
-    expect(buttons.map((button) => button.textContent?.trim())).toEqual(["新建连接", "新建查询", "打开 SQL", "设置"]);
+    expect(buttons.map((button) => button.textContent?.trim())).toEqual(["新建连接", "新建查询", "打开 SQL", "执行 SQL", "设置"]);
     expect(buttons.every((button) => button.classList.contains("window-tool-accent"))).toBe(true);
     expect(buttons.map((button) => Array.from(button.classList).find((name) => name.startsWith("tool-")))).toEqual([
-      "tool-connection", "tool-query", "tool-file", "tool-settings",
+      "tool-connection", "tool-query", "tool-file", "tool-file", "tool-settings",
     ]);
     host.querySelector<HTMLButtonElement>('.window-primary-actions .window-tool[aria-label="新建查询"]')!.click();
     await nextTick();

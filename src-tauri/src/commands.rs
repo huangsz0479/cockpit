@@ -1,10 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::OpenOptions,
-    io::{BufWriter, Cursor, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
+
+#[cfg(test)]
+use std::io::Cursor;
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -2049,6 +2055,7 @@ fn encrypt_backup_file(
     output.sync_all().map_err(exchange_error)
 }
 
+#[cfg(test)]
 fn decrypt_backup_bytes(bytes: &[u8], password: &str) -> cockpit_core::Result<Vec<u8>> {
     let header_len = ENCRYPTED_BACKUP_MAGIC.len() + 16 + 4;
     if bytes.len() < header_len || !bytes.starts_with(ENCRYPTED_BACKUP_MAGIC) {
@@ -2092,6 +2099,7 @@ fn decrypt_backup_bytes(bytes: &[u8], password: &str) -> cockpit_core::Result<Ve
     Ok(output)
 }
 
+#[cfg(test)]
 fn read_backup_text(path: &Path, password: Option<&str>) -> cockpit_core::Result<String> {
     let mut bytes = std::fs::read(path).map_err(exchange_error)?;
     if bytes.starts_with(ENCRYPTED_BACKUP_MAGIC) {
@@ -2109,6 +2117,351 @@ fn read_backup_text(path: &Path, password: Option<&str>) -> cockpit_core::Result
     }
     String::from_utf8(bytes)
         .map_err(|error| CockpitError::Exchange(format!("备份不是有效的 UTF-8 SQL：{error}")))
+}
+
+const SQL_FILE_PROGRESS_INTERVAL_BYTES: u64 = 1024 * 1024;
+
+enum SqlScriptStreamEvent {
+    Metadata {
+        cockpit_backup: bool,
+        total_bytes: u64,
+    },
+    Progress {
+        completed_bytes: u64,
+        total_bytes: u64,
+    },
+    Statement {
+        sql: String,
+        completed_bytes: u64,
+    },
+}
+
+struct SqlFileProgressReader<R> {
+    inner: R,
+    completed_bytes: Arc<AtomicU64>,
+    total_bytes: u64,
+    last_reported_bytes: u64,
+    sender: tokio::sync::mpsc::Sender<SqlScriptStreamEvent>,
+    token: tokio_util::sync::CancellationToken,
+}
+
+impl<R> SqlFileProgressReader<R> {
+    fn new(
+        inner: R,
+        total_bytes: u64,
+        completed_bytes: Arc<AtomicU64>,
+        sender: tokio::sync::mpsc::Sender<SqlScriptStreamEvent>,
+        token: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            inner,
+            completed_bytes,
+            total_bytes,
+            last_reported_bytes: 0,
+            sender,
+            token,
+        }
+    }
+}
+
+impl<R: Read> Read for SqlFileProgressReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.token.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "SQL 文件执行已取消",
+            ));
+        }
+        let read = self.inner.read(buffer)?;
+        if read == 0 {
+            return Ok(0);
+        }
+        let completed = self
+            .completed_bytes
+            .fetch_add(read as u64, Ordering::Relaxed)
+            .saturating_add(read as u64);
+        let should_report = completed >= self.total_bytes
+            || completed.saturating_sub(self.last_reported_bytes)
+                >= SQL_FILE_PROGRESS_INTERVAL_BYTES;
+        if should_report {
+            self.last_reported_bytes = completed;
+            self.sender
+                .blocking_send(SqlScriptStreamEvent::Progress {
+                    completed_bytes: completed.min(self.total_bytes),
+                    total_bytes: self.total_bytes,
+                })
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "SQL 文件执行通道已关闭")
+                })?;
+        }
+        Ok(read)
+    }
+}
+
+struct EncryptedBackupReader<R> {
+    inner: R,
+    cipher: Aes256Gcm,
+    nonce_prefix: [u8; 4],
+    counter: u64,
+    decrypted: Vec<u8>,
+    decrypted_offset: usize,
+    finished: bool,
+}
+
+impl<R: Read> EncryptedBackupReader<R> {
+    fn new(mut inner: R, password: &str) -> cockpit_core::Result<Self> {
+        let mut magic = [0u8; ENCRYPTED_BACKUP_MAGIC.len()];
+        inner.read_exact(&mut magic).map_err(exchange_error)?;
+        if &magic != ENCRYPTED_BACKUP_MAGIC {
+            return Err(CockpitError::Exchange("加密备份文件头无效".into()));
+        }
+        let mut salt = [0u8; 16];
+        let mut nonce_prefix = [0u8; 4];
+        inner.read_exact(&mut salt).map_err(exchange_error)?;
+        inner
+            .read_exact(&mut nonce_prefix)
+            .map_err(exchange_error)?;
+        let key = encryption_key(password, &salt)?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(exchange_error)?;
+        Ok(Self {
+            inner,
+            cipher,
+            nonce_prefix,
+            counter: 0,
+            decrypted: Vec::new(),
+            decrypted_offset: 0,
+            finished: false,
+        })
+    }
+
+    fn read_next_chunk(&mut self) -> std::io::Result<()> {
+        let mut length_bytes = [0u8; 4];
+        self.inner.read_exact(&mut length_bytes).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "加密备份文件不完整")
+            } else {
+                error
+            }
+        })?;
+        let length = u32::from_be_bytes(length_bytes) as usize;
+        if length == 0 {
+            let mut trailing = [0u8; 1];
+            match self.inner.read(&mut trailing) {
+                Ok(0) => {
+                    self.finished = true;
+                    return Ok(());
+                }
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "加密备份尾部包含无效数据",
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if length > ENCRYPTION_CHUNK_SIZE + 16 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "加密备份分块过大",
+            ));
+        }
+        let mut encrypted = vec![0u8; length];
+        self.inner.read_exact(&mut encrypted).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "加密备份分块不完整")
+            } else {
+                error
+            }
+        })?;
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&self.nonce_prefix);
+        nonce[4..].copy_from_slice(&self.counter.to_be_bytes());
+        self.decrypted = self
+            .cipher
+            .decrypt(Nonce::from_slice(&nonce), encrypted.as_slice())
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "备份密码错误或文件已损坏")
+            })?;
+        self.decrypted_offset = 0;
+        self.counter = self.counter.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "加密分块计数溢出")
+        })?;
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for EncryptedBackupReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        while written < output.len() {
+            if self.decrypted_offset < self.decrypted.len() {
+                let available = self.decrypted.len() - self.decrypted_offset;
+                let copy_length = available.min(output.len() - written);
+                output[written..written + copy_length].copy_from_slice(
+                    &self.decrypted[self.decrypted_offset..self.decrypted_offset + copy_length],
+                );
+                self.decrypted_offset += copy_length;
+                written += copy_length;
+                continue;
+            }
+            if self.finished {
+                break;
+            }
+            self.read_next_chunk()?;
+        }
+        Ok(written)
+    }
+}
+
+struct SqlScriptSource {
+    reader: Box<dyn BufRead + Send>,
+    completed_bytes: Arc<AtomicU64>,
+    total_bytes: u64,
+}
+
+fn open_sql_script_source(
+    path: &Path,
+    password: Option<&str>,
+    sender: tokio::sync::mpsc::Sender<SqlScriptStreamEvent>,
+    token: tokio_util::sync::CancellationToken,
+) -> cockpit_core::Result<SqlScriptSource> {
+    let file = std::fs::File::open(path).map_err(exchange_error)?;
+    let total_bytes = file.metadata().map_err(exchange_error)?.len();
+    let completed_bytes = Arc::new(AtomicU64::new(0));
+    let progress_reader = SqlFileProgressReader::new(
+        file,
+        total_bytes,
+        Arc::clone(&completed_bytes),
+        sender,
+        token,
+    );
+    let mut encoded = BufReader::with_capacity(64 * 1024, progress_reader);
+    let encrypted = encoded
+        .fill_buf()
+        .map_err(exchange_error)?
+        .starts_with(ENCRYPTED_BACKUP_MAGIC);
+    let decoded: Box<dyn Read + Send> = if encrypted {
+        let password = password
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| CockpitError::InvalidConfig("该备份已加密，请输入密码".into()))?;
+        Box::new(EncryptedBackupReader::new(encoded, password)?)
+    } else {
+        Box::new(encoded)
+    };
+    let mut decoded = BufReader::with_capacity(64 * 1024, decoded);
+    let compressed = decoded
+        .fill_buf()
+        .map_err(exchange_error)?
+        .starts_with(&[0x1f, 0x8b]);
+    let reader: Box<dyn BufRead + Send> = if compressed {
+        Box::new(BufReader::with_capacity(64 * 1024, GzDecoder::new(decoded)))
+    } else {
+        Box::new(decoded)
+    };
+    Ok(SqlScriptSource {
+        reader,
+        completed_bytes,
+        total_bytes,
+    })
+}
+
+fn first_line_is_cockpit_backup(reader: &mut dyn BufRead) -> cockpit_core::Result<bool> {
+    let buffer = reader.fill_buf().map_err(exchange_error)?;
+    let line_end = buffer
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(buffer.len());
+    let mut start = 0usize;
+    let mut end = line_end;
+    while start < end && buffer[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && buffer[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    Ok(&buffer[start..end] == b"-- Cockpit database backup")
+}
+
+fn send_sql_script_event(
+    sender: &tokio::sync::mpsc::Sender<SqlScriptStreamEvent>,
+    event: SqlScriptStreamEvent,
+) -> cockpit_core::Result<()> {
+    sender
+        .blocking_send(event)
+        .map_err(|_| CockpitError::Query("SQL 文件执行已取消".into()))
+}
+
+fn stream_sql_script(
+    path: &Path,
+    password: Option<&str>,
+    token: tokio_util::sync::CancellationToken,
+    sender: tokio::sync::mpsc::Sender<SqlScriptStreamEvent>,
+) -> cockpit_core::Result<()> {
+    let mut source = open_sql_script_source(path, password, sender.clone(), token.clone())?;
+    let cockpit_backup = first_line_is_cockpit_backup(source.reader.as_mut())?;
+    send_sql_script_event(
+        &sender,
+        SqlScriptStreamEvent::Metadata {
+            cockpit_backup,
+            total_bytes: source.total_bytes,
+        },
+    )?;
+    let mut parser = SqlScriptParser::default();
+    let mut line = String::new();
+    loop {
+        if token.is_cancelled() {
+            return Err(CockpitError::Query("SQL 文件执行已取消".into()));
+        }
+        line.clear();
+        let read = match source.reader.read_line(&mut line) {
+            Ok(read) => read,
+            Err(_) if token.is_cancelled() => {
+                return Err(CockpitError::Query("SQL 文件执行已取消".into()));
+            }
+            Err(error) => {
+                return Err(CockpitError::Exchange(format!(
+                    "读取 SQL 文件失败，请确认文件为 UTF-8 编码：{error}"
+                )));
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        for sql in parser.push_line(&line)? {
+            let completed_bytes = source.completed_bytes.load(Ordering::Relaxed);
+            send_sql_script_event(
+                &sender,
+                SqlScriptStreamEvent::Statement {
+                    sql,
+                    completed_bytes: completed_bytes.min(source.total_bytes),
+                },
+            )?;
+        }
+    }
+    if let Some(sql) = parser.finish() {
+        let completed_bytes = source.completed_bytes.load(Ordering::Relaxed);
+        send_sql_script_event(
+            &sender,
+            SqlScriptStreamEvent::Statement {
+                sql,
+                completed_bytes: completed_bytes.min(source.total_bytes),
+            },
+        )?;
+    }
+    send_sql_script_event(
+        &sender,
+        SqlScriptStreamEvent::Progress {
+            completed_bytes: source
+                .completed_bytes
+                .load(Ordering::Relaxed)
+                .min(source.total_bytes),
+            total_bytes: source.total_bytes,
+        },
+    )
 }
 
 fn file_sha256(path: &Path) -> cockpit_core::Result<(String, u64)> {
@@ -2288,19 +2641,6 @@ async fn import_data_inner(
         return Err(CockpitError::Query("导入前请先提交或回滚当前事务".into()));
     }
     if matches!(request.format, ImportFormat::Sql) {
-        let input_path = PathBuf::from(&request.input_path);
-        let encryption_password = request.encryption_password.clone();
-        let sql_text = tokio::task::spawn_blocking(move || {
-            read_backup_text(&input_path, encryption_password.as_deref())
-        })
-        .await
-        .map_err(|error| CockpitError::Exchange(error.to_string()))??;
-        let execution_database = sql_text
-            .lines()
-            .next()
-            .is_none_or(|line| line.trim() != "-- Cockpit database backup")
-            .then_some(request.database.as_str());
-        let mut parser = SqlScriptParser::default();
         session.begin_transaction().await?;
         let mysql_session_settings =
             if matches!(driver_kind, DatabaseKind::MySql | DatabaseKind::MariaDb) {
@@ -2314,37 +2654,122 @@ async fn import_data_inner(
             } else {
                 None
             };
-        let import_result: cockpit_core::Result<u64> = async {
+        let input_path = PathBuf::from(&request.input_path);
+        let encryption_password = request.encryption_password.clone();
+        let import_result: cockpit_core::Result<(u64, u64)> = async {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+            let stream_token = token.clone();
+            let stream_task = tokio::task::spawn_blocking(move || {
+                stream_sql_script(
+                    &input_path,
+                    encryption_password.as_deref(),
+                    stream_token,
+                    sender,
+                )
+            });
+            let mut metadata_received = false;
+            let mut execution_database = Some(request.database.as_str());
             let mut executed = 0u64;
-            for line in sql_text.split_inclusive('\n') {
-                if token.is_cancelled() {
-                    return Err(CockpitError::Query("恢复任务已取消".into()));
-                }
-                for statement in parser.push_line(line)? {
-                    execute_import_statement(&session, execution_database, statement, executed + 1)
-                        .await?;
-                    executed += 1;
-                    emit_transfer_progress(
-                        app,
-                        task_id,
-                        "restore",
-                        "执行 SQL",
-                        executed,
-                        None,
-                        None,
-                    );
+            let mut completed_bytes = 0u64;
+            let mut total_bytes = 0u64;
+            let mut execution_error = None;
+            while let Some(event) = receiver.recv().await {
+                match event {
+                    SqlScriptStreamEvent::Metadata {
+                        cockpit_backup,
+                        total_bytes: event_total,
+                    } => {
+                        metadata_received = true;
+                        total_bytes = event_total;
+                        execution_database = (!cockpit_backup).then_some(request.database.as_str());
+                    }
+                    SqlScriptStreamEvent::Progress {
+                        completed_bytes: event_completed,
+                        total_bytes: event_total,
+                    } => {
+                        completed_bytes = completed_bytes.max(event_completed);
+                        total_bytes = event_total;
+                        emit_transfer_progress(
+                            app,
+                            task_id,
+                            "restore",
+                            if executed == 0 {
+                                "读取 SQL"
+                            } else {
+                                "读取并执行 SQL"
+                            },
+                            completed_bytes,
+                            Some(total_bytes),
+                            Some(format!("已执行 {executed} 条语句")),
+                        );
+                    }
+                    SqlScriptStreamEvent::Statement {
+                        sql,
+                        completed_bytes: event_completed,
+                    } => {
+                        if !metadata_received {
+                            execution_error =
+                                Some(CockpitError::Exchange("SQL 文件流缺少元数据".into()));
+                            break;
+                        }
+                        if token.is_cancelled() {
+                            execution_error =
+                                Some(CockpitError::Query("SQL 文件执行已取消".into()));
+                            break;
+                        }
+                        if let Err(error) = execute_import_statement(
+                            &session,
+                            execution_database,
+                            sql,
+                            executed + 1,
+                        )
+                        .await
+                        {
+                            execution_error = Some(error);
+                            break;
+                        }
+                        executed += 1;
+                        completed_bytes = completed_bytes.max(event_completed);
+                        emit_transfer_progress(
+                            app,
+                            task_id,
+                            "restore",
+                            "执行 SQL",
+                            completed_bytes,
+                            Some(total_bytes),
+                            Some(format!("已执行 {executed} 条语句")),
+                        );
+                    }
                 }
             }
-            if let Some(statement) = parser.finish() {
-                execute_import_statement(&session, execution_database, statement, executed + 1)
-                    .await?;
-                executed += 1;
-                emit_transfer_progress(app, task_id, "restore", "执行 SQL", executed, None, None);
+            drop(receiver);
+            if let Some(error) = execution_error {
+                token.cancel();
+                let _ = stream_task.await;
+                return Err(error);
+            }
+            stream_task
+                .await
+                .map_err(|error| CockpitError::Exchange(error.to_string()))??;
+            if !metadata_received {
+                return Err(CockpitError::Exchange("无法读取 SQL 文件元数据".into()));
+            }
+            if token.is_cancelled() {
+                return Err(CockpitError::Query("SQL 文件执行已取消".into()));
             }
             if executed == 0 {
                 return Err(CockpitError::InvalidConfig("SQL 文件没有可执行语句".into()));
             }
-            Ok(executed)
+            emit_transfer_progress(
+                app,
+                task_id,
+                "restore",
+                "提交事务",
+                completed_bytes.max(total_bytes),
+                Some(total_bytes),
+                Some(format!("已执行 {executed} 条语句，正在提交")),
+            );
+            Ok((executed, total_bytes))
         }
         .await;
         let settings_restore_result = if let Some(settings) = &mysql_session_settings {
@@ -2352,8 +2777,8 @@ async fn import_data_inner(
         } else {
             Ok(())
         };
-        let executed = match import_result {
-            Ok(executed) => executed,
+        let (executed, total_bytes) = match import_result {
+            Ok(result) => result,
             Err(error) => {
                 let _ = session.rollback_transaction().await;
                 return match settings_restore_result {
@@ -2379,9 +2804,9 @@ async fn import_data_inner(
             task_id,
             "restore",
             "完成",
-            executed,
-            Some(executed),
-            None,
+            total_bytes,
+            Some(total_bytes),
+            Some(format!("已执行 {executed} 条语句")),
         );
         return Ok(ImportSummary {
             rows_imported: 0,
@@ -2984,7 +3409,9 @@ async fn execute_import_statement(
         .await
         .map(|_| ())
         .map_err(|error| {
-            CockpitError::Exchange(format!("恢复在第 {statement_number} 条语句失败：{error}"))
+            CockpitError::Exchange(format!(
+                "SQL 文件在第 {statement_number} 条语句执行失败：{error}"
+            ))
         })
 }
 
@@ -3039,6 +3466,9 @@ impl SqlScriptParser {
             return Ok(Vec::new());
         }
         self.buffer.push_str(line);
+        if !line.contains(&self.delimiter) {
+            return Ok(Vec::new());
+        }
         let mut statements = Vec::new();
         while let Some(index) = find_sql_delimiter(&self.buffer, &self.delimiter) {
             let statement = self.buffer[..index].trim();
@@ -3483,13 +3913,50 @@ mod tests {
     };
 
     use super::{
-        RuntimeStats, decrypt_backup_bytes, encrypt_backup_file, export_total_cell,
-        mysql_alter_database_definition, order_view_names, process_tree_memory_bytes,
-        read_backup_text, split_sql_script, strip_definer_clause, table_page_sql,
-        write_delimited_definition,
+        RuntimeStats, SqlScriptStreamEvent, decrypt_backup_bytes, encrypt_backup_file,
+        export_total_cell, mysql_alter_database_definition, order_view_names,
+        process_tree_memory_bytes, read_backup_text, split_sql_script, stream_sql_script,
+        strip_definer_clause, table_page_sql, write_delimited_definition,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use cockpit_core::CellValue;
+
+    async fn collect_streamed_sql(
+        path: std::path::PathBuf,
+        password: Option<String>,
+    ) -> (bool, u64, Vec<String>, Vec<u64>) {
+        let token = tokio_util::sync::CancellationToken::new();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let stream_token = token.clone();
+        let stream_task = tokio::task::spawn_blocking(move || {
+            stream_sql_script(&path, password.as_deref(), stream_token, sender)
+        });
+        let mut cockpit_backup = false;
+        let mut total_bytes = 0u64;
+        let mut statements = Vec::new();
+        let mut progress = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            match event {
+                SqlScriptStreamEvent::Metadata {
+                    cockpit_backup: event_backup,
+                    total_bytes: event_total,
+                } => {
+                    cockpit_backup = event_backup;
+                    total_bytes = event_total;
+                }
+                SqlScriptStreamEvent::Progress {
+                    completed_bytes,
+                    total_bytes: event_total,
+                } => {
+                    total_bytes = event_total;
+                    progress.push(completed_bytes);
+                }
+                SqlScriptStreamEvent::Statement { sql, .. } => statements.push(sql),
+            }
+        }
+        stream_task.await.unwrap().unwrap();
+        (cockpit_backup, total_bytes, statements, progress)
+    }
 
     #[test]
     fn serializes_runtime_stats_for_the_frontend_contract() {
@@ -3669,6 +4136,67 @@ mod tests {
             .unwrap(),
             112_000
         );
+    }
+
+    #[tokio::test]
+    async fn streams_large_sql_files_with_bounded_byte_progress() {
+        let path = std::env::temp_dir().join(format!("cockpit-large-{}.sql", uuid::Uuid::new_v4()));
+        let statement = format!("INSERT INTO demo VALUES (1, '{}');\n", "x".repeat(192));
+        let statement_count = 12_000usize;
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut writer = std::io::BufWriter::new(file);
+            for _ in 0..statement_count {
+                writer.write_all(statement.as_bytes()).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        let expected_bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(expected_bytes > 2 * 1024 * 1024);
+
+        let (cockpit_backup, total_bytes, statements, progress) =
+            collect_streamed_sql(path.clone(), None).await;
+
+        assert!(!cockpit_backup);
+        assert_eq!(total_bytes, expected_bytes);
+        assert_eq!(statements.len(), statement_count);
+        assert!(progress.len() >= 2);
+        assert_eq!(progress.last().copied(), Some(expected_bytes));
+        assert!(
+            progress
+                .iter()
+                .all(|completed| *completed <= expected_bytes)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn streams_encrypted_gzip_sql_backups() {
+        let suffix = uuid::Uuid::new_v4();
+        let compressed = std::env::temp_dir().join(format!("cockpit-stream-{suffix}.sql.gz"));
+        let encrypted = std::env::temp_dir().join(format!("cockpit-stream-{suffix}.enc"));
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(b"-- Cockpit database backup\nSELECT 1;\nSELECT 2;")
+            .unwrap();
+        std::fs::write(&compressed, encoder.finish().unwrap()).unwrap();
+        encrypt_backup_file(
+            &compressed,
+            &encrypted,
+            "stream-password",
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+
+        let (cockpit_backup, total_bytes, statements, progress) =
+            collect_streamed_sql(encrypted.clone(), Some("stream-password".into())).await;
+
+        assert!(cockpit_backup);
+        assert_eq!(total_bytes, std::fs::metadata(&encrypted).unwrap().len());
+        assert_eq!(statements, ["SELECT 1", "SELECT 2"]);
+        assert_eq!(progress.last().copied(), Some(total_bytes));
+        let _ = std::fs::remove_file(compressed);
+        let _ = std::fs::remove_file(encrypted);
     }
 
     #[test]

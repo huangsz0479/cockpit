@@ -193,7 +193,6 @@ export interface AppSettings {
   backupIncludeData: boolean;
   editorFontSize?: number;
   editorTabSize?: number;
-  confirmDestructiveQueries?: boolean;
   autoCheckUpdates?: boolean;
   defaultExportFormat?: ExportFormat;
   backupCompression?: "none" | "gzip";

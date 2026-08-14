@@ -199,6 +199,33 @@ const activeExportPercent = computed(() => {
   if (task.total === 0) return 0;
   return Math.min(99, Math.floor((task.completed / task.total) * 100));
 });
+const activeSqlFileTaskId = ref<UUID | null>(null);
+const activeSqlFileTask = computed(() => activeSqlFileTaskId.value
+  ? transferTasks.value.find((task) => task.taskId === activeSqlFileTaskId.value) ?? null
+  : null);
+const activeSqlFileStatusLabel = computed(() => {
+  if (activeSqlFileTask.value?.status === "running") return "正在执行 SQL 文件";
+  if (activeSqlFileTask.value?.status === "completed") return "SQL 文件执行成功";
+  if (activeSqlFileTask.value?.status === "cancelled") return "SQL 文件执行已取消";
+  return "SQL 文件执行失败";
+});
+const activeSqlFilePercent = computed(() => {
+  const task = activeSqlFileTask.value;
+  if (!task || task.total == null) return null;
+  if (task.status === "completed") return 100;
+  if (task.total === 0) return 0;
+  return Math.min(99, Math.floor((task.completed / task.total) * 100));
+});
+const activeSqlFileProgressText = computed(() => {
+  const task = activeSqlFileTask.value;
+  if (!task) return "";
+  if (task.status === "failed") return task.error || task.message || "执行失败";
+  if (task.status === "cancelled") return "任务已取消，正在回滚已执行的语句";
+  const byteProgress = task.total == null
+    ? null
+    : `${formatTransferBytes(task.completed)} / ${formatTransferBytes(task.total)}`;
+  return [task.message || "正在准备 SQL 文件", byteProgress].filter(Boolean).join(" · ");
+});
 const backupSchedule = ref<BackupSchedule | null>(storedJson<BackupSchedule | null>(BACKUP_SCHEDULE_STORAGE_KEY, null));
 const snippets = ref<QuerySnippet[]>(storedJson<QuerySnippet[]>(SNIPPETS_STORAGE_KEY, []));
 let unlistenTransferProgress: UnlistenFn | null = null;
@@ -215,7 +242,6 @@ const DEFAULT_SETTINGS: AppSettings = {
   backupIncludeData: true,
   editorFontSize: 12,
   editorTabSize: 2,
-  confirmDestructiveQueries: true,
   autoCheckUpdates: true,
   defaultExportFormat: "excel",
   backupCompression: "none",
@@ -737,7 +763,7 @@ function handleGlobalShortcut(event: KeyboardEvent) {
     createQuery();
   } else if (key === "o") {
     event.preventDefault();
-    void openSqlFile();
+    void (event.shiftKey ? executeSqlFile() : openSqlFile());
   } else if (key === "s") {
     event.preventDefault();
     void saveCurrentQuery(event.shiftKey);
@@ -780,8 +806,9 @@ async function loadSettings() {
   try {
     const payload = await api.loadWorkspaceState(SETTINGS_STATE_KEY);
     if (payload) {
-      const loaded = { ...DEFAULT_SETTINGS, ...JSON.parse(payload) as Partial<AppSettings> } as AppSettings & { theme?: unknown; updateManifestUrl?: unknown };
+      const loaded = { ...DEFAULT_SETTINGS, ...JSON.parse(payload) as Partial<AppSettings> } as AppSettings & { theme?: unknown; updateManifestUrl?: unknown; confirmDestructiveQueries?: unknown };
       delete loaded.theme;
+      delete loaded.confirmDestructiveQueries;
       delete loaded.updateManifestUrl;
       settings.value = loaded;
     }
@@ -2041,6 +2068,15 @@ function openAdminSql(statement: string) {
   showServerAdmin.value = false;
 }
 
+function formatTransferBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const unitIndex = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** unitIndex;
+  const digits = unitIndex === 0 || value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits).replace(/\.0+$|(?<=\.[0-9])0+$/g, "")} ${units[unitIndex]}`;
+}
+
 function pathFileName(path: string) {
   return path.split(/[\\/]/).pop() || "query.sql";
 }
@@ -2281,22 +2317,7 @@ async function execute(overrideSql?: unknown) {
     return;
   }
   const assessment = await api.assess(sqlToRun);
-  let allowWrite = false;
-  if (assessment.requiresConfirmation) {
-    const mustConfirm = assessment.risk === "destructive"
-      || settings.value.confirmDestructiveQueries !== false
-      || activeQueryConnection.value?.production;
-    allowWrite = !mustConfirm || await confirmAction({
-      title: assessment.risk === "destructive" ? "确认执行高风险 SQL" : "确认执行写入 SQL",
-      message: assessment.reason ?? "该语句可能修改数据。",
-      detail: activeQueryConnection.value?.production
-        ? "当前连接标记为生产环境，请再次确认执行目标和影响范围。"
-        : "请确认 SQL 内容和当前连接后再执行。",
-      tone: assessment.risk === "destructive" ? "danger" : "warning",
-      confirmLabel: "确认执行",
-    });
-    if (!allowWrite) return;
-  }
+  const allowWrite = assessment.requiresConfirmation;
   const safeSelect = assessment.statementKind === "SELECT" && !assessment.requiresConfirmation;
   const canPageQuery = tab.kind === "console" && safeSelect && canPageSelectQuery(sqlToRun);
   const appendPageLimit = canPageQuery && canAppendSelectQueryLimit(sqlToRun);
@@ -2343,6 +2364,10 @@ async function execute(overrideSql?: unknown) {
       });
     }
   }
+}
+
+async function executeEditorSql() {
+  await execute(sqlEditor.value?.sqlForExecution?.());
 }
 
 async function executeParameterizedSql(rendered: string) {
@@ -3543,15 +3568,26 @@ async function finishTableImport() {
   if (tab?.kind === "table") await reloadTableTab(tab);
 }
 
-async function importSqlFile(targetDatabase?: string) {
+async function runSqlFile(targetDatabase: string | undefined, mode: "execute" | "restore") {
+  if (busy.value) {
+    error.value = "当前有任务正在执行，请等待完成或先取消 SQL 文件任务";
+    return;
+  }
   const database = targetDatabase ?? selectedDatabase.value;
-  if (!activeConnectionId.value || !database) {
+  const connectionId = activeConnectionId.value;
+  if (!connectionId || !database) {
     error.value = "请先连接并选择数据库";
     return;
   }
-  const inputPath = await open({ multiple: false, directory: false, filters: [{ name: "SQL 备份", extensions: ["sql", "gz", "enc"] }] });
+  const restoring = mode === "restore";
+  const inputPath = await open({
+    multiple: false,
+    directory: false,
+    title: restoring ? "选择 SQL 备份" : "选择要执行的 SQL 文件",
+    filters: [{ name: restoring ? "SQL 备份" : "SQL 文件", extensions: restoring ? ["sql", "gz", "enc"] : ["sql"] }],
+  });
   if (!inputPath || Array.isArray(inputPath)) return;
-  const encryptionPassword = inputPath.toLocaleLowerCase().endsWith(".enc")
+  const encryptionPassword = restoring && inputPath.toLocaleLowerCase().endsWith(".enc")
     ? await promptAction({
       title: "解密数据库备份",
       message: "所选备份文件已加密，请输入创建备份时使用的密码。",
@@ -3563,37 +3599,49 @@ async function importSqlFile(targetDatabase?: string) {
       confirmLabel: "解密并继续",
     })
     : null;
-  if (inputPath.toLocaleLowerCase().endsWith(".enc") && encryptionPassword === null) return;
-  if (!await confirmAction({
-    title: "确认恢复数据库",
-    message: `将在数据库“${database}”中执行所选备份文件。`,
-    detail: "文件中的写入和结构变更会直接生效。建议确认目标数据库并提前完成备份。",
-    tone: "danger",
-    confirmLabel: "开始恢复",
-  })) return;
+  if (restoring && inputPath.toLocaleLowerCase().endsWith(".enc") && encryptionPassword === null) return;
+  const fileName = pathFileName(inputPath);
   busy.value = true;
   error.value = null;
   const taskId = crypto.randomUUID();
   createTransferTask({
-    taskId, kind: "restore", title: `恢复 ${database}`, phase: "准备", completed: 0,
-    status: "running", startedAt: new Date().toISOString(), outputPath: inputPath,
+    taskId, kind: "restore", title: restoring ? `恢复 ${database}` : `执行 ${fileName}`, phase: "准备", completed: 0,
+    message: "正在准备流式读取", status: "running", cancellable: true,
+    startedAt: new Date().toISOString(), outputPath: inputPath,
   });
+  activeSqlFileTaskId.value = taskId;
   try {
     if (selectedDatabase.value !== database) await openDatabase(database);
-    const summary = await api.importData({ connectionId: activeConnectionId.value, database, inputPath, format: "sql", hasHeaders: false, taskId, encryptionPassword });
+    const summary = await api.importData({ connectionId, database, inputPath, format: "sql", hasHeaders: false, taskId, encryptionPassword });
     await Promise.all([store.loadTables("", false), store.loadDatabaseObjects(database)]);
+    finishTransferTask(taskId, "completed", {
+      phase: "完成",
+      message: `已执行 ${summary.statementsExecuted} 条语句`,
+    });
     await showNotice({
-      title: "恢复完成",
+      title: restoring ? "恢复完成" : "执行完成",
       message: `已成功执行 ${summary.statementsExecuted} 条语句。`,
-      detail: `目标数据库：${database}`,
+      detail: `文件：${fileName}\n目标数据库：${database}`,
       tone: "success",
       confirmLabel: "完成",
     });
   } catch (cause) {
     const message = typeof cause === "object" && cause && "message" in cause ? String(cause.message) : String(cause);
     error.value = message;
-    finishTransferTask(taskId, message.includes("取消") ? "cancelled" : "failed", { error: message, phase: message.includes("取消") ? "已取消" : "失败" });
+    finishTransferTask(taskId, message.includes("取消") ? "cancelled" : "failed", {
+      error: message,
+      message,
+      phase: message.includes("取消") ? "已取消" : "失败",
+    });
   } finally { busy.value = false; }
+}
+
+async function executeSqlFile() {
+  await runSqlFile(undefined, "execute");
+}
+
+async function importSqlFile(targetDatabase?: string) {
+  await runSqlFile(targetDatabase, "restore");
 }
 </script>
 
@@ -3604,6 +3652,7 @@ async function importSqlFile(targetDatabase?: string) {
       @new-query="createQuery"
       @add-connection="showDialog = true; editing = null"
       @open-sql="openSqlFile"
+      @execute-sql-file="executeSqlFile"
       @settings="showSettings = true"
     />
 
@@ -3617,6 +3666,28 @@ async function importSqlFile(targetDatabase?: string) {
       <FileCode2 :size="15" />
       <span>{{ queryFileNotice.message }}</span>
       <button type="button" aria-label="关闭文件提示" @click="queryFileNotice = null"><X :size="13" /></button>
+    </div>
+
+    <div
+      v-if="activeSqlFileTask"
+      class="export-progress-notice sql-file-progress-notice"
+      :class="[activeSqlFileTask.status, { stacked: Boolean(activeExportTask) }]"
+      role="status"
+    >
+      <RefreshCw v-if="activeSqlFileTask.status === 'running'" :size="16" class="loading-icon" />
+      <FileCode2 v-else :size="16" />
+      <div class="export-progress-copy">
+        <strong>{{ activeSqlFileStatusLabel }} · {{ activeSqlFileTask.phase }}</strong>
+        <span>{{ activeSqlFileProgressText }}<template v-if="activeSqlFilePercent !== null"> · {{ activeSqlFilePercent }}%</template></span>
+        <progress
+          v-if="activeSqlFilePercent !== null && (activeSqlFileTask.status === 'running' || activeSqlFileTask.status === 'completed')"
+          :value="activeSqlFilePercent"
+          max="100"
+          aria-label="SQL 文件执行进度"
+        />
+      </div>
+      <button v-if="activeSqlFileTask.status === 'running'" type="button" class="link" @click="cancelTransferTask(activeSqlFileTask.taskId)">取消</button>
+      <button v-else type="button" class="export-progress-close" aria-label="关闭 SQL 文件执行提示" @click="activeSqlFileTaskId = null"><X :size="13" /></button>
     </div>
 
     <div v-if="activeExportTask" class="export-progress-notice" :class="activeExportTask.status" role="status">
@@ -3724,7 +3795,7 @@ async function importSqlFile(targetDatabase?: string) {
                 </div>
                 <div class="query-toolbar-group" role="group" aria-label="执行与导出">
                   <button v-if="executingId" class="danger compact" @click="store.cancel"><img class="query-toolbar-icon" :src="stopIcon" alt="" aria-hidden="true" /> 停止</button>
-                  <button v-else class="window-tool execute-button" :disabled="!connected || !activeWorkspaceTab.connectionId" @click="execute()"><img class="query-toolbar-icon" :src="runIcon" alt="" aria-hidden="true" /> 执行 <kbd>{{ shortcutModifier }}↵</kbd></button>
+                  <button v-else class="window-tool execute-button" :disabled="!connected || !activeWorkspaceTab.connectionId" @click="executeEditorSql"><img class="query-toolbar-icon" :src="runIcon" alt="" aria-hidden="true" /> 执行 <kbd>{{ shortcutModifier }}↵</kbd></button>
                   <button type="button" class="ghost compact query-export-trigger" aria-haspopup="dialog" aria-controls="query-export-dialog" :disabled="busy || !displayedResult?.columns.length" :title="displayedResult?.columns.length ? '导出查询结果' : '查询完成后可导出结果'" @click="showQueryExportDialog = true"><img class="query-toolbar-icon" :src="exportIcon" alt="" aria-hidden="true" /> 导出</button>
                 </div>
               </div>

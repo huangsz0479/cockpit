@@ -131,6 +131,7 @@ describe("SettingsDialog", () => {
     await nextTick();
 
     expect(host.textContent).toContain("GitHub Releases");
+    expect(host.textContent).not.toContain("高风险 SQL");
     expect(host.textContent).not.toContain("更新清单地址");
     Array.from(host.querySelectorAll<HTMLButtonElement>("button"))
       .find((button) => button.textContent === "立即检查")!
