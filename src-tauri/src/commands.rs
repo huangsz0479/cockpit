@@ -2403,6 +2403,10 @@ fn stream_sql_script(
 ) -> cockpit_core::Result<()> {
     let mut source = open_sql_script_source(path, password, sender.clone(), token.clone())?;
     let cockpit_backup = first_line_is_cockpit_backup(source.reader.as_mut())?;
+    if cockpit_backup {
+        let mut header = String::new();
+        source.reader.read_line(&mut header).map_err(exchange_error)?;
+    }
     send_sql_script_event(
         &sender,
         SqlScriptStreamEvent::Metadata {
