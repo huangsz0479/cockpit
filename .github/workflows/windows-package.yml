@@ -28,14 +28,12 @@ jobs:
             args: --target universal-apple-darwin --bundles dmg
           - platform: windows-latest
             rust_targets: ""
-            args: --bundles msi
+            args: --bundles nsis,msi
           - platform: ubuntu-22.04
             rust_targets: ""
             args: --bundles appimage,deb
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
-    env:
-      WINDOWS_CERTIFICATE_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -60,56 +58,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Require Windows code-signing certificate
-        if: matrix.platform == 'windows-latest' && env.WINDOWS_CERTIFICATE_CONFIGURED != 'true'
-        shell: pwsh
-        run: throw "Windows releases require the WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD secrets."
-
-      - name: Import Windows code-signing certificate
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-        run: ./.github/scripts/import-windows-code-signing-certificate.ps1
-
-      - name: Build and upload installers to draft release
+      - name: Build and publish installers
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: preview-v__VERSION__
           releaseName: Cockpit v__VERSION__ Preview
-          releaseBody: "Automated preview build from the release branch. Windows packages are Authenticode signed."
+          releaseBody: "Automated preview build from the release branch. These packages are not code signed."
           releaseCommitish: ${{ github.event.workflow_run.head_sha || github.sha }}
-          releaseDraft: true
+          releaseDraft: false
           prerelease: true
           retryAttempts: 1
           args: ${{ matrix.args }}
-
-      - name: Verify Windows Authenticode signatures
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        run: ./.github/scripts/verify-windows-signatures.ps1
-
-  publish:
-    name: Publish verified preview release
-    needs: package
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-      - name: Resolve preview release tag
-        id: release
-        shell: bash
-        run: echo "tag=preview-v$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
-      - name: Publish preview release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
