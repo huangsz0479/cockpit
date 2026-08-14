@@ -12,6 +12,7 @@ jobs:
   bundle:
     env:
       APPLE_CERTIFICATE_CONFIGURED: ${{ secrets.APPLE_CERTIFICATE != '' }}
+      WINDOWS_CERTIFICATE_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -19,7 +20,7 @@ jobs:
           - platform: macos-latest
             args: --target universal-apple-darwin
           - platform: windows-latest
-            args: ""
+            args: --bundles msi
           - platform: ubuntu-22.04
             args: ""
     runs-on: ${{ matrix.platform }}
@@ -36,9 +37,21 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libsecret-1-dev
       - run: npm ci
-      - name: Build and publish signed bundles
+      - name: Require Windows code-signing certificate
+        if: matrix.platform == 'windows-latest' && env.WINDOWS_CERTIFICATE_CONFIGURED != 'true'
+        shell: pwsh
+        run: throw "Windows releases require the WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD secrets."
+      - name: Import Windows code-signing certificate
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: ./.github/scripts/import-windows-code-signing-certificate.ps1
+      - name: Build and upload bundles to draft release
         if: matrix.platform != 'macos-latest' || env.APPLE_CERTIFICATE_CONFIGURED == 'true'
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -51,18 +64,41 @@ jobs:
           tagName: v__VERSION__
           releaseName: Cockpit v__VERSION__
           releaseBody: "See the assets below for platform installers."
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
-      - name: Build and publish unsigned macOS bundle
+      - name: Build and upload unsigned macOS bundle to draft release
         if: matrix.platform == 'macos-latest' && env.APPLE_CERTIFICATE_CONFIGURED != 'true'
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: v__VERSION__
           releaseName: Cockpit v__VERSION__
           releaseBody: "See the assets below for platform installers. The macOS bundle is unsigned."
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+      - name: Verify Windows Authenticode signatures
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: ./.github/scripts/verify-windows-signatures.ps1
+
+  publish:
+    name: Publish verified release
+    needs: bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        run: echo "tag=v$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
