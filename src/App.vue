@@ -3606,7 +3606,7 @@ async function runSqlFile(targetDatabase: string | undefined, mode: "execute" | 
   const taskId = crypto.randomUUID();
   createTransferTask({
     taskId, kind: "restore", title: restoring ? `恢复 ${database}` : `执行 ${fileName}`, phase: "准备", completed: 0,
-    message: "正在准备流式读取", status: "running", cancellable: true,
+    message: "正在读取 SQL 文件", status: "running", cancellable: true,
     startedAt: new Date().toISOString(), outputPath: inputPath,
   });
   activeSqlFileTaskId.value = taskId;
