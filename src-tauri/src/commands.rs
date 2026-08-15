@@ -1738,7 +1738,7 @@ pub async fn backup_database(
     let backup_result: cockpit_core::Result<(u64, u64, u64)> = async {
         let mut output = BufWriter::new(file);
         writeln!(output, "-- Cockpit database backup").map_err(exchange_error)?;
-        writeln!(output, "-- Database: {}\n", database).map_err(exchange_error)?;
+        writeln!(output, "-- Database: {database}\n").map_err(exchange_error)?;
         let mut captured_database_ddl = None;
         match driver_kind {
             DatabaseKind::MySql | DatabaseKind::MariaDb => {
