@@ -30,6 +30,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
+      # Keep in sync with rust-toolchain.toml (the action does not read it).
       - uses: dtolnay/rust-toolchain@1.88
         with:
           components: rustfmt, clippy
