@@ -9,8 +9,3 @@ export function cellText(cell: CellValue | undefined): string {
   return cell.value;
 }
 
-export function cellTitle(cell: CellValue | undefined): string {
-  if (cell?.kind === "bytes") return `${cell.value.length} bytes · Base64 available in cell detail`;
-  return cellText(cell);
-}
-

@@ -15,18 +15,17 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use calamine::{Data, Reader, open_workbook_auto};
 use chrono::Utc;
 use cockpit_core::{
-    CellValue, CockpitError, ColumnInfo, ConnectionInfo, ConnectionProfile, DatabaseDriver,
-    DatabaseInfo, DatabaseKind, DatabaseObjectDefinition, DatabaseObjectKind, ErrorPayload,
-    EventInfo, ExecuteQueryRequest, ExportFormat, ImportConflictPolicy, QueryResultPage,
-    ResultExportOptions, ResultStreamWriter, RoutineInfo, RoutineParameter, RowMutationRequest,
-    RowMutationResult, ServerLockInfo, ServerMetric, ServerProcessInfo, ServerVariable,
-    SqlAssessment, TableDetail, TableInfo, TriggerInfo, UserAccount, safety::assess_sql,
-    write_result_page,
+    CellValue, CockpitError, ColumnInfo, ColumnMeta, ConnectionInfo, ConnectionProfile,
+    DatabaseDriver, DatabaseInfo, DatabaseKind, DatabaseObjectDefinition, DatabaseObjectKind,
+    ErrorPayload, EventInfo, ExecuteQueryRequest, ExportFormat, ImportConflictPolicy,
+    QueryResultPage, ResultExportOptions, ResultStreamWriter, RoutineInfo, RoutineParameter,
+    RowMutationRequest, RowMutationResult, ServerLockInfo, ServerMetric, ServerProcessInfo,
+    ServerVariable, SqlAssessment, TableDetail, TableInfo, TriggerInfo, UserAccount,
+    safety::assess_sql, write_result_page,
 };
 use cockpit_mysql::MySqlDriver;
 use cockpit_postgres::PostgresDriver;
 use cockpit_sqlite::SqliteDriver;
-use encoding_rs::GB18030;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rand_core::{OsRng, RngCore};
 use regex::Regex;
@@ -935,16 +934,57 @@ pub async fn reveal_file(input_path: String) -> CommandResult<()> {
     .map_err(payload)
 }
 
+/// Upper bound for `write_binary_file` payloads (base64 already decoded).
+const MAX_BINARY_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
 #[tauri::command]
 pub async fn write_binary_file(output_path: String, base64: String) -> CommandResult<String> {
-    let bytes = BASE64_STANDARD.decode(base64).map_err(|error| {
-        payload(CockpitError::InvalidConfig(format!(
-            "二进制数据无效：{error}"
-        )))
-    })?;
     tauri::async_runtime::spawn_blocking(move || {
+        // Reject oversized payloads before decoding: base64 inflates the
+        // raw bytes by ~4/3, so the encoded length is a cheap upper bound.
+        if base64.len() as u64 > MAX_BINARY_FILE_BYTES * 4 / 3 + 4 {
+            return Err(CockpitError::Exchange(format!(
+                "二进制文件超过 512 MB 限制（当前约 {:.1} MB）",
+                base64.len() as f64 / 1024.0 / 1024.0 / 4.0 * 3.0
+            )));
+        }
+        let bytes = BASE64_STANDARD
+            .decode(base64)
+            .map_err(|error| CockpitError::InvalidConfig(format!("二进制数据无效：{error}")))?;
+        if bytes.len() as u64 > MAX_BINARY_FILE_BYTES {
+            return Err(CockpitError::Exchange(format!(
+                "二进制文件超过 512 MB 限制（当前 {:.1} MB）",
+                bytes.len() as f64 / 1024.0 / 1024.0
+            )));
+        }
         let output_path = PathBuf::from(output_path);
-        std::fs::write(&output_path, bytes).map_err(exchange_error)?;
+        let parent = output_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .ok_or_else(|| CockpitError::InvalidConfig("保存路径无效".into()))?;
+        let file_name = output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| CockpitError::InvalidConfig("保存文件名无效".into()))?;
+        // Write to a temporary file first, then atomically replace the
+        // destination, so a crash mid-write never leaves a truncated file
+        // at the requested path.
+        let temporary_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+        let write_result = (|| -> cockpit_core::Result<()> {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary_path)
+                .map_err(exchange_error)?;
+            file.write_all(&bytes).map_err(exchange_error)?;
+            file.sync_all().map_err(exchange_error)?;
+            drop(file);
+            replace_file(&temporary_path, &output_path)
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(error);
+        }
         Ok(output_path.to_string_lossy().into_owned())
     })
     .await
@@ -1156,13 +1196,22 @@ pub async fn export_table(
             Some(total_rows),
             Some(format!("已写入 0 / {total_rows} 行")),
         );
+        // Keyset pagination on the primary (or non-null unique) key avoids
+        // re-skipping OFFSET rows of the whole table on every page. It is
+        // disabled permanently as soon as a page cannot yield a cursor
+        // (e.g. a NULL key value), falling back to OFFSET.
+        let key_columns = table_keyset_columns(&detail);
+        let mut keyset_active = key_columns.is_some();
+        let mut cursor: Option<KeysetCursor> = None;
         loop {
+            let keyset = keyset_active.then_some(cursor.as_ref()).flatten();
             let sql = table_page_sql(
                 &database,
                 &table,
                 &detail,
                 page_size,
                 offset,
+                keyset,
                 driver_kind,
                 include_generated_columns,
             )?;
@@ -1192,6 +1241,26 @@ pub async fn export_table(
                     .write_row(row)?;
             }
             offset += row_count;
+            if keyset_active {
+                let next = match (key_columns.as_deref(), page.rows.last()) {
+                    (Some(key_columns), Some(last_row)) => {
+                        keyset_from_last_row(key_columns, &page.columns, last_row)
+                    }
+                    _ => None,
+                };
+                match next {
+                    Some(next)
+                        if keyset_condition_sql(&next.columns, &next.last_values, driver_kind)
+                            .is_some() =>
+                    {
+                        cursor = Some(next);
+                    }
+                    _ => {
+                        keyset_active = false;
+                        cursor = None;
+                    }
+                }
+            }
             emit_export_progress(
                 &app,
                 task_id,
@@ -1297,7 +1366,7 @@ pub async fn export_query(
         .and_then(|name| name.to_str())
         .ok_or_else(|| payload(CockpitError::InvalidConfig("导出文件名无效".into())))?;
     let temporary_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(&temporary_path)
@@ -1308,8 +1377,6 @@ pub async fn export_query(
         return Err(payload(error));
     }
     let page_size = 2_000usize;
-    let mut offset = 0usize;
-    let mut writer: Option<ResultStreamWriter<BufWriter<std::fs::File>>> = None;
     let export_result: cockpit_core::Result<u64> = async {
         emit_export_progress(
             &app,
@@ -1343,54 +1410,113 @@ pub async fn export_query(
             Some(total_rows),
             Some(format!("已写入 0 / {total_rows} 行")),
         );
-        loop {
-            let page = session
+        // Describe the result shape (column names) with LIMIT 0 so every
+        // page can be ordered deterministically and keyed by the query's
+        // own output columns; no rows are transferred by this query.
+        let describe = session
+            .execute(ExecuteQueryRequest {
+                execution_id: Uuid::new_v4(),
+                sql: format!(
+                    "SELECT * FROM ({}) AS {} LIMIT 0",
+                    sql.trim().trim_end_matches(';'),
+                    backup_quote_identifier("__cockpit_page", driver_kind),
+                ),
+                database: database.clone(),
+                timeout_secs: None,
+                allow_write: false,
+                page_size: 1,
+                row_offset: 0,
+            })
+            .await?;
+        let keyset_supported = {
+            let mut seen = std::collections::HashSet::new();
+            describe
+                .columns
+                .iter()
+                .all(|column| !column.name.is_empty() && seen.insert(column.name.clone()))
+        };
+        // Probe whether the output columns can actually be ordered: some
+        // engines reject ordering on certain column types (e.g. PostgreSQL
+        // has no ordering operator for `json`), which would otherwise break
+        // the ordered pages below. LIMIT 0 transfers no rows.
+        let ordered_columns = if keyset_supported {
+            let order = (1..=describe.columns.len())
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let probe = format!(
+                "SELECT * FROM ({}) AS {} ORDER BY {order} LIMIT 0",
+                sql.trim().trim_end_matches(';'),
+                backup_quote_identifier("__cockpit_page", driver_kind),
+            );
+            match session
                 .execute(ExecuteQueryRequest {
                     execution_id: Uuid::new_v4(),
-                    sql: paged_select_sql(&sql, page_size, offset, driver_kind),
+                    sql: probe,
                     database: database.clone(),
                     timeout_secs: None,
                     allow_write: false,
-                    page_size,
+                    page_size: 1,
                     row_offset: 0,
                 })
-                .await?;
-            if writer.is_none() {
-                writer = Some(ResultStreamWriter::new(
-                    BufWriter::new(file.try_clone().map_err(exchange_error)?),
-                    &page.columns,
-                    &{
-                        let mut options = options.clone().unwrap_or_default();
-                        options.database_kind = driver_kind;
-                        options
-                    },
-                )?);
+                .await
+            {
+                Ok(_) => describe.columns.len(),
+                Err(_) => 0,
             }
-            let row_count = page.rows.len();
-            for row in &page.rows {
-                writer
-                    .as_mut()
-                    .expect("writer initialized")
-                    .write_row(row)?;
-            }
-            offset += row_count;
+        } else {
+            0
+        };
+        let export_options = {
+            let mut options = options.clone().unwrap_or_default();
+            options.database_kind = driver_kind;
+            options
+        };
+        let mut rows_written = export_query_pages(
+            &app,
+            task_id,
+            &session,
+            database.clone(),
+            &sql,
+            page_size,
+            &file,
+            export_options.clone(),
+            driver_kind,
+            total_rows,
+            ordered_columns,
+        )
+        .await?;
+        if ordered_columns > 0 && rows_written != total_rows {
+            // Keyset pagination seeks past the cursor with a strict `>`, so
+            // duplicate rows (which sort equal to the cursor) would be
+            // skipped. When the exported count does not add up, redo the
+            // export with plain OFFSET pagination for completeness.
             emit_export_progress(
                 &app,
                 task_id,
                 "导出数据",
-                offset as u64,
+                0,
                 Some(total_rows),
-                Some(format!("已写入 {offset} / {total_rows} 行")),
+                Some("检测到重复行，回退为偏移分页重新导出".into()),
             );
-            if !page.has_more || row_count == 0 {
-                break;
-            }
+            use std::io::{Seek, SeekFrom};
+            file.set_len(0).map_err(exchange_error)?;
+            file.seek(SeekFrom::Start(0)).map_err(exchange_error)?;
+            rows_written = export_query_pages(
+                &app,
+                task_id,
+                &session,
+                database.clone(),
+                &sql,
+                page_size,
+                &file,
+                export_options,
+                driver_kind,
+                total_rows,
+                0,
+            )
+            .await?;
         }
-        let writer = writer.ok_or_else(|| CockpitError::Exchange("导出没有返回元数据".into()))?;
-        let rows_written = writer.rows_written();
-        let mut output = writer.finish()?;
-        output.flush().map_err(exchange_error)?;
-        output.get_ref().sync_all().map_err(exchange_error)?;
         Ok(rows_written)
     }
     .await;
@@ -1423,6 +1549,100 @@ pub async fn export_query(
         output_path: output_path.to_string_lossy().into_owned(),
         rows_written,
     })
+}
+
+/// Writes one full export pass of an arbitrary query result to `file`,
+/// fetching `page_size` rows at a time. With `ordered_columns > 0` the pages
+/// are ordered by the query's own output columns and fetched with keyset
+/// pagination (seek past the last row) instead of `LIMIT/OFFSET`, which
+/// turns the export from O(n²) into O(n) for seekable queries. Keyset mode
+/// is abandoned permanently as soon as a page cannot yield a valid cursor
+/// (NULL or otherwise unrepresentable key values), falling back to OFFSET.
+/// With `ordered_columns == 0` the pass uses plain `LIMIT/OFFSET` without
+/// ordering (e.g. when the result columns cannot be ordered at all).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "export pass bundles the session, target file and progress context"
+)]
+async fn export_query_pages(
+    app: &AppHandle,
+    task_id: Option<Uuid>,
+    session: &Arc<dyn cockpit_core::DriverSession>,
+    database: Option<String>,
+    sql: &str,
+    page_size: usize,
+    file: &std::fs::File,
+    options: ResultExportOptions,
+    driver_kind: DatabaseKind,
+    total_rows: u64,
+    ordered_columns: usize,
+) -> cockpit_core::Result<u64> {
+    let mut offset = 0usize;
+    let mut writer: Option<ResultStreamWriter<BufWriter<std::fs::File>>> = None;
+    let mut keyset_active = ordered_columns > 0;
+    let mut cursor: Option<KeysetCursor> = None;
+    loop {
+        let keyset = keyset_active.then_some(cursor.as_ref()).flatten();
+        let page = session
+            .execute(ExecuteQueryRequest {
+                execution_id: Uuid::new_v4(),
+                sql: paged_select_sql(sql, page_size, offset, keyset, driver_kind, ordered_columns),
+                database: database.clone(),
+                timeout_secs: None,
+                allow_write: false,
+                page_size,
+                row_offset: 0,
+            })
+            .await?;
+        if writer.is_none() {
+            writer = Some(ResultStreamWriter::new(
+                BufWriter::new(file.try_clone().map_err(exchange_error)?),
+                &page.columns,
+                &options,
+            )?);
+        }
+        let row_count = page.rows.len();
+        for row in &page.rows {
+            writer
+                .as_mut()
+                .expect("writer initialized")
+                .write_row(row)?;
+        }
+        offset += row_count;
+        if keyset_active && let Some(last_row) = page.rows.last() {
+            let next = KeysetCursor {
+                columns: page
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<_>>(),
+                last_values: last_row.to_vec(),
+            };
+            if keyset_condition_sql(&next.columns, &next.last_values, driver_kind).is_some() {
+                cursor = Some(next);
+            } else {
+                keyset_active = false;
+                cursor = None;
+            }
+        }
+        emit_export_progress(
+            app,
+            task_id,
+            "导出数据",
+            offset as u64,
+            Some(total_rows),
+            Some(format!("已写入 {offset} / {total_rows} 行")),
+        );
+        if !page.has_more || row_count == 0 {
+            break;
+        }
+    }
+    let writer = writer.ok_or_else(|| CockpitError::Exchange("导出没有返回元数据".into()))?;
+    let rows_written = writer.rows_written();
+    let mut output = writer.finish()?;
+    output.flush().map_err(exchange_error)?;
+    output.get_ref().sync_all().map_err(exchange_error)?;
+    Ok(rows_written)
 }
 
 #[derive(Debug, Serialize)]
@@ -1647,6 +1867,11 @@ pub async fn backup_database(
                 let detail = table_details.get(&table.name).ok_or_else(|| {
                     CockpitError::Exchange(format!("备份缺少表结构：{}", table.name))
                 })?;
+                // Keyset pagination on the table key (same SQL builder as
+                // exports); falls back to OFFSET when no cursor is available.
+                let key_columns = table_keyset_columns(detail);
+                let mut keyset_active = key_columns.is_some();
+                let mut cursor: Option<KeysetCursor> = None;
                 let first_page = session
                     .execute(ExecuteQueryRequest {
                         execution_id: Uuid::new_v4(),
@@ -1656,6 +1881,7 @@ pub async fn backup_database(
                             detail,
                             page_size,
                             offset,
+                            keyset_active.then_some(cursor.as_ref()).flatten(),
                             driver_kind,
                         )?,
                         database: Some(database.clone()),
@@ -1682,6 +1908,30 @@ pub async fn backup_database(
                         writer.write_row(row)?;
                     }
                     offset += row_count;
+                    if keyset_active {
+                        let next = match (key_columns.as_deref(), page.rows.last()) {
+                            (Some(key_columns), Some(last_row)) => {
+                                keyset_from_last_row(key_columns, &page.columns, last_row)
+                            }
+                            _ => None,
+                        };
+                        match next {
+                            Some(next)
+                                if keyset_condition_sql(
+                                    &next.columns,
+                                    &next.last_values,
+                                    driver_kind,
+                                )
+                                .is_some() =>
+                            {
+                                cursor = Some(next);
+                            }
+                            _ => {
+                                keyset_active = false;
+                                cursor = None;
+                            }
+                        }
+                    }
                     emit_transfer_progress(
                         &app,
                         task_id,
@@ -1703,6 +1953,7 @@ pub async fn backup_database(
                                 detail,
                                 page_size,
                                 offset,
+                                keyset_active.then_some(cursor.as_ref()).flatten(),
                                 driver_kind,
                             )?,
                             database: Some(database.clone()),
@@ -1923,28 +2174,46 @@ pub async fn backup_database(
     let mut final_temporary_path = if compression == "gzip" {
         emit_transfer_progress(&app, task_id, "backup", "压缩", 0, None, None);
         let compressed_path = parent.join(format!(".{file_name}.{}.gz.tmp", Uuid::new_v4()));
-        let mut input =
-            std::fs::File::open(&temporary_path).map_err(|error| payload(exchange_error(error)))?;
-        let compressed_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&compressed_path)
-            .map_err(|error| payload(exchange_error(error)))?;
-        let mut encoder = GzEncoder::new(compressed_file, Compression::default());
-        if let Err(error) = std::io::copy(&mut input, &mut encoder).map_err(exchange_error) {
-            let _ = std::fs::remove_file(&temporary_path);
-            let _ = std::fs::remove_file(&compressed_path);
-            state.transfers.write().await.remove(&task_id);
-            return Err(payload(error));
+        let compress_token = token.clone();
+        let compress_input = temporary_path.clone();
+        let compress_output = compressed_path.clone();
+        // gzip is CPU/IO bound; run it on the blocking pool so the async
+        // runtime is never stalled. The custom writer checks the
+        // cancellation token on every compressed chunk, so cancel_transfer
+        // stops the compression promptly instead of waiting for the whole
+        // file to be processed.
+        let compress_result =
+            tokio::task::spawn_blocking(move || -> cockpit_core::Result<PathBuf> {
+                let mut input = std::fs::File::open(&compress_input).map_err(exchange_error)?;
+                let compressed_file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&compress_output)
+                    .map_err(exchange_error)?;
+                let writer = CancelCheckWriter {
+                    inner: compressed_file,
+                    token: compress_token,
+                };
+                let mut encoder = GzEncoder::new(writer, Compression::default());
+                std::io::copy(&mut input, &mut encoder).map_err(exchange_error)?;
+                let file = encoder.finish().map_err(exchange_error)?.into_inner();
+                file.sync_all().map_err(exchange_error)?;
+                Ok(compress_output)
+            })
+            .await
+            .map_err(|error| payload(CockpitError::Exchange(error.to_string())))?;
+        match compress_result {
+            Ok(path) => {
+                let _ = std::fs::remove_file(&temporary_path);
+                path
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary_path);
+                let _ = std::fs::remove_file(&compressed_path);
+                state.transfers.write().await.remove(&task_id);
+                return Err(payload(error));
+            }
         }
-        let compressed_file = encoder
-            .finish()
-            .map_err(|error| payload(exchange_error(error)))?;
-        compressed_file
-            .sync_all()
-            .map_err(|error| payload(exchange_error(error)))?;
-        let _ = std::fs::remove_file(&temporary_path);
-        compressed_path
     } else {
         temporary_path
     };
@@ -1952,9 +2221,21 @@ pub async fn backup_database(
     if let Some(password) = encryption_password.as_deref() {
         emit_transfer_progress(&app, task_id, "backup", "加密", 0, None, None);
         let encrypted_path = parent.join(format!(".{file_name}.{}.enc.tmp", Uuid::new_v4()));
-        if let Err(error) =
-            encrypt_backup_file(&final_temporary_path, &encrypted_path, password, &token)
-        {
+        let encrypt_token = token.clone();
+        let encrypt_input = final_temporary_path.clone();
+        let encrypt_output = encrypted_path.clone();
+        let encrypt_password = password.to_string();
+        let encrypt_result = tokio::task::spawn_blocking(move || {
+            encrypt_backup_file(
+                &encrypt_input,
+                &encrypt_output,
+                &encrypt_password,
+                &encrypt_token,
+            )
+        })
+        .await
+        .map_err(|error| payload(CockpitError::Exchange(error.to_string())))?;
+        if let Err(error) = encrypt_result {
             let _ = std::fs::remove_file(&final_temporary_path);
             let _ = std::fs::remove_file(&encrypted_path);
             state.transfers.write().await.remove(&task_id);
@@ -1963,7 +2244,19 @@ pub async fn backup_database(
         let _ = std::fs::remove_file(&final_temporary_path);
         final_temporary_path = encrypted_path;
     }
-    let (checksum_sha256, bytes_written) = file_sha256(&final_temporary_path).map_err(payload)?;
+    let hash_path = final_temporary_path.clone();
+    let hash_token = token.clone();
+    let hash_result = tokio::task::spawn_blocking(move || file_sha256(&hash_path, &hash_token))
+        .await
+        .map_err(|error| payload(CockpitError::Exchange(error.to_string())))?;
+    let (checksum_sha256, bytes_written) = match hash_result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = std::fs::remove_file(&final_temporary_path);
+            state.transfers.write().await.remove(&task_id);
+            return Err(payload(error));
+        }
+    };
     replace_file(&final_temporary_path, &output_path).map_err(payload)?;
     state.transfers.write().await.remove(&task_id);
     emit_transfer_progress(
@@ -1984,6 +2277,36 @@ pub async fn backup_database(
         bytes_written,
         encrypted,
     })
+}
+
+/// Write wrapper that aborts the surrounding `std::io::copy` as soon as the
+/// backup task is cancelled, so gzip compression stops promptly instead of
+/// blocking a worker thread until the whole file has been processed.
+struct CancelCheckWriter<W> {
+    inner: W,
+    token: tokio_util::sync::CancellationToken,
+}
+
+impl<W> CancelCheckWriter<W> {
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for CancelCheckWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.token.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "备份任务已取消",
+            ));
+        }
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn encryption_key(password: &str, salt: &[u8; 16]) -> cockpit_core::Result<[u8; 32]> {
@@ -2049,42 +2372,64 @@ fn encrypt_backup_file(
     output.sync_all().map_err(exchange_error)
 }
 
-fn decrypt_backup_bytes(bytes: &[u8], password: &str) -> cockpit_core::Result<Vec<u8>> {
+/// Decrypts a chunked encrypted backup file incrementally, so the encrypted
+/// bytes never have to be held in memory together with the decrypted output
+/// (a large backup would otherwise peak at ~1.5x its size). The plaintext is
+/// still returned as one buffer because the SQL restore pipeline needs the
+/// full text in memory to split statements.
+fn decrypt_backup_file(path: &Path, password: &str) -> cockpit_core::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path).map_err(exchange_error)?;
     let header_len = ENCRYPTED_BACKUP_MAGIC.len() + 16 + 4;
-    if bytes.len() < header_len || !bytes.starts_with(ENCRYPTED_BACKUP_MAGIC) {
+    let mut header = vec![0u8; header_len];
+    file.read_exact(&mut header).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            CockpitError::Exchange("加密备份文件头无效".into())
+        } else {
+            exchange_error(error)
+        }
+    })?;
+    if !header.starts_with(ENCRYPTED_BACKUP_MAGIC) {
         return Err(CockpitError::Exchange("加密备份文件头无效".into()));
     }
     let mut salt = [0u8; 16];
-    salt.copy_from_slice(&bytes[ENCRYPTED_BACKUP_MAGIC.len()..ENCRYPTED_BACKUP_MAGIC.len() + 16]);
-    let nonce_prefix = &bytes[ENCRYPTED_BACKUP_MAGIC.len() + 16..header_len];
+    salt.copy_from_slice(&header[ENCRYPTED_BACKUP_MAGIC.len()..ENCRYPTED_BACKUP_MAGIC.len() + 16]);
+    let nonce_prefix = &header[ENCRYPTED_BACKUP_MAGIC.len() + 16..header_len];
     let key = encryption_key(password, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(exchange_error)?;
     let mut output = Vec::new();
-    let mut offset = header_len;
     let mut counter = 0u64;
     loop {
-        let length_bytes = bytes
-            .get(offset..offset + 4)
-            .ok_or_else(|| CockpitError::Exchange("加密备份文件不完整".into()))?;
-        let length = u32::from_be_bytes(length_bytes.try_into().expect("four-byte slice")) as usize;
-        offset += 4;
+        let mut length_bytes = [0u8; 4];
+        file.read_exact(&mut length_bytes).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                CockpitError::Exchange("加密备份文件不完整".into())
+            } else {
+                exchange_error(error)
+            }
+        })?;
+        let length = u32::from_be_bytes(length_bytes) as usize;
         if length == 0 {
-            if offset != bytes.len() {
+            let mut trailing = [0u8; 1];
+            if file.read(&mut trailing).map_err(exchange_error)? != 0 {
                 return Err(CockpitError::Exchange("加密备份尾部包含无效数据".into()));
             }
             break;
         }
-        let encrypted = bytes
-            .get(offset..offset + length)
-            .ok_or_else(|| CockpitError::Exchange("加密备份分块不完整".into()))?;
+        let mut encrypted = vec![0u8; length];
+        file.read_exact(&mut encrypted).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                CockpitError::Exchange("加密备份分块不完整".into())
+            } else {
+                exchange_error(error)
+            }
+        })?;
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(nonce_prefix);
         nonce[4..].copy_from_slice(&counter.to_be_bytes());
         let decrypted = cipher
-            .decrypt(Nonce::from_slice(&nonce), encrypted)
+            .decrypt(Nonce::from_slice(&nonce), encrypted.as_slice())
             .map_err(|_| CockpitError::Exchange("备份密码错误或文件已损坏".into()))?;
         output.extend_from_slice(&decrypted);
-        offset += length;
         counter = counter
             .checked_add(1)
             .ok_or_else(|| CockpitError::Exchange("加密分块计数溢出".into()))?;
@@ -2093,13 +2438,22 @@ fn decrypt_backup_bytes(bytes: &[u8], password: &str) -> cockpit_core::Result<Ve
 }
 
 fn read_backup_text(path: &Path, password: Option<&str>) -> cockpit_core::Result<String> {
-    let mut bytes = std::fs::read(path).map_err(exchange_error)?;
-    if bytes.starts_with(ENCRYPTED_BACKUP_MAGIC) {
+    // Peek at the magic without reading the whole file, so encrypted backups
+    // are decrypted incrementally instead of loading the ciphertext fully.
+    let mut magic = [0u8; ENCRYPTED_BACKUP_MAGIC.len()];
+    let magic_len = {
+        let mut file = std::fs::File::open(path).map_err(exchange_error)?;
+        file.read(&mut magic).map_err(exchange_error)?
+    };
+    let mut bytes = if magic_len >= ENCRYPTED_BACKUP_MAGIC.len() && magic == *ENCRYPTED_BACKUP_MAGIC
+    {
         let password = password
             .filter(|value| !value.is_empty())
             .ok_or_else(|| CockpitError::InvalidConfig("该备份已加密，请输入密码".into()))?;
-        bytes = decrypt_backup_bytes(&bytes, password)?;
-    }
+        decrypt_backup_file(path, password)?
+    } else {
+        std::fs::read(path).map_err(exchange_error)?
+    };
     if bytes.starts_with(&[0x1f, 0x8b]) {
         let mut decoded = Vec::new();
         GzDecoder::new(Cursor::new(bytes))
@@ -2121,12 +2475,18 @@ fn strip_cockpit_backup_header(sql: &str) -> (bool, &str) {
     }
 }
 
-fn file_sha256(path: &Path) -> cockpit_core::Result<(String, u64)> {
+fn file_sha256(
+    path: &Path,
+    token: &tokio_util::sync::CancellationToken,
+) -> cockpit_core::Result<(String, u64)> {
     let mut file = std::fs::File::open(path).map_err(exchange_error)?;
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut bytes = 0u64;
     loop {
+        if token.is_cancelled() {
+            return Err(CockpitError::Query("备份任务已取消".into()));
+        }
         let read = file.read(&mut buffer).map_err(exchange_error)?;
         if read == 0 {
             break;
@@ -2438,6 +2798,11 @@ async fn import_data_inner(
         .iter()
         .map(|column| column.name.clone())
         .collect::<Vec<_>>();
+    let valid_columns = detail
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
     let parse_request = ImportParseRequest {
         input_path: request.input_path.clone(),
         format: request.format,
@@ -2449,37 +2814,61 @@ async fn import_data_inner(
         null_values: request.null_values.clone(),
         trim_values: request.trim_values,
     };
-    let (source_columns, rows) =
-        tauri::async_runtime::spawn_blocking(move || parse_import_rows(&parse_request))
-            .await
-            .map_err(|error| CockpitError::Exchange(error.to_string()))??;
-    let valid_columns = detail
-        .columns
-        .iter()
-        .map(|column| column.name.as_str())
-        .collect::<Vec<_>>();
-    let (columns, rows) =
-        apply_import_mappings(source_columns, rows, &request.mappings, &valid_columns)?;
-    if columns.is_empty() {
-        return Err(CockpitError::InvalidConfig("导入文件没有可用列".into()));
-    }
-    let total = rows.len() as u64;
+    let batch_size = request.batch_size.clamp(1, 2_000);
+    // The file is parsed on a blocking thread and streamed to this loop in
+    // batches (CSV row by row; Excel in row chunks), so imports no longer
+    // load the whole file into memory.
+    let (mut receiver, reader_task) = spawn_import_reader(parse_request, batch_size, token.clone());
     session.begin_transaction().await?;
     let mut imported = 0u64;
     let mut processed = 0u64;
     let mut errors = Vec::new();
-    let batch_size = request.batch_size.clamp(1, 2_000);
-    for batch in rows.chunks(batch_size) {
+    let mut projection: Option<ImportProjection> = None;
+    let mut known_total: Option<u64> = None;
+    loop {
+        let message = receiver
+            .recv()
+            .await
+            .ok_or_else(|| CockpitError::Exchange("导入文件读取线程意外终止".into()))?;
+        let batch = match message {
+            Ok(ImportStreamMessage::Start {
+                columns: source_columns,
+                total,
+            }) => {
+                let resolved =
+                    resolve_import_projection(source_columns, &request.mappings, &valid_columns)?;
+                if resolved.columns.is_empty() {
+                    let _ = session.rollback_transaction().await;
+                    return Err(CockpitError::InvalidConfig("导入文件没有可用列".into()));
+                }
+                known_total = total;
+                projection = Some(resolved);
+                continue;
+            }
+            Ok(ImportStreamMessage::Rows(rows)) => rows,
+            Ok(ImportStreamMessage::End) => break,
+            Err(error) => {
+                let _ = session.rollback_transaction().await;
+                return Err(error);
+            }
+        };
         if token.is_cancelled() {
             let _ = session.rollback_transaction().await;
             return Err(CockpitError::Query("导入任务已取消".into()));
         }
+        let projection = projection
+            .as_ref()
+            .ok_or_else(|| CockpitError::Exchange("导入流缺少表头信息".into()))?;
+        let batch = batch
+            .iter()
+            .map(|row| project_import_row(projection, row))
+            .collect::<Vec<_>>();
         let result = session
             .insert_rows_with_policy(
                 &request.database,
                 table,
-                &columns,
-                batch,
+                &projection.columns,
+                &batch,
                 request.conflict_strategy,
             )
             .await;
@@ -2495,7 +2884,7 @@ async fn import_data_inner(
                         .insert_rows_with_policy(
                             &request.database,
                             table,
-                            &columns,
+                            &projection.columns,
                             std::slice::from_ref(row),
                             request.conflict_strategy,
                         )
@@ -2523,14 +2912,20 @@ async fn import_data_inner(
             "import",
             "写入数据",
             processed,
-            Some(total),
+            known_total,
             None,
         );
     }
+    reader_task
+        .await
+        .map_err(|error| CockpitError::Exchange(format!("导入文件读取线程异常：{error}")))?;
     if let Err(error) = session.commit_transaction().await {
         let _ = session.rollback_transaction().await;
         return Err(error);
     }
+    // CSV streaming does not know the total up front; use the processed
+    // count so the summary semantics match the previous whole-file import.
+    let total = known_total.unwrap_or(processed);
     emit_transfer_progress(app, task_id, "import", "完成", total, Some(total), None);
     Ok(ImportSummary {
         rows_imported: imported,
@@ -2647,98 +3042,337 @@ struct ImportParseRequest {
     trim_values: bool,
 }
 
-fn parse_import_rows(
+/// Messages sent by the blocking import reader to the async insert loop.
+/// The first message is always `Start` (source columns plus the total row
+/// count when it is known up front), followed by `Rows` batches and `End`.
+enum ImportStreamMessage {
+    Start {
+        columns: Vec<String>,
+        total: Option<u64>,
+    },
+    Rows(Vec<Vec<CellValue>>),
+    End,
+}
+
+type ImportStreamResult = std::result::Result<ImportStreamMessage, CockpitError>;
+
+/// Excel (calamine) materializes the whole sheet in memory and cannot be
+/// streamed; cap the number of data rows so a misconfigured import cannot
+/// exhaust the process memory.
+const MAX_IMPORT_ROWS: usize = 1_000_000;
+
+/// Starts a blocking reader thread that parses the import file and sends
+/// `Start`/`Rows`/`End` batches over a bounded channel. The async insert
+/// loop consumes the batches so the file is never loaded in full at once
+/// (CSV is parsed row by row; Excel stays bounded by `MAX_IMPORT_ROWS`).
+fn spawn_import_reader(
+    request: ImportParseRequest,
+    batch_size: usize,
+    token: tokio_util::sync::CancellationToken,
+) -> (
+    tokio::sync::mpsc::Receiver<ImportStreamResult>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let handle = tokio::task::spawn_blocking(move || {
+        let result = match request.format {
+            ImportFormat::Csv => read_csv_stream(&request, batch_size, &token, &tx),
+            ImportFormat::Excel => read_excel_stream(&request, batch_size, &token, &tx),
+            ImportFormat::Sql => unreachable!("SQL restore is handled separately"),
+        };
+        if let Err(error) = result {
+            let _ = tx.blocking_send(Err(error));
+        }
+    });
+    (rx, handle)
+}
+
+fn read_csv_stream(
     request: &ImportParseRequest,
-) -> cockpit_core::Result<(Vec<String>, Vec<Vec<CellValue>>)> {
-    match request.format {
-        ImportFormat::Csv => {
-            let contents = read_delimited_text(&request.input_path, request.encoding.as_deref())?;
-            let delimiter = delimiter_byte(request.delimiter.as_deref(), &contents)?;
-            let mut reader = csv::ReaderBuilder::new()
-                .has_headers(request.has_headers)
-                .flexible(true)
-                .delimiter(delimiter)
-                .from_reader(contents.as_bytes());
-            let columns = if request.has_headers {
-                reader
-                    .headers()
-                    .map_err(exchange_error)?
-                    .iter()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            } else {
-                request.fallback_columns.clone()
-            };
-            let rows = reader
-                .records()
-                .map(|record| {
-                    record.map_err(exchange_error).map(|record| {
-                        record
-                            .iter()
-                            .map(|value| {
-                                import_text_cell(value, &request.null_values, request.trim_values)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect::<cockpit_core::Result<Vec<_>>>()?;
-            Ok((columns, rows))
-        }
-        ImportFormat::Excel => {
-            let mut workbook = open_workbook_auto(&request.input_path).map_err(exchange_error)?;
-            let sheet_names = workbook.sheet_names().to_vec();
-            let sheet_name = sheet_names
-                .iter()
-                .find(|name| request.sheet_name.as_deref() == Some(name.as_str()))
-                .or_else(|| sheet_names.first())
-                .cloned()
-                .ok_or_else(|| CockpitError::Exchange("Excel 文件没有工作表".into()))?;
-            let range = workbook
-                .worksheet_range(&sheet_name)
-                .map_err(exchange_error)?;
-            let mut rows = range.rows();
-            let columns = if request.has_headers {
-                rows.next()
-                    .map(|row| row.iter().map(ToString::to_string).collect())
-                    .unwrap_or_default()
-            } else {
-                request.fallback_columns.clone()
-            };
-            let values = rows
-                .map(|row| {
-                    row.iter()
-                        .map(|value| match value {
-                            Data::Empty => CellValue::Null,
-                            _ => import_text_cell(
-                                &value.to_string(),
-                                &request.null_values,
-                                request.trim_values,
-                            ),
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            Ok((columns, values))
-        }
-        ImportFormat::Sql => unreachable!("SQL imports are handled separately"),
-    }
-}
-
-fn import_text_cell(value: &str, null_values: &[String], trim_values: bool) -> CellValue {
-    let value = if trim_values { value.trim() } else { value };
-    if null_values.iter().any(|null| null == value) {
-        CellValue::Null
+    batch_size: usize,
+    token: &tokio_util::sync::CancellationToken,
+    tx: &tokio::sync::mpsc::Sender<ImportStreamResult>,
+) -> cockpit_core::Result<()> {
+    let file = std::fs::File::open(&request.input_path).map_err(exchange_error)?;
+    let transcoding =
+        TranscodingReader::new(file, request.encoding.as_deref()).map_err(exchange_error)?;
+    let mut buffered = std::io::BufReader::new(transcoding);
+    // Sniff the delimiter from the first decoded chunk, then hand the whole
+    // stream (sniffed prefix + remainder) to the CSV reader.
+    let mut sniff = Vec::with_capacity(64 * 1024);
+    std::io::Read::by_ref(&mut buffered)
+        .take(64 * 1024)
+        .read_to_end(&mut sniff)
+        .map_err(exchange_error)?;
+    let sniff_text = String::from_utf8_lossy(&sniff);
+    let delimiter = delimiter_byte(request.delimiter.as_deref(), &sniff_text)?;
+    let source = Cursor::new(sniff).chain(buffered);
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(request.has_headers)
+        .flexible(true)
+        .delimiter(delimiter)
+        .from_reader(source);
+    let columns = if request.has_headers {
+        reader
+            .headers()
+            .map_err(exchange_error)?
+            .iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
     } else {
-        CellValue::Text(value.into())
+        request.fallback_columns.clone()
+    };
+    if tx
+        .blocking_send(Ok(ImportStreamMessage::Start {
+            columns,
+            total: None,
+        }))
+        .is_err()
+    {
+        return Ok(());
+    }
+    let mut batch = Vec::with_capacity(batch_size);
+    for record in reader.records() {
+        if token.is_cancelled() {
+            return Err(CockpitError::Query("导入任务已取消".into()));
+        }
+        let record = record.map_err(exchange_error)?;
+        batch.push(
+            record
+                .iter()
+                .map(|value| import_text_cell(value, &request.null_values, request.trim_values))
+                .collect::<Vec<_>>(),
+        );
+        if batch.len() >= batch_size {
+            let rows = std::mem::take(&mut batch);
+            if tx
+                .blocking_send(Ok(ImportStreamMessage::Rows(rows)))
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+    }
+    if !batch.is_empty()
+        && tx
+            .blocking_send(Ok(ImportStreamMessage::Rows(batch)))
+            .is_err()
+    {
+        return Ok(());
+    }
+    if tx.blocking_send(Ok(ImportStreamMessage::End)).is_err() {
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn read_excel_stream(
+    request: &ImportParseRequest,
+    batch_size: usize,
+    token: &tokio_util::sync::CancellationToken,
+    tx: &tokio::sync::mpsc::Sender<ImportStreamResult>,
+) -> cockpit_core::Result<()> {
+    let mut workbook = open_workbook_auto(&request.input_path).map_err(exchange_error)?;
+    let sheet_names = workbook.sheet_names().to_vec();
+    let sheet_name = sheet_names
+        .iter()
+        .find(|name| request.sheet_name.as_deref() == Some(name.as_str()))
+        .or_else(|| sheet_names.first())
+        .cloned()
+        .ok_or_else(|| CockpitError::Exchange("Excel 文件没有工作表".into()))?;
+    let range = workbook
+        .worksheet_range(&sheet_name)
+        .map_err(exchange_error)?;
+    let data_rows = range
+        .height()
+        .saturating_sub(usize::from(request.has_headers));
+    if data_rows > MAX_IMPORT_ROWS {
+        return Err(CockpitError::Exchange(format!(
+            "Excel 工作表超过 {MAX_IMPORT_ROWS} 行上限（当前 {data_rows} 行），无法导入"
+        )));
+    }
+    let mut rows = range.rows();
+    let columns = if request.has_headers {
+        rows.next()
+            .map(|row| row.iter().map(ToString::to_string).collect())
+            .unwrap_or_default()
+    } else {
+        request.fallback_columns.clone()
+    };
+    if tx
+        .blocking_send(Ok(ImportStreamMessage::Start {
+            columns,
+            total: Some(data_rows as u64),
+        }))
+        .is_err()
+    {
+        return Ok(());
+    }
+    let mut batch = Vec::with_capacity(batch_size);
+    for row in rows {
+        if token.is_cancelled() {
+            return Err(CockpitError::Query("导入任务已取消".into()));
+        }
+        batch.push(
+            row.iter()
+                .map(|value| match value {
+                    Data::Empty => CellValue::Null,
+                    _ => import_text_cell(
+                        &value.to_string(),
+                        &request.null_values,
+                        request.trim_values,
+                    ),
+                })
+                .collect::<Vec<_>>(),
+        );
+        if batch.len() >= batch_size {
+            let rows = std::mem::take(&mut batch);
+            if tx
+                .blocking_send(Ok(ImportStreamMessage::Rows(rows)))
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+    }
+    if !batch.is_empty()
+        && tx
+            .blocking_send(Ok(ImportStreamMessage::Rows(batch)))
+            .is_err()
+    {
+        return Ok(());
+    }
+    if tx.blocking_send(Ok(ImportStreamMessage::End)).is_err() {
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// Incremental transcoding reader: decodes the raw file bytes (UTF-8 strict,
+/// UTF-8 lossy, or GB18030) into UTF-8 on the fly so CSV files never need to
+/// be loaded into memory as a whole. Strict UTF-8 mode reports invalid input
+/// as an I/O error, mirroring the previous whole-file behavior.
+struct TranscodingReader<R> {
+    inner: R,
+    decoder: encoding_rs::Decoder,
+    raw_buffer: Vec<u8>,
+    raw_pos: usize,
+    raw_len: usize,
+    out_buffer: Vec<u8>,
+    out_pos: usize,
+    eof: bool,
+    strict: bool,
+}
+
+impl<R: Read> TranscodingReader<R> {
+    fn new(inner: R, encoding: Option<&str>) -> std::io::Result<Self> {
+        let encoding = encoding.unwrap_or("utf-8");
+        let decoder = match encoding {
+            "utf-8" => encoding_rs::UTF_8.new_decoder_without_bom_handling(),
+            "utf-8-lossy" => encoding_rs::UTF_8.new_decoder_without_bom_handling(),
+            "gb18030" => encoding_rs::GB18030.new_decoder_without_bom_handling(),
+            value => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("不支持的文本编码：{value}"),
+                ));
+            }
+        };
+        Ok(Self {
+            inner,
+            decoder,
+            raw_buffer: vec![0u8; 64 * 1024],
+            raw_pos: 0,
+            raw_len: 0,
+            out_buffer: Vec::new(),
+            out_pos: 0,
+            eof: false,
+            strict: encoding == "utf-8",
+        })
+    }
+
+    /// Decodes more input into `out_buffer`; returns `false` on EOF.
+    fn fill(&mut self) -> std::io::Result<bool> {
+        let mut decoded = [0u8; 8192];
+        loop {
+            if self.raw_pos < self.raw_len {
+                let (result, read, written, had_errors) = self.decoder.decode_to_utf8(
+                    &self.raw_buffer[self.raw_pos..self.raw_len],
+                    &mut decoded,
+                    false,
+                );
+                self.raw_pos += read;
+                if had_errors && self.strict {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "CSV 不是有效 UTF-8；可改用宽松 UTF-8 或 GB18030",
+                    ));
+                }
+                if written > 0 {
+                    self.out_buffer.extend_from_slice(&decoded[..written]);
+                    return Ok(true);
+                }
+                if matches!(result, encoding_rs::CoderResult::InputEmpty) {
+                    // All buffered raw bytes consumed; need more input.
+                }
+            }
+            if self.eof {
+                let mut tail = [0u8; 16];
+                let (_, _, written, had_errors) = self.decoder.decode_to_utf8(&[], &mut tail, true);
+                if had_errors && self.strict {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "CSV 不是有效 UTF-8；可改用宽松 UTF-8 或 GB18030",
+                    ));
+                }
+                if written > 0 {
+                    self.out_buffer.extend_from_slice(&tail[..written]);
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+            let read = self.inner.read(&mut self.raw_buffer)?;
+            self.raw_pos = 0;
+            self.raw_len = read;
+            if read == 0 {
+                self.eof = true;
+            }
+        }
     }
 }
 
-fn apply_import_mappings(
+impl<R: Read> Read for TranscodingReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.out_pos < self.out_buffer.len() {
+                let count = std::cmp::min(out.len(), self.out_buffer.len() - self.out_pos);
+                out[..count].copy_from_slice(&self.out_buffer[self.out_pos..self.out_pos + count]);
+                self.out_pos += count;
+                if self.out_pos == self.out_buffer.len() {
+                    self.out_buffer.clear();
+                    self.out_pos = 0;
+                }
+                return Ok(count);
+            }
+            if !self.fill()? {
+                return Ok(0);
+            }
+        }
+    }
+}
+
+/// Resolved column projection for one import: target column names plus the
+/// source index each one is read from.
+struct ImportProjection {
+    columns: Vec<String>,
+    indices: Vec<usize>,
+}
+
+fn resolve_import_projection(
     source_columns: Vec<String>,
-    rows: Vec<Vec<CellValue>>,
     mappings: &[ImportColumnMapping],
     valid_columns: &[&str],
-) -> cockpit_core::Result<(Vec<String>, Vec<Vec<CellValue>>)> {
+) -> cockpit_core::Result<ImportProjection> {
     let resolved = if mappings.is_empty() {
         source_columns
             .iter()
@@ -2775,33 +3409,29 @@ fn apply_import_mappings(
             "同一目标字段不能映射多次".into(),
         ));
     }
-    let columns = resolved
-        .iter()
-        .map(|(_, target)| target.clone())
-        .collect::<Vec<_>>();
-    let projected = rows
-        .into_iter()
-        .map(|row| {
-            resolved
-                .iter()
-                .map(|(index, _)| row.get(*index).cloned().unwrap_or(CellValue::Null))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    Ok((columns, projected))
+    Ok(ImportProjection {
+        columns: resolved
+            .iter()
+            .map(|(_, target)| target.clone())
+            .collect::<Vec<_>>(),
+        indices: resolved.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+    })
 }
 
-fn read_delimited_text(input_path: &str, encoding: Option<&str>) -> cockpit_core::Result<String> {
-    let bytes = std::fs::read(input_path).map_err(exchange_error)?;
-    match encoding.unwrap_or("utf-8") {
-        "utf-8" => String::from_utf8(bytes).map_err(|_| {
-            CockpitError::Exchange("CSV 不是有效 UTF-8；可改用宽松 UTF-8 或 GB18030".into())
-        }),
-        "utf-8-lossy" => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-        "gb18030" => Ok(GB18030.decode(&bytes).0.into_owned()),
-        value => Err(CockpitError::InvalidConfig(format!(
-            "不支持的文本编码：{value}"
-        ))),
+fn project_import_row(projection: &ImportProjection, row: &[CellValue]) -> Vec<CellValue> {
+    projection
+        .indices
+        .iter()
+        .map(|index| row.get(*index).cloned().unwrap_or(CellValue::Null))
+        .collect::<Vec<_>>()
+}
+
+fn import_text_cell(value: &str, null_values: &[String], trim_values: bool) -> CellValue {
+    let value = if trim_values { value.trim() } else { value };
+    if null_values.iter().any(|null| null == value) {
+        CellValue::Null
+    } else {
+        CellValue::Text(value.into())
     }
 }
 
@@ -2832,13 +3462,23 @@ fn build_import_preview(request: &ImportPreviewRequest) -> cockpit_core::Result<
     match request.format {
         ImportFormat::Sql => Err(CockpitError::InvalidConfig("SQL 文件不支持表格预览".into())),
         ImportFormat::Csv => {
-            let contents = read_delimited_text(&request.input_path, request.encoding.as_deref())?;
-            let delimiter = delimiter_byte(request.delimiter.as_deref(), &contents)?;
+            let file = std::fs::File::open(&request.input_path).map_err(exchange_error)?;
+            let transcoding = TranscodingReader::new(file, request.encoding.as_deref())
+                .map_err(exchange_error)?;
+            let mut buffered = std::io::BufReader::new(transcoding);
+            let mut sniff = Vec::with_capacity(64 * 1024);
+            std::io::Read::by_ref(&mut buffered)
+                .take(64 * 1024)
+                .read_to_end(&mut sniff)
+                .map_err(exchange_error)?;
+            let sniff_text = String::from_utf8_lossy(&sniff);
+            let delimiter = delimiter_byte(request.delimiter.as_deref(), &sniff_text)?;
+            let source = Cursor::new(sniff).chain(buffered);
             let mut reader = csv::ReaderBuilder::new()
                 .has_headers(request.has_headers)
                 .flexible(true)
                 .delimiter(delimiter)
-                .from_reader(contents.as_bytes());
+                .from_reader(source);
             let mut columns = if request.has_headers {
                 reader
                     .headers()
@@ -2951,26 +3591,35 @@ fn export_page(
 }
 
 fn replace_file(temporary_path: &Path, output_path: &Path) -> cockpit_core::Result<()> {
-    if !output_path.exists() {
-        return std::fs::rename(temporary_path, output_path).map_err(|error| {
+    match std::fs::rename(temporary_path, output_path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if cfg!(windows)
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) =>
+        {
+            // Windows `rename` cannot overwrite an existing destination
+            // (`MoveFileEx` without `MOVEFILE_REPLACE_EXISTING`). std does
+            // not expose ReplaceFile, so remove the destination first and
+            // retry with a single rename.
+            if let Err(remove_error) = std::fs::remove_file(output_path)
+                && remove_error.kind() != std::io::ErrorKind::NotFound
+            {
+                let _ = std::fs::remove_file(temporary_path);
+                return Err(exchange_error(remove_error));
+            }
+            std::fs::rename(temporary_path, output_path).map_err(|error| {
+                let _ = std::fs::remove_file(temporary_path);
+                exchange_error(error)
+            })
+        }
+        Err(error) => {
             let _ = std::fs::remove_file(temporary_path);
-            exchange_error(error)
-        });
+            Err(exchange_error(error))
+        }
     }
-    let backup_path = output_path.with_extension(format!("cockpit-backup-{}", Uuid::new_v4()));
-    if let Err(error) = std::fs::rename(output_path, &backup_path) {
-        let _ = std::fs::remove_file(temporary_path);
-        return Err(exchange_error(error));
-    }
-    if let Err(error) = std::fs::rename(temporary_path, output_path) {
-        let _ = std::fs::rename(&backup_path, output_path);
-        let _ = std::fs::remove_file(temporary_path);
-        return Err(exchange_error(error));
-    }
-    if let Err(error) = std::fs::remove_file(&backup_path) {
-        log::warn!("temporary output backup cleanup failed: {error}");
-    }
-    Ok(())
 }
 
 fn strip_definer_clause(ddl: &str) -> String {
@@ -3407,16 +4056,209 @@ fn mysql_table_engine(ddl: &str) -> Option<&str> {
     ddl.get(start..end).filter(|value| !value.is_empty())
 }
 
+/// Cursor for keyset (seek) pagination: the ordered key columns plus the
+/// values of the last emitted row. The next page is fetched with
+/// `WHERE k > last ORDER BY k LIMIT n` so the server seeks to the cursor
+/// instead of re-skipping `OFFSET` rows of the whole result set every page
+/// (linear total cost instead of quadratic).
+#[derive(Debug, Clone)]
+struct KeysetCursor {
+    columns: Vec<String>,
+    last_values: Vec<CellValue>,
+}
+
+/// Builds the `WHERE` clause that seeks past `(last_values...)` in
+/// `(columns...)` order, or `None` when the cursor cannot be represented:
+/// a NULL key value cannot be compared with `>` (NULL comparisons are
+/// unknown), so callers must fall back to `OFFSET` pagination.
+///
+/// The comparison is written as an explicit OR-of-AND chain
+/// (`k1 > v1 OR (k1 = v1 AND k2 > v2) OR ...`) rather than the row
+/// constructor `(k1, k2) > (v1, v2)`: it is equivalent lexicographically
+/// but works identically on MySQL, MariaDB, PostgreSQL and SQLite, and
+/// avoids the NULL edge cases of MySQL row-constructor comparisons.
+fn keyset_condition_sql(
+    columns: &[String],
+    last_values: &[CellValue],
+    database_kind: DatabaseKind,
+) -> Option<String> {
+    if columns.len() != last_values.len() {
+        return None;
+    }
+    let literals = last_values
+        .iter()
+        .map(|value| keyset_literal(value, database_kind))
+        .collect::<Option<Vec<_>>>()?;
+    let mut predicates = Vec::with_capacity(columns.len());
+    for index in 0..columns.len() {
+        let mut parts = Vec::with_capacity(index + 1);
+        for equal in 0..index {
+            parts.push(format!(
+                "{} = {}",
+                backup_quote_identifier(&columns[equal], database_kind),
+                literals[equal]
+            ));
+        }
+        parts.push(format!(
+            "{} > {}",
+            backup_quote_identifier(&columns[index], database_kind),
+            literals[index]
+        ));
+        predicates.push(parts.join(" AND "));
+    }
+    Some(predicates.join(" OR "))
+}
+
+/// Renders a single key value as a SQL literal for keyset comparisons.
+/// Returns `None` for values that cannot be embedded safely (NULL, or a
+/// non-finite float). Text-like values are single-quoted; binary and
+/// geometry values are embedded as hex literals so byte order is preserved.
+fn keyset_literal(value: &CellValue, database_kind: DatabaseKind) -> Option<String> {
+    let quoted = |text: String| -> String {
+        let escaped = match database_kind {
+            // MySQL/MariaDB treat backslash as an escape character by
+            // default, so backslashes must be doubled as well.
+            DatabaseKind::MySql | DatabaseKind::MariaDb => {
+                text.replace('\\', "\\\\").replace('\'', "''")
+            }
+            // PostgreSQL (standard_conforming_strings) and SQLite treat
+            // backslash literally; only single quotes need doubling.
+            DatabaseKind::PostgreSql | DatabaseKind::Sqlite => text.replace('\'', "''"),
+        };
+        format!("'{escaped}'")
+    };
+    let hex_literal = |bytes: &[u8]| -> String {
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        match database_kind {
+            DatabaseKind::MySql | DatabaseKind::MariaDb | DatabaseKind::Sqlite => {
+                format!("X'{hex}'")
+            }
+            DatabaseKind::PostgreSql => format!("'\\x{hex}'"),
+        }
+    };
+    match value {
+        CellValue::Null => None,
+        CellValue::Bool(value) => Some(quoted(if *value { "1".into() } else { "0".into() })),
+        CellValue::Signed(value)
+        | CellValue::Unsigned(value)
+        | CellValue::Decimal(value)
+        | CellValue::Text(value)
+        | CellValue::Date(value)
+        | CellValue::Time(value)
+        | CellValue::DateTime(value)
+        | CellValue::Json(value) => Some(quoted(value.clone())),
+        CellValue::Float(value) if value.is_finite() => Some(quoted(format!("{value}"))),
+        CellValue::Float(_) => None,
+        CellValue::Bytes { base64, .. } => {
+            let bytes = BASE64_STANDARD.decode(base64).ok()?;
+            Some(hex_literal(&bytes))
+        }
+        CellValue::Geometry { wkb_base64, srid } => {
+            let wkb = BASE64_STANDARD.decode(wkb_base64).ok()?;
+            let mut bytes = Vec::with_capacity(wkb.len() + 4);
+            bytes.extend_from_slice(&srid.unwrap_or_default().to_le_bytes());
+            bytes.extend_from_slice(&wkb);
+            Some(hex_literal(&bytes))
+        }
+    }
+}
+
+/// Returns the ordered key columns usable for keyset pagination of a table:
+/// the primary key, or the first unique index whose columns are all
+/// declared NOT NULL (mirrors the ordering choice of `table_page_sql`).
+/// `None` means no reliable key exists and `OFFSET` must be used.
+fn table_keyset_columns(detail: &TableDetail) -> Option<Vec<String>> {
+    let primary = detail
+        .indexes
+        .iter()
+        .find(|index| index.primary && !index.columns.is_empty());
+    let non_null_unique = detail.indexes.iter().find(|index| {
+        index.unique
+            && !index.columns.is_empty()
+            && index.columns.iter().all(|name| {
+                detail
+                    .columns
+                    .iter()
+                    .find(|column| column.name == *name)
+                    .is_some_and(|column| !column.nullable)
+            })
+    });
+    primary
+        .or(non_null_unique)
+        .map(|index| index.columns.clone())
+}
+
+/// Builds a keyset cursor from the last row of a fetched page, aligned with
+/// the page's column metadata. Returns `None` when a key column is missing
+/// from the projection (e.g. a generated key column excluded from export).
+fn keyset_from_last_row(
+    key_columns: &[String],
+    page_columns: &[ColumnMeta],
+    last_row: &[CellValue],
+) -> Option<KeysetCursor> {
+    let mut last_values = Vec::with_capacity(key_columns.len());
+    for name in key_columns {
+        let index = page_columns
+            .iter()
+            .position(|column| column.name == *name)?;
+        last_values.push(last_row.get(index)?.clone());
+    }
+    Some(KeysetCursor {
+        columns: key_columns.to_vec(),
+        last_values,
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pagination builder mirrors the table detail and cursor inputs"
+)]
 fn table_page_sql(
     database: &str,
     table: &str,
     detail: &TableDetail,
     page_size: usize,
     offset: usize,
+    keyset: Option<&KeysetCursor>,
     database_kind: DatabaseKind,
     include_generated_columns: bool,
 ) -> cockpit_core::Result<String> {
     if !matches!(database_kind, DatabaseKind::MySql | DatabaseKind::MariaDb) {
+        let key_columns = table_keyset_columns(detail);
+        if let (Some(key_columns), Some(cursor)) = (key_columns.as_ref(), keyset)
+            && cursor.columns == *key_columns
+            && let Some(condition) =
+                keyset_condition_sql(&cursor.columns, &cursor.last_values, database_kind)
+        {
+            let order = key_columns
+                .iter()
+                .map(|column| backup_quote_identifier(column, database_kind))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(format!(
+                "SELECT * FROM {}.{} WHERE {condition} ORDER BY {order} LIMIT {}",
+                backup_quote_identifier(database, database_kind),
+                backup_quote_identifier(table, database_kind),
+                page_size + 1
+            ));
+        }
+        if let Some(key_columns) = key_columns {
+            let order = key_columns
+                .iter()
+                .map(|column| backup_quote_identifier(column, database_kind))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(format!(
+                "SELECT * FROM {}.{} ORDER BY {order} LIMIT {} OFFSET {}",
+                backup_quote_identifier(database, database_kind),
+                backup_quote_identifier(table, database_kind),
+                page_size + 1,
+                offset
+            ));
+        }
         return Ok(format!(
             "SELECT * FROM {}.{} LIMIT {} OFFSET {}",
             backup_quote_identifier(database, database_kind),
@@ -3450,6 +4292,9 @@ fn table_page_sql(
                     .is_some_and(|column| !column.nullable)
             })
     });
+    let key_columns = primary
+        .or(non_null_unique)
+        .map(|index| index.columns.clone());
     let projection = selected_columns
         .iter()
         .map(|column| backup_quote_identifier(&column.name, database_kind))
@@ -3474,6 +4319,18 @@ fn table_page_sql(
             .collect::<Vec<_>>()
             .join(", ")
     };
+    if let (Some(key_columns), Some(cursor)) = (key_columns.as_ref(), keyset)
+        && cursor.columns == *key_columns
+        && let Some(condition) =
+            keyset_condition_sql(&cursor.columns, &cursor.last_values, database_kind)
+    {
+        return Ok(format!(
+            "SELECT {projection} FROM {}.{} WHERE {condition} ORDER BY {order} LIMIT {}",
+            backup_quote_identifier(database, database_kind),
+            backup_quote_identifier(table, database_kind),
+            page_size + 1
+        ));
+    }
     Ok(format!(
         "SELECT {projection} FROM {}.{} ORDER BY {order} LIMIT {} OFFSET {}",
         backup_quote_identifier(database, database_kind),
@@ -3489,6 +4346,7 @@ fn backup_table_page_sql(
     detail: &TableDetail,
     page_size: usize,
     offset: usize,
+    keyset: Option<&KeysetCursor>,
     database_kind: DatabaseKind,
 ) -> cockpit_core::Result<String> {
     table_page_sql(
@@ -3497,6 +4355,7 @@ fn backup_table_page_sql(
         detail,
         page_size,
         offset,
+        keyset,
         database_kind,
         false,
     )
@@ -3506,15 +4365,38 @@ fn paged_select_sql(
     sql: &str,
     page_size: usize,
     offset: usize,
+    keyset: Option<&KeysetCursor>,
     database_kind: DatabaseKind,
+    ordered_columns: usize,
 ) -> String {
-    format!(
-        "SELECT * FROM ({}) AS {} LIMIT {} OFFSET {}",
+    let source = format!(
+        "SELECT * FROM ({}) AS {}",
         sql.trim().trim_end_matches(';'),
-        backup_quote_identifier("__cockpit_page", database_kind),
-        page_size + 1,
-        offset
-    )
+        backup_quote_identifier("__cockpit_page", database_kind)
+    );
+    let limit = page_size + 1;
+    if let Some(cursor) = keyset
+        && let Some(condition) =
+            keyset_condition_sql(&cursor.columns, &cursor.last_values, database_kind)
+    {
+        // Deterministic ordering by the query's own output columns
+        // (ordinals work even when the columns have duplicate names).
+        let order = (1..=cursor.columns.len())
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("{source} WHERE {condition} ORDER BY {order} LIMIT {limit}");
+    }
+    if ordered_columns > 0 {
+        // Keep page 1 and any OFFSET fallback pages ordered identically to
+        // the keyset order, so the export stays consistent and repeatable.
+        let order = (1..=ordered_columns)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("{source} ORDER BY {order} LIMIT {limit} OFFSET {offset}");
+    }
+    format!("{source} LIMIT {limit} OFFSET {offset}")
 }
 
 #[cfg(test)]
@@ -3525,10 +4407,11 @@ mod tests {
     };
 
     use super::{
-        RuntimeStats, decrypt_backup_bytes, encrypt_backup_file, export_total_cell,
-        mysql_alter_database_definition, order_view_names, process_tree_memory_bytes,
-        read_backup_text, split_sql_script, strip_cockpit_backup_header, strip_definer_clause,
-        table_page_sql, write_delimited_definition,
+        DatabaseKind, KeysetCursor, RuntimeStats, decrypt_backup_file, encrypt_backup_file,
+        export_total_cell, keyset_condition_sql, mysql_alter_database_definition, order_view_names,
+        paged_select_sql, process_tree_memory_bytes, read_backup_text, split_sql_script,
+        strip_cockpit_backup_header, strip_definer_clause, table_keyset_columns, table_page_sql,
+        write_delimited_definition,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use cockpit_core::CellValue;
@@ -3687,6 +4570,7 @@ mod tests {
             &detail,
             500,
             1_000,
+            None,
             cockpit_core::DatabaseKind::MySql,
             false,
         )
@@ -3694,6 +4578,204 @@ mod tests {
         assert!(sql.starts_with("SELECT `id`, `secret` FROM `demo`.`items` ORDER BY `id`"));
         assert!(!sql.contains("computed"));
         assert!(sql.ends_with("LIMIT 501 OFFSET 1000"));
+    }
+
+    #[test]
+    fn keyset_condition_uses_quoted_composite_key_predicates() {
+        let columns = vec!["order`id".to_string(), "created_at".to_string()];
+        let values = vec![
+            CellValue::Unsigned("42".into()),
+            CellValue::Text("2024-01-02 03:04:05".into()),
+        ];
+        let condition =
+            keyset_condition_sql(&columns, &values, DatabaseKind::MySql).expect("valid cursor");
+        // AND binds tighter than OR, so the composite predicate needs no
+        // extra parentheses; backticks inside identifiers are doubled.
+        assert_eq!(
+            condition,
+            "`order``id` > '42' OR `order``id` = '42' AND `created_at` > '2024-01-02 03:04:05'"
+        );
+    }
+
+    #[test]
+    fn keyset_condition_escapes_literals_per_dialect() {
+        let columns = vec!["note".to_string()];
+        let values = vec![CellValue::Text("it's a \\ test".into())];
+        assert_eq!(
+            keyset_condition_sql(&columns, &values, DatabaseKind::MySql).unwrap(),
+            "`note` > 'it''s a \\\\ test'"
+        );
+        assert_eq!(
+            keyset_condition_sql(&columns, &values, DatabaseKind::PostgreSql).unwrap(),
+            "\"note\" > 'it''s a \\ test'"
+        );
+    }
+
+    #[test]
+    fn keyset_condition_rejects_null_and_mismatched_cursors() {
+        let columns = vec!["id".to_string()];
+        assert_eq!(
+            keyset_condition_sql(&columns, &[CellValue::Null], DatabaseKind::MySql),
+            None
+        );
+        assert_eq!(
+            keyset_condition_sql(&columns, &[], DatabaseKind::MySql),
+            None
+        );
+        assert_eq!(
+            keyset_condition_sql(&columns, &[CellValue::Float(f64::NAN)], DatabaseKind::MySql),
+            None
+        );
+    }
+
+    #[test]
+    fn table_page_sql_uses_keyset_cursor_when_valid() {
+        let detail = cockpit_core::TableDetail {
+            table: cockpit_core::TableInfo {
+                database: "demo".into(),
+                name: "items".into(),
+                table_type: "BASE TABLE".into(),
+                comment: None,
+                estimated_rows: None,
+                total_bytes: None,
+            },
+            columns: vec![cockpit_core::ColumnInfo {
+                name: "id".into(),
+                ordinal: 1,
+                data_type: "bigint".into(),
+                full_type: "bigint".into(),
+                nullable: false,
+                default_value: None,
+                extra: None,
+                comment: None,
+                key: Some("PRI".into()),
+                generation_expression: None,
+                collation: None,
+            }],
+            indexes: vec![cockpit_core::IndexInfo {
+                name: "PRIMARY".into(),
+                columns: vec!["id".into()],
+                unique: true,
+                primary: true,
+                index_type: Some("BTREE".into()),
+            }],
+            foreign_keys: vec![],
+            ddl: String::new(),
+        };
+        assert_eq!(table_keyset_columns(&detail), Some(vec!["id".to_string()]));
+        let cursor = KeysetCursor {
+            columns: vec!["id".into()],
+            last_values: vec![CellValue::Unsigned("100".into())],
+        };
+        let sql = table_page_sql(
+            "demo",
+            "items",
+            &detail,
+            500,
+            1_000,
+            Some(&cursor),
+            DatabaseKind::MySql,
+            true,
+        )
+        .unwrap();
+        assert!(sql.contains("WHERE `id` > '100'"));
+        assert!(sql.ends_with("LIMIT 501"));
+        assert!(!sql.contains("OFFSET"));
+    }
+
+    #[test]
+    fn table_page_sql_falls_back_to_offset_for_keyless_tables() {
+        let detail = cockpit_core::TableDetail {
+            table: cockpit_core::TableInfo {
+                database: "demo".into(),
+                name: "logs".into(),
+                table_type: "BASE TABLE".into(),
+                comment: None,
+                estimated_rows: None,
+                total_bytes: None,
+            },
+            columns: vec![cockpit_core::ColumnInfo {
+                name: "message".into(),
+                ordinal: 1,
+                data_type: "text".into(),
+                full_type: "text".into(),
+                nullable: true,
+                default_value: None,
+                extra: None,
+                comment: None,
+                key: None,
+                generation_expression: None,
+                collation: None,
+            }],
+            indexes: vec![],
+            foreign_keys: vec![],
+            ddl: String::new(),
+        };
+        assert_eq!(table_keyset_columns(&detail), None);
+        let sql = table_page_sql(
+            "demo",
+            "logs",
+            &detail,
+            500,
+            1_000,
+            None,
+            DatabaseKind::PostgreSql,
+            true,
+        )
+        .unwrap();
+        assert!(sql.starts_with("SELECT * FROM \"demo\".\"logs\" LIMIT 501 OFFSET 1000"));
+    }
+
+    #[test]
+    fn paged_select_sql_seeks_with_keyset_and_orders_by_ordinals() {
+        let cursor = KeysetCursor {
+            columns: vec!["id".into(), "name".into()],
+            last_values: vec![
+                CellValue::Unsigned("7".into()),
+                CellValue::Text("ada".into()),
+            ],
+        };
+        let sql = paged_select_sql(
+            "SELECT id, name FROM users ORDER BY id;",
+            2_000,
+            0,
+            Some(&cursor),
+            DatabaseKind::MySql,
+            2,
+        );
+        assert!(sql.starts_with(
+            "SELECT * FROM (SELECT id, name FROM users ORDER BY id) AS `__cockpit_page`"
+        ));
+        assert!(sql.contains("WHERE `id` > '7' OR `id` = '7' AND `name` > 'ada'"));
+        assert!(sql.ends_with("ORDER BY 1, 2 LIMIT 2001"));
+        assert!(!sql.contains("OFFSET"));
+    }
+
+    #[test]
+    fn paged_select_sql_orders_first_and_fallback_pages_by_ordinals() {
+        // Without a cursor the first page is still ordered by the output
+        // columns (ordinals), so later keyset pages stay consistent; the
+        // unordered LIMIT/OFFSET form is only used when ordering is known
+        // to be impossible.
+        let sql = paged_select_sql(
+            "SELECT id, name FROM users",
+            2_000,
+            4_000,
+            None,
+            DatabaseKind::PostgreSql,
+            2,
+        );
+        assert!(sql.contains("ORDER BY 1, 2 LIMIT 2001 OFFSET 4000"));
+        let unordered = paged_select_sql(
+            "SELECT id FROM users",
+            2_000,
+            4_000,
+            None,
+            DatabaseKind::PostgreSql,
+            0,
+        );
+        assert!(unordered.ends_with("LIMIT 2001 OFFSET 4000"));
+        assert!(!unordered.contains("ORDER BY"));
     }
 
     #[test]
@@ -3789,12 +4871,12 @@ mod tests {
             &tokio_util::sync::CancellationToken::new(),
         )
         .unwrap();
-        let bytes = std::fs::read(&encrypted).unwrap();
         assert_eq!(
-            String::from_utf8(decrypt_backup_bytes(&bytes, "correct-password").unwrap()).unwrap(),
+            String::from_utf8(decrypt_backup_file(&encrypted, "correct-password").unwrap())
+                .unwrap(),
             "SELECT '中文';"
         );
-        assert!(decrypt_backup_bytes(&bytes, "wrong-password").is_err());
+        assert!(decrypt_backup_file(&encrypted, "wrong-password").is_err());
         assert_eq!(
             read_backup_text(&encrypted, Some("correct-password")).unwrap(),
             "SELECT '中文';"

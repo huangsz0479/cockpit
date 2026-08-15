@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     process::Stdio,
     sync::Arc,
@@ -38,6 +38,7 @@ pub struct MySqlSession {
     pool: Pool,
     control_opts: Opts,
     running: RwLock<HashMap<Uuid, u32>>,
+    killed_executions: RwLock<HashSet<Uuid>>,
     transaction: Mutex<Option<Conn>>,
     read_transaction_time_zone: Mutex<Option<String>>,
     ssh_tunnel: Option<Arc<SshTunnel>>,
@@ -103,6 +104,7 @@ async fn open_session(profile: ConnectionProfile, password: String) -> Result<Ar
         pool,
         control_opts: opts,
         running: RwLock::new(HashMap::new()),
+        killed_executions: RwLock::new(HashSet::new()),
         transaction: Mutex::new(None),
         read_transaction_time_zone: Mutex::new(None),
         ssh_tunnel: ssh_tunnel.clone(),
@@ -122,6 +124,7 @@ async fn open_session(profile: ConnectionProfile, password: String) -> Result<Ar
                 pool,
                 control_opts: opts,
                 running: RwLock::new(HashMap::new()),
+                killed_executions: RwLock::new(HashSet::new()),
                 transaction: Mutex::new(None),
                 read_transaction_time_zone: Mutex::new(None),
                 ssh_tunnel,
@@ -941,15 +944,26 @@ impl DriverSession for MySqlSession {
             Err(_) => {
                 let cleanup_timeout = Duration::from_secs(self.profile.connect_timeout_secs.max(1));
                 let _ = tokio::time::timeout(cleanup_timeout, self.cancel(execution_id)).await;
+                // Mark this execution as killed before polling the future
+                // again: `execute_inner` then disconnects the pooled
+                // connection explicitly instead of letting it return to the
+                // pool with a possibly unfinished result set.
+                self.killed_executions.write().await.insert(execution_id);
                 let drained = tokio::time::timeout(cleanup_timeout, &mut future)
                     .await
                     .is_ok();
                 drop(future);
                 self.running.write().await.remove(&execution_id);
+                self.killed_executions.write().await.remove(&execution_id);
                 if !drained && let Some(conn) = self.transaction.lock().await.take() {
                     self.read_transaction_time_zone.lock().await.take();
                     let _ = conn.disconnect().await;
                 }
+                // When the future did not drain, the pooled connection was
+                // dropped mid-result; mysql_async's pool recycles such
+                // connections asynchronously (drops the pending result and
+                // discards them on fatal errors), so they never reach a
+                // later query in a dirty state.
                 Err(CockpitError::Timeout)
             }
         }
@@ -1175,6 +1189,25 @@ impl MySqlSession {
     }
 
     async fn metadata_connection(&self) -> Result<Conn> {
+        // Reuse an idle pooled connection for metadata reads instead of
+        // opening a dedicated TCP+TLS connection on every call. Metadata
+        // queries only read information_schema / SHOW with fully qualified
+        // names and never mutate session state, so sharing the pool is safe.
+        //
+        // A single-connection pool (dedicated tab sessions force pool_size 1)
+        // must not be drained for metadata: the data query or an open
+        // transaction holds the only connection and would deadlock waiting
+        // for it. Those sessions keep using a dedicated control connection.
+        if self.profile.pool_size > 1 {
+            // If every pooled connection is checked out (query or
+            // transaction), wait briefly for an idle one, then fall back to a
+            // dedicated connection instead of blocking the metadata read.
+            match tokio::time::timeout(Duration::from_secs(5), self.pool.get_conn()).await {
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(error)) => return Err(connection_error(error)),
+                Err(_) => {}
+            }
+        }
         Conn::new(self.control_opts.clone())
             .await
             .map_err(connection_error)
@@ -1187,7 +1220,15 @@ impl MySqlSession {
         }
         drop(transaction);
         let mut conn = self.connection().await?;
-        self.execute_with_connection(&mut conn, request).await
+        let execution_id = request.execution_id;
+        let result = self.execute_with_connection(&mut conn, request).await;
+        if self.killed_executions.read().await.contains(&execution_id) {
+            // This query was cancelled by a timeout kill; the connection may
+            // still hold an unfinished result set. Disconnect it explicitly
+            // so it never returns to the pool in a dirty state.
+            let _ = conn.disconnect().await;
+        }
+        result
     }
 
     async fn execute_with_connection(

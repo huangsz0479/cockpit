@@ -5,12 +5,23 @@ const props = defineProps<{ x: number; y: number }>();
 const emit = defineEmits<{ close: [] }>();
 const menu = ref<HTMLElement | null>(null);
 const position = ref({ left: props.x, top: props.y });
+let triggerElement: HTMLElement | null = null;
 
 function closeOnEscape(event: KeyboardEvent) {
   if (event.key === "Escape") emit("close");
 }
 
+function restoreTriggerFocus() {
+  const active = document.activeElement;
+  const focusStillInMenu = menu.value?.contains(active)
+    || !active
+    || active === document.body;
+  if (!focusStillInMenu) return;
+  if (triggerElement?.isConnected) triggerElement.focus({ preventScroll: true });
+}
+
 function close() {
+  restoreTriggerFocus();
   emit("close");
 }
 
@@ -39,6 +50,7 @@ function handleMenuKeydown(event: KeyboardEvent) {
 }
 
 onMounted(async () => {
+  triggerElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   window.addEventListener("keydown", closeOnEscape);
   window.addEventListener("resize", close);
   window.addEventListener("blur", close);
@@ -59,6 +71,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("resize", close);
   window.removeEventListener("blur", close);
   window.removeEventListener("scroll", close, true);
+  restoreTriggerFocus();
 });
 </script>
 

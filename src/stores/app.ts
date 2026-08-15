@@ -38,7 +38,6 @@ export const useAppStore = defineStore("app", () => {
   const triggers = ref<TriggerInfo[]>([]);
   const events = ref<EventInfo[]>([]);
   const transactionSessions = ref<Record<UUID, boolean>>({});
-  const result = ref<QueryResultPage | null>(null);
   const executingId = ref<UUID | null>(null);
   const executingConnectionId = ref<UUID | null>(null);
   const executingSessionId = ref<UUID | null>(null);
@@ -180,12 +179,6 @@ export const useAppStore = defineStore("app", () => {
     }
   }
 
-  async function selectTable(table: TableInfo) {
-    if (!activeConnectionId.value) return;
-    selectedTable.value = table;
-    tableDetail.value = (await run(() => api.tableDetail(activeConnectionId.value!, table.database, table.name))) ?? null;
-  }
-
   function highlightTable(table: TableInfo) {
     selectedTable.value = table;
     if (tableDetail.value?.table.database !== table.database || tableDetail.value.table.name !== table.name) {
@@ -238,7 +231,6 @@ export const useAppStore = defineStore("app", () => {
       const page = keepResultRowsRaw(await api.execute(connectionId, sessionId, {
         executionId, sql, database, allowWrite, rowOffset, pageSize,
       }));
-      result.value = page;
       return page;
     } catch (cause) { error.value = messageOf(cause); }
     finally {
@@ -303,15 +295,14 @@ export const useAppStore = defineStore("app", () => {
     routines.value = [];
     triggers.value = [];
     events.value = [];
-    result.value = null;
   }
 
   return {
     connections, connectionInfo, activeConnectionId, activeConnection, connected, databases, selectedDatabase,
     tables, tableHasMore, selectedTable, tableDetail, routines, triggers, events,
-    transactionSessions, result, executingId, executingConnectionId, executingSessionId, busy, error,
+    transactionSessions, executingId, executingConnectionId, executingSessionId, busy, error,
     loadConnections, saveConnection, removeConnection, connect, disconnect, loadDatabases, selectDatabase, closeDatabase, loadTables,
-    loadDatabaseObjects, highlightTable, selectTable, openTabSession, closeTabSession, execute, cancel,
+    loadDatabaseObjects, highlightTable, openTabSession, closeTabSession, execute, cancel,
     mutateRow, beginTransaction, commitTransaction, rollbackTransaction,
   };
 });

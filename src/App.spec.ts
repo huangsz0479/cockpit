@@ -432,11 +432,10 @@ describe("App connection actions", () => {
     host.querySelector<HTMLButtonElement>(".object-group-title")!.click();
     await nextTick();
     const objectNode = host.querySelector<HTMLButtonElement>(".object-node")!;
-    const selectTable = vi.spyOn(store, "selectTable");
     objectNode.click();
     await nextTick();
     expect(store.selectedTable?.name).toBe("users");
-    expect(selectTable).not.toHaveBeenCalled();
+    expect(store.tableDetail).toBeNull();
     store.tableDetail = {
       table,
       columns: [
@@ -1123,6 +1122,311 @@ describe("App connection actions", () => {
 
     assess.mockRestore();
     tableDetail.mockRestore();
+    app.unmount();
+  });
+
+  it("disables query result paging and re-execution while an inline row editor is open", async () => {
+    const { app, host, store } = mountApp();
+    const connection = profile();
+    const page: QueryResultPage = {
+      executionId: crypto.randomUUID(),
+      columns: [
+        { name: "id", databaseType: "BIGINT", nullable: false, unsigned: true, binary: false },
+        { name: "entry_date", databaseType: "DATE", nullable: false, unsigned: false, binary: false },
+      ],
+      rows: [
+        [{ kind: "unsigned", value: "1" }, { kind: "date", value: "2026-08-01" }],
+        [{ kind: "unsigned", value: "2" }, { kind: "date", value: "2026-08-02" }],
+      ],
+      affectedRows: 0,
+      executionTimeMs: 4,
+      truncated: false,
+      hasMore: true,
+      resultSetIndex: 0,
+      messages: [],
+    };
+    store.connections.push(connection);
+    store.activeConnectionId = connection.id;
+    store.connectionInfo[connection.id] = { serverVersion: "8.0", connectionId: 1, currentDatabase: "demo" };
+    store.databases = [{ name: "demo" }];
+    store.selectedDatabase = "demo";
+    vi.mocked(openDialog).mockResolvedValueOnce("/tmp/users.sql");
+    vi.spyOn(api, "readTextFile").mockResolvedValue({ path: "/tmp/users.sql", contents: "SELECT * FROM users" });
+    const assess = vi.spyOn(api, "assess").mockResolvedValue({
+      statementKind: "SELECT", risk: "safe", requiresConfirmation: false,
+    });
+    vi.spyOn(api, "tableDetail").mockResolvedValue({
+      table: { database: "demo", name: "users", tableType: "BASE TABLE" },
+      columns: [
+        { name: "id", ordinal: 1, dataType: "bigint", fullType: "bigint unsigned", nullable: false, defaultValue: null, extra: "auto_increment", key: "PRI" },
+        { name: "entry_date", ordinal: 2, dataType: "date", fullType: "date", nullable: false, defaultValue: null, extra: "", key: "" },
+      ],
+      indexes: [{ name: "PRIMARY", columns: ["id"], unique: true, primary: true }],
+      foreignKeys: [],
+      ddl: "CREATE TABLE users (id BIGINT UNSIGNED PRIMARY KEY, entry_date DATE NOT NULL)",
+    });
+    const execute = vi.spyOn(store, "execute").mockResolvedValue(page);
+    const mutateRow = vi.spyOn(store, "mutateRow").mockResolvedValue({ affectedRows: 1, concurrentChange: false });
+    await nextTick();
+
+    host.querySelector<HTMLButtonElement>('.window-primary-actions .window-tool[aria-label="打开 SQL"]')!.click();
+    await vi.waitFor(() => expect(host.querySelector("[data-testid='sql-editor']")).not.toBeNull());
+    host.querySelector<HTMLButtonElement>(".execute-button")!.click();
+    await vi.waitFor(() => expect(host.querySelector(".result-card.editable-query-result")).not.toBeNull());
+
+    const nextPageButton = () => host.querySelector<HTMLButtonElement>(".result-pagination button[aria-label='下一页']")!;
+    const executeButton = () => host.querySelector<HTMLButtonElement>(".execute-button")!;
+    expect(nextPageButton().disabled).toBe(false);
+
+    host.querySelector<HTMLElement>('.result-card.editable-query-result tbody td[data-grid-row="0"][data-grid-column="0"]')!.click();
+    await nextTick();
+    expect(host.querySelector('.result-card .inline-cell-input[data-column="id"]')).not.toBeNull();
+
+    expect(executeButton().disabled).toBe(true);
+    expect(nextPageButton().disabled).toBe(true);
+
+    nextPageButton().click();
+    executeButton().click();
+    await nextTick();
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(mutateRow).not.toHaveBeenCalled();
+    expect(host.querySelector('.result-card .inline-cell-input[data-column="id"]')).not.toBeNull();
+
+    host.querySelector<HTMLInputElement>(".result-card .inline-cell-input")!
+      .dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await nextTick();
+    expect(host.querySelector(".result-card .inline-cell-input")).toBeNull();
+    expect(nextPageButton().disabled).toBe(false);
+
+    assess.mockRestore();
+    app.unmount();
+  });
+
+  it("finishes an inline row edit before paging the query result and saves against the original row", async () => {
+    const { app, host, store } = mountApp();
+    const connection = profile();
+    const page: QueryResultPage = {
+      executionId: crypto.randomUUID(),
+      columns: [
+        { name: "id", databaseType: "BIGINT", nullable: false, unsigned: true, binary: false },
+        { name: "entry_date", databaseType: "DATE", nullable: false, unsigned: false, binary: false },
+      ],
+      rows: [
+        [{ kind: "unsigned", value: "1" }, { kind: "date", value: "2026-08-01" }],
+        [{ kind: "unsigned", value: "2" }, { kind: "date", value: "2026-08-02" }],
+      ],
+      affectedRows: 0,
+      executionTimeMs: 4,
+      truncated: false,
+      hasMore: true,
+      resultSetIndex: 0,
+      messages: [],
+    };
+    const nextPage: QueryResultPage = {
+      ...page,
+      executionId: crypto.randomUUID(),
+      rows: [[{ kind: "unsigned", value: "101" }, { kind: "date", value: "2026-09-01" }]],
+      hasMore: false,
+    };
+    store.connections.push(connection);
+    store.activeConnectionId = connection.id;
+    store.connectionInfo[connection.id] = { serverVersion: "8.0", connectionId: 1, currentDatabase: "demo" };
+    store.databases = [{ name: "demo" }];
+    store.selectedDatabase = "demo";
+    vi.mocked(openDialog).mockResolvedValueOnce("/tmp/users.sql");
+    vi.spyOn(api, "readTextFile").mockResolvedValue({ path: "/tmp/users.sql", contents: "SELECT * FROM users" });
+    const assess = vi.spyOn(api, "assess").mockResolvedValue({
+      statementKind: "SELECT", risk: "safe", requiresConfirmation: false,
+    });
+    vi.spyOn(api, "tableDetail").mockResolvedValue({
+      table: { database: "demo", name: "users", tableType: "BASE TABLE" },
+      columns: [
+        { name: "id", ordinal: 1, dataType: "bigint", fullType: "bigint unsigned", nullable: false, defaultValue: null, extra: "auto_increment", key: "PRI" },
+        { name: "entry_date", ordinal: 2, dataType: "date", fullType: "date", nullable: false, defaultValue: null, extra: "", key: "" },
+      ],
+      indexes: [{ name: "PRIMARY", columns: ["id"], unique: true, primary: true }],
+      foreignKeys: [],
+      ddl: "CREATE TABLE users (id BIGINT UNSIGNED PRIMARY KEY, entry_date DATE NOT NULL)",
+    });
+    const execute = vi.spyOn(store, "execute").mockResolvedValue(page);
+    const mutateRow = vi.spyOn(store, "mutateRow").mockResolvedValue({ affectedRows: 1, concurrentChange: false });
+    await nextTick();
+
+    host.querySelector<HTMLButtonElement>('.window-primary-actions .window-tool[aria-label="打开 SQL"]')!.click();
+    await vi.waitFor(() => expect(host.querySelector("[data-testid='sql-editor']")).not.toBeNull());
+    host.querySelector<HTMLButtonElement>(".execute-button")!.click();
+    await vi.waitFor(() => expect(host.querySelector(".result-card.editable-query-result")).not.toBeNull());
+    const sessionId = execute.mock.calls[0]![0]!;
+
+    host.querySelector<HTMLElement>('.result-card.editable-query-result tbody td[data-grid-row="1"][data-grid-column="1"]')!.click();
+    await nextTick();
+    const dateInput = host.querySelector<HTMLInputElement>('.result-card .inline-cell-input[data-column="entry_date"]')!;
+    dateInput.value = "2026-08-05";
+    dateInput.dispatchEvent(new Event("input", { bubbles: true }));
+
+    execute.mockResolvedValueOnce(page).mockResolvedValueOnce(nextPage);
+    dateInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }));
+
+    await vi.waitFor(() => expect(mutateRow).toHaveBeenCalledTimes(1));
+    expect(mutateRow).toHaveBeenCalledWith(sessionId, {
+      database: "demo",
+      table: "users",
+      kind: "update",
+      values: [["entry_date", { kind: "date", value: "2026-08-05" }]],
+      keyValues: [["id", { kind: "unsigned", value: "2" }]],
+      originalValues: [
+        ["id", { kind: "unsigned", value: "2" }],
+        ["entry_date", { kind: "date", value: "2026-08-02" }],
+      ],
+    });
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledWith(sessionId, "SELECT * FROM users\nLIMIT 501 OFFSET 500;", false, 0, 500));
+    await vi.waitFor(() => expect(host.querySelector<HTMLInputElement>('.result-card .inline-cell-input[data-column="id"]')?.value).toBe("101"));
+
+    assess.mockRestore();
+    app.unmount();
+  });
+
+  it("keeps result-set tabs from switching while an inline row editor is open", async () => {
+    const { app, host, store } = mountApp();
+    const connection = profile();
+    const sql = "SELECT id FROM users;\nSELECT * FROM audit_log WHERE active = 1;";
+    const page: QueryResultPage = {
+      executionId: crypto.randomUUID(),
+      columns: [{ name: "id", databaseType: "BIGINT", nullable: false, unsigned: true, binary: false }],
+      rows: [[{ kind: "unsigned", value: "1" }]],
+      affectedRows: 0,
+      executionTimeMs: 4,
+      truncated: false,
+      hasMore: false,
+      resultSetIndex: 0,
+      messages: [],
+      additionalResultSets: [{
+        columns: [
+          { name: "id", databaseType: "BIGINT", nullable: false, unsigned: true, binary: false },
+          { name: "active", databaseType: "TINYINT", nullable: false, unsigned: false, binary: false },
+        ],
+        rows: [[{ kind: "unsigned", value: "8" }, { kind: "signed", value: "1" }]],
+        affectedRows: 0,
+        truncated: false,
+        hasMore: false,
+        resultSetIndex: 1,
+        rowOffset: 0,
+        pageSize: 500,
+      }],
+    };
+    store.connections.push(connection);
+    store.activeConnectionId = connection.id;
+    store.connectionInfo[connection.id] = { serverVersion: "8.0", connectionId: 1, currentDatabase: "demo" };
+    store.databases = [{ name: "demo" }];
+    store.selectedDatabase = "demo";
+    vi.mocked(openDialog).mockResolvedValueOnce("/tmp/multi-result.sql");
+    vi.spyOn(api, "readTextFile").mockResolvedValue({ path: "/tmp/multi-result.sql", contents: sql });
+    const assess = vi.spyOn(api, "assess").mockResolvedValue({
+      statementKind: "MULTI_STATEMENT", risk: "safe", requiresConfirmation: false,
+    });
+    vi.spyOn(api, "tableDetail").mockResolvedValue({
+      table: { database: "demo", name: "audit_log", tableType: "BASE TABLE" },
+      columns: [
+        { name: "id", ordinal: 1, dataType: "bigint", fullType: "bigint unsigned", nullable: false, defaultValue: null, extra: "auto_increment", key: "PRI" },
+        { name: "active", ordinal: 2, dataType: "tinyint", fullType: "tinyint", nullable: false, defaultValue: null, extra: "", key: "" },
+      ],
+      indexes: [{ name: "PRIMARY", columns: ["id"], unique: true, primary: true }],
+      foreignKeys: [],
+      ddl: "CREATE TABLE audit_log (id BIGINT PRIMARY KEY, active TINYINT NOT NULL)",
+    });
+    const execute = vi.spyOn(store, "execute").mockResolvedValue(page);
+    const mutateRow = vi.spyOn(store, "mutateRow").mockResolvedValue({ affectedRows: 1, concurrentChange: false });
+    await nextTick();
+
+    host.querySelector<HTMLButtonElement>('.window-primary-actions .window-tool[aria-label="打开 SQL"]')!.click();
+    await vi.waitFor(() => expect(host.querySelector("[data-testid='sql-editor']")).not.toBeNull());
+    host.querySelector<HTMLButtonElement>(".execute-button")!.click();
+    await vi.waitFor(() => expect(host.querySelectorAll(".result-set-tabs button")).toHaveLength(2));
+    host.querySelectorAll<HTMLButtonElement>(".result-set-tabs button")[1]!.click();
+    await vi.waitFor(() => expect(host.querySelector(".result-card.editable-query-result")).not.toBeNull());
+
+    host.querySelector<HTMLElement>('.editable-query-result tbody td[data-grid-row="0"][data-grid-column="1"]')!.click();
+    await nextTick();
+    expect(host.querySelector('.editable-query-result .inline-cell-input[data-column="active"]')).not.toBeNull();
+
+    const resultSetTabs = Array.from(host.querySelectorAll<HTMLButtonElement>(".result-set-tabs button"));
+    expect(resultSetTabs.every((button) => button.disabled)).toBe(true);
+
+    resultSetTabs[0]!.click();
+    await nextTick();
+    expect(host.querySelectorAll<HTMLButtonElement>(".result-set-tabs button")[1]!.getAttribute("aria-selected")).toBe("true");
+    expect(host.querySelector(".result-card.editable-query-result")).not.toBeNull();
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(mutateRow).not.toHaveBeenCalled();
+
+    assess.mockRestore();
+    app.unmount();
+  });
+
+  it("debounces the in-page result filter while typing", async () => {
+    const { app, host, store } = mountApp();
+    const connection = profile();
+    const page: QueryResultPage = {
+      executionId: crypto.randomUUID(),
+      columns: [
+        { name: "id", databaseType: "BIGINT", nullable: false, unsigned: true, binary: false },
+        { name: "entry_date", databaseType: "DATE", nullable: false, unsigned: false, binary: false },
+      ],
+      rows: [
+        [{ kind: "unsigned", value: "1" }, { kind: "date", value: "2026-08-01" }],
+        [{ kind: "unsigned", value: "2" }, { kind: "date", value: "2026-08-02" }],
+      ],
+      affectedRows: 0,
+      executionTimeMs: 4,
+      truncated: false,
+      hasMore: false,
+      resultSetIndex: 0,
+      messages: [],
+    };
+    store.connections.push(connection);
+    store.activeConnectionId = connection.id;
+    store.connectionInfo[connection.id] = { serverVersion: "8.0", connectionId: 1, currentDatabase: "demo" };
+    store.databases = [{ name: "demo" }];
+    store.selectedDatabase = "demo";
+    vi.mocked(openDialog).mockResolvedValueOnce("/tmp/users.sql");
+    vi.spyOn(api, "readTextFile").mockResolvedValue({ path: "/tmp/users.sql", contents: "SELECT * FROM users" });
+    const assess = vi.spyOn(api, "assess").mockResolvedValue({
+      statementKind: "SELECT", risk: "safe", requiresConfirmation: false,
+    });
+    vi.spyOn(api, "tableDetail").mockResolvedValue({
+      table: { database: "demo", name: "users", tableType: "BASE TABLE" },
+      columns: [
+        { name: "id", ordinal: 1, dataType: "bigint", fullType: "bigint unsigned", nullable: false, defaultValue: null, extra: "auto_increment", key: "PRI" },
+        { name: "entry_date", ordinal: 2, dataType: "date", fullType: "date", nullable: false, defaultValue: null, extra: "", key: "" },
+      ],
+      indexes: [{ name: "PRIMARY", columns: ["id"], unique: true, primary: true }],
+      foreignKeys: [],
+      ddl: "CREATE TABLE users (id BIGINT UNSIGNED PRIMARY KEY, entry_date DATE NOT NULL)",
+    });
+    vi.spyOn(store, "execute").mockResolvedValue(page);
+    await nextTick();
+
+    host.querySelector<HTMLButtonElement>('.window-primary-actions .window-tool[aria-label="打开 SQL"]')!.click();
+    await vi.waitFor(() => expect(host.querySelector("[data-testid='sql-editor']")).not.toBeNull());
+    host.querySelector<HTMLButtonElement>(".execute-button")!.click();
+    await vi.waitFor(() => expect(host.querySelector(".result-card.editable-query-result")).not.toBeNull());
+
+    const visibleRowCount = () => host.querySelectorAll(".editable-query-result tbody tr.data-row").length;
+    expect(visibleRowCount()).toBe(2);
+
+    const search = host.querySelector<HTMLInputElement>(".result-search")!;
+    search.value = "2026-08-02";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    expect(visibleRowCount()).toBe(2);
+
+    await new Promise((resolve) => setTimeout(resolve, 260));
+    await nextTick();
+    expect(visibleRowCount()).toBe(1);
+    expect(host.querySelector(".editable-query-result .data-grid")?.textContent).toContain("2026-08-02");
+    expect(host.querySelector(".editable-query-result .data-grid")?.textContent).not.toContain("2026-08-01");
+
+    assess.mockRestore();
     app.unmount();
   });
 

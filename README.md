@@ -332,6 +332,15 @@ Scheduled backups require Cockpit to remain open and the target connection to st
 - CSV and Excel imports retain parsed data in memory until submission. Split very large files into smaller batches.
 - Some metadata or management features may be unavailable depending on the database version and account permissions.
 
+## 16. Building and Releasing
+
+For developers:
+
+- Local builds: `npm run build` (frontend), `cargo build` (Rust workspace), `npm run tauri build` (full desktop installers).
+- Release: bump the version in `package.json`, `src-tauri/tauri.conf.json`, and the root `Cargo.toml` (`[workspace.package] version`) to the same value, then push a `vX.Y.Z` tag. `.github/workflows/release.yml` builds installers for macOS / Windows / Linux and publishes them to GitHub Releases, verifying the tag matches `tauri.conf.json`. macOS signing/notarization depends on repository secrets; without them, an unsigned bundle is produced.
+- Preview installers: run the **Desktop installers** workflow (`.github/workflows/windows-package.yml`) manually from the Actions page.
+- Updates: Cockpit checks GitHub Releases for stable versions on startup and only shows a notification; there is no automatic download or installation.
+
 ## License
 
 Cockpit is released under the [Apache License 2.0](LICENSE).

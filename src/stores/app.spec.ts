@@ -71,11 +71,11 @@ describe("app store query execution", () => {
     };
     vi.mocked(api.execute).mockResolvedValue(page);
 
-    await store.execute(crypto.randomUUID(), "SELECT 1; SELECT 2");
+    const returned = await store.execute(crypto.randomUUID(), "SELECT 1; SELECT 2");
 
-    expect(isReactive(store.result)).toBe(true);
-    expect(isReactive(store.result!.rows)).toBe(false);
-    expect(isReactive(store.result!.additionalResultSets![0]!.rows)).toBe(false);
+    expect(returned).not.toBeUndefined();
+    expect(isReactive(returned!.rows)).toBe(false);
+    expect(isReactive(returned!.additionalResultSets![0]!.rows)).toBe(false);
   });
 
   it("clears the previous connection tree before loading the next connection", async () => {

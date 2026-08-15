@@ -223,11 +223,6 @@ export function singleTableSelectAllTargets(sql: string, defaultDatabase?: strin
   return statements?.map((statement) => singleTableSelectAllStatementTarget(statement, defaultDatabase)) ?? [];
 }
 
-export function singleTableSelectAllTarget(sql: string, defaultDatabase?: string | null): SingleTableSelectTarget | null {
-  const targets = singleTableSelectAllTargets(sql, defaultDatabase);
-  return targets.length === 1 ? targets[0] ?? null : null;
-}
-
 export const MYSQL_COLUMN_TYPES = [
   "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE", "REAL", "BIT",
   "VARCHAR", "CHAR", "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT", "BINARY", "VARBINARY",

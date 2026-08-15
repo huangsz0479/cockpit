@@ -52,8 +52,21 @@ impl SecretStore {
             .session_values
             .write()
             .map_err(|_| CockpitError::SecretStore("会话凭据锁已损坏".into()))?;
-        values.insert(account, value.to_string());
-        Ok(persist_vault(&self.vault_file, &self.device_key, &values).is_ok())
+        let previous = values.insert(account.clone(), value.to_string());
+        if let Err(error) = persist_vault(&self.vault_file, &self.device_key, &values) {
+            // Roll back the in-memory change so the store never claims a
+            // password exists that was not persisted to disk.
+            match previous {
+                Some(previous) => {
+                    values.insert(account, previous);
+                }
+                None => {
+                    values.remove(&account);
+                }
+            }
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub fn get(&self, connection_id: Uuid, key: &str) -> Result<Option<String>> {
@@ -75,7 +88,11 @@ impl SecretStore {
             for key in ["mysql_password", "ssh_password", "ssh_key_passphrase"] {
                 values.remove(&Self::account(connection_id, key));
             }
-            let _ = persist_vault(&self.vault_file, &self.device_key, &values);
+            if let Err(error) = persist_vault(&self.vault_file, &self.device_key, &values) {
+                log::warn!(
+                    "failed to persist credential vault after deleting connection {connection_id}: {error}"
+                );
+            }
         }
     }
 }

@@ -15,10 +15,11 @@ use cockpit_core::{
     ServerProcessInfo, ServerVariable, TableDetail, TableInfo, TlsMode, TriggerInfo, UserAccount,
     safety::assess_sql,
 };
+use futures::StreamExt;
 use native_tls::{Certificate, Identity, TlsConnector};
 use postgres_native_tls::MakeTlsConnector;
 use tokio::sync::{Mutex, RwLock};
-use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
+use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryStream};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -29,6 +30,8 @@ pub struct PostgresSession {
     client: Mutex<Option<Client>>,
     cancel_token: tokio_postgres::CancelToken,
     transaction_active: RwLock<bool>,
+    /// 最后一次通过 SET search_path 应用的 schema，避免每条查询都重复设置会话状态。
+    search_path: Mutex<Option<String>>,
 }
 
 fn connection_error(error: impl std::fmt::Display) -> CockpitError {
@@ -37,6 +40,14 @@ fn connection_error(error: impl std::fmt::Display) -> CockpitError {
 
 fn query_error(error: impl std::fmt::Display) -> CockpitError {
     CockpitError::Query(error.to_string())
+}
+
+/// 只读连接拒绝一切写路径入口（与 MySQL 驱动的错误消息保持一致）。
+fn ensure_writable(read_only: bool) -> Result<()> {
+    if read_only {
+        return Err(CockpitError::Query("该连接处于只读模式".into()));
+    }
+    Ok(())
 }
 
 fn quote_identifier(value: &str) -> String {
@@ -210,6 +221,7 @@ impl DatabaseDriver for PostgresDriver {
             client: Mutex::new(Some(client)),
             cancel_token,
             transaction_active: RwLock::new(false),
+            search_path: Mutex::new(None),
         }))
     }
 }
@@ -221,6 +233,38 @@ impl PostgresSession {
             .as_ref()
             .ok_or_else(|| CockpitError::Connection("连接已经关闭".into()))?;
         action(client).await
+    }
+
+    async fn execute_inner(&self, request: ExecuteQueryRequest) -> Result<QueryResultPage> {
+        let started = Instant::now();
+        let guard = self.client.lock().await;
+        let client = guard
+            .as_ref()
+            .ok_or_else(|| CockpitError::Connection("连接已经关闭".into()))?;
+        if let Some(schema) = request
+            .database
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            // 每个 schema 只在会话中设置一次 search_path，避免每条查询前都产生会话副作用；
+            // 事务回滚会还原 search_path，因此回滚时清空缓存（见 rollback_transaction）。
+            let mut search_path = self.search_path.lock().await;
+            if search_path.as_deref() != Some(schema) {
+                client
+                    .batch_execute(&format!(
+                        "SET search_path TO {}, public",
+                        quote_identifier(schema)
+                    ))
+                    .await
+                    .map_err(query_error)?;
+                *search_path = Some(schema.to_owned());
+            }
+        }
+        let stream = client
+            .simple_query_raw(&request.sql)
+            .await
+            .map_err(query_error)?;
+        simple_stream_to_page(&request, stream, started).await
     }
 }
 
@@ -477,38 +521,41 @@ impl DriverSession for PostgresSession {
                     .unwrap_or_else(|| "该语句需要确认后执行".into()),
             ));
         }
-        let started = Instant::now();
         let timeout = Duration::from_secs(
             request
                 .timeout_secs
                 .unwrap_or(self.profile.query_timeout_secs)
                 .max(1),
         );
-        let guard = self.client.lock().await;
-        let client = guard
-            .as_ref()
-            .ok_or_else(|| CockpitError::Connection("连接已经关闭".into()))?;
-        if let Some(schema) = request
-            .database
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            client
-                .batch_execute(&format!(
-                    "SET search_path TO {}, public",
-                    quote_identifier(schema)
-                ))
-                .await
-                .map_err(query_error)?;
+        let mut future = Box::pin(self.execute_inner(request));
+        match tokio::time::timeout(timeout, &mut future).await {
+            Ok(result) => result,
+            Err(_) => {
+                let cleanup_timeout = Duration::from_secs(self.profile.connect_timeout_secs.max(1));
+                // 1) 通知服务端取消仍在运行的查询，而不是只丢弃客户端 future：
+                //    否则服务端会继续执行（如长 SELECT / UPDATE），把会话卡住。
+                let _ =
+                    tokio::time::timeout(cleanup_timeout, self.cancel_token.cancel_query(NoTls))
+                        .await;
+                // 2) 等待连接把被取消查询的剩余响应排空（回到 ReadyForQuery），恢复可复用状态。
+                let drained = tokio::time::timeout(cleanup_timeout, &mut future)
+                    .await
+                    .is_ok();
+                drop(future);
+                if !drained {
+                    // 3) 取消后连接未能恢复：断开连接，避免后续查询复用一个坏会话。
+                    let mut guard = self.client.lock().await;
+                    let _ = guard.take();
+                    *self.transaction_active.write().await = false;
+                    self.search_path.lock().await.take();
+                }
+                Err(CockpitError::Timeout)
+            }
         }
-        let messages = tokio::time::timeout(timeout, client.simple_query(&request.sql))
-            .await
-            .map_err(|_| CockpitError::Timeout)?
-            .map_err(query_error)?;
-        Ok(simple_messages_to_page(request, messages, started))
     }
 
     async fn mutate_row(&self, request: RowMutationRequest) -> Result<RowMutationResult> {
+        ensure_writable(self.profile.read_only)?;
         let target = format!(
             "{}.{}",
             quote_identifier(&request.database),
@@ -588,6 +635,7 @@ impl DriverSession for PostgresSession {
         rows: &[Vec<CellValue>],
         policy: ImportConflictPolicy,
     ) -> Result<u64> {
+        ensure_writable(self.profile.read_only)?;
         if columns.is_empty() || rows.is_empty() {
             return Ok(0);
         }
@@ -639,8 +687,21 @@ impl DriverSession for PostgresSession {
     }
 
     async fn begin_transaction(&self) -> Result<()> {
+        ensure_writable(self.profile.read_only)?;
         self.with_client(async |client| client.batch_execute("BEGIN").await.map_err(query_error))
             .await?;
+        *self.transaction_active.write().await = true;
+        Ok(())
+    }
+
+    async fn begin_read_transaction(&self) -> Result<()> {
+        self.with_client(async |client| {
+            client
+                .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .await
+                .map_err(query_error)
+        })
+        .await?;
         *self.transaction_active.write().await = true;
         Ok(())
     }
@@ -658,6 +719,8 @@ impl DriverSession for PostgresSession {
         })
         .await?;
         *self.transaction_active.write().await = false;
+        // ROLLBACK 会还原事务内 SET search_path 的副作用，缓存可能已失效。
+        self.search_path.lock().await.take();
         Ok(())
     }
 
@@ -676,6 +739,7 @@ impl DriverSession for PostgresSession {
     async fn close(&self) -> Result<()> {
         self.client.lock().await.take();
         *self.transaction_active.write().await = false;
+        self.search_path.lock().await.take();
         Ok(())
     }
 }
@@ -808,41 +872,84 @@ fn mutation_conditions(request: &RowMutationRequest) -> Result<String> {
         .map(|values| values.join(" AND "))
 }
 
-fn simple_messages_to_page(
-    request: ExecuteQueryRequest,
-    messages: Vec<SimpleQueryMessage>,
+/// 流式消费结果行时只保留一页数据：跳过 `row_offset` 行、最多收集 `page_size` 行，
+/// 之后的任意一行都标记 `has_more`（仍需继续消费，让连接回到可复用状态）。
+struct PageCollector {
+    rows: Vec<Vec<CellValue>>,
+    skipped: usize,
+    has_more: bool,
+    row_offset: usize,
+    page_size: usize,
+}
+
+impl PageCollector {
+    fn new(row_offset: usize, page_size: usize) -> Self {
+        Self {
+            rows: Vec::with_capacity(page_size.min(1024)),
+            skipped: 0,
+            has_more: false,
+            row_offset,
+            page_size,
+        }
+    }
+
+    fn push(&mut self, row: Vec<CellValue>) {
+        if self.skipped < self.row_offset {
+            self.skipped += 1;
+        } else if self.rows.len() < self.page_size {
+            self.rows.push(row);
+        } else {
+            self.has_more = true;
+        }
+    }
+}
+
+/// 把 `simple_query_raw` 的流式消息转换为分页结果：边消费边丢弃跳过/超出页面的行，
+/// 避免把整个结果集物化到内存；每条语句（结果集）独立应用 row_offset/page_size 分页。
+async fn simple_stream_to_page(
+    request: &ExecuteQueryRequest,
+    stream: SimpleQueryStream,
     started: Instant,
-) -> QueryResultPage {
+) -> Result<QueryResultPage> {
+    let page_size = request.page_size.max(1);
+    let row_offset = request.row_offset;
     let mut sets: Vec<QueryResultSet> = Vec::new();
     let mut columns: Vec<ColumnMeta> = Vec::new();
-    let mut rows: Vec<Vec<CellValue>> = Vec::new();
-    let mut affected = 0;
+    let mut affected = 0u64;
+    let mut page = PageCollector::new(row_offset, page_size);
+    let mut result_set_index = 0usize;
     let push_set = |sets: &mut Vec<QueryResultSet>,
                     columns: &mut Vec<ColumnMeta>,
-                    rows: &mut Vec<Vec<CellValue>>,
-                    affected_rows: u64| {
-        if columns.is_empty() && rows.is_empty() {
-            return;
+                    page: &mut PageCollector,
+                    affected: &mut u64,
+                    result_set_index: &mut usize| {
+        if !(columns.is_empty() && page.rows.is_empty() && *affected == 0) {
+            sets.push(QueryResultSet {
+                columns: std::mem::take(columns),
+                rows: std::mem::take(&mut page.rows),
+                affected_rows: *affected,
+                truncated: page.has_more,
+                has_more: page.has_more,
+                result_set_index: *result_set_index,
+                row_offset,
+                page_size,
+            });
+            *result_set_index += 1;
         }
-        let start = request.row_offset.min(rows.len());
-        let end = (start + request.page_size.max(1)).min(rows.len());
-        sets.push(QueryResultSet {
-            columns: std::mem::take(columns),
-            rows: rows[start..end].to_vec(),
-            affected_rows,
-            truncated: end < rows.len(),
-            has_more: end < rows.len(),
-            result_set_index: sets.len(),
-            row_offset: request.row_offset,
-            page_size: request.page_size.max(1),
-        });
-        rows.clear();
+        *affected = 0;
+        *page = PageCollector::new(row_offset, page_size);
     };
-    for message in messages {
-        match message {
+    let mut stream = Box::pin(stream);
+    while let Some(message) = stream.next().await {
+        match message.map_err(query_error)? {
             SimpleQueryMessage::RowDescription(description) => {
-                push_set(&mut sets, &mut columns, &mut rows, affected);
-                affected = 0;
+                push_set(
+                    &mut sets,
+                    &mut columns,
+                    &mut page,
+                    &mut affected,
+                    &mut result_set_index,
+                );
                 columns = description
                     .iter()
                     .map(|column| ColumnMeta {
@@ -868,7 +975,7 @@ fn simple_messages_to_page(
                         })
                         .collect();
                 }
-                rows.push(
+                page.push(
                     (0..row.len())
                         .map(|index| {
                             row.get(index)
@@ -879,29 +986,45 @@ fn simple_messages_to_page(
                 );
             }
             SimpleQueryMessage::CommandComplete(count) => {
-                affected = affected.saturating_add(count);
-                push_set(&mut sets, &mut columns, &mut rows, affected);
-                affected = 0;
+                // 只有不带结果行的语句（纯 DML）时 count 才是受影响行数；
+                // 带结果行的语句（SELECT、INSERT ... RETURNING 等）count 是返回行数，
+                // 不应当作 affected_rows 上报（与 MySQL 驱动语义一致）。
+                if page.rows.is_empty() && columns.is_empty() {
+                    affected = count;
+                }
+                push_set(
+                    &mut sets,
+                    &mut columns,
+                    &mut page,
+                    &mut affected,
+                    &mut result_set_index,
+                );
             }
             _ => {}
         }
     }
-    push_set(&mut sets, &mut columns, &mut rows, affected);
+    push_set(
+        &mut sets,
+        &mut columns,
+        &mut page,
+        &mut affected,
+        &mut result_set_index,
+    );
     let first = if sets.is_empty() {
         QueryResultSet {
             columns: Vec::new(),
             rows: Vec::new(),
-            affected_rows: affected,
+            affected_rows: 0,
             truncated: false,
             has_more: false,
             result_set_index: 0,
-            row_offset: request.row_offset,
-            page_size: request.page_size.max(1),
+            row_offset,
+            page_size,
         }
     } else {
         sets.remove(0)
     };
-    QueryResultPage {
+    Ok(QueryResultPage {
         execution_id: request.execution_id,
         columns: first.columns,
         rows: first.rows,
@@ -914,7 +1037,7 @@ fn simple_messages_to_page(
         row_offset: first.row_offset,
         page_size: first.page_size,
         additional_result_sets: sets,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -942,5 +1065,50 @@ mod tests {
             ),
             vec!["id", "created at"]
         );
+    }
+
+    #[test]
+    fn read_only_connections_reject_writes() {
+        assert!(ensure_writable(false).is_ok());
+        assert!(matches!(
+            ensure_writable(true),
+            Err(CockpitError::Query(message)) if message.contains("只读模式")
+        ));
+    }
+
+    #[test]
+    fn page_collector_skips_offset_and_keeps_only_one_page() {
+        let mut page = PageCollector::new(2, 2);
+        for value in 0..5 {
+            page.push(vec![CellValue::Signed(value.to_string())]);
+        }
+        assert_eq!(
+            page.rows,
+            vec![
+                vec![CellValue::Signed("2".into())],
+                vec![CellValue::Signed("3".into())],
+            ]
+        );
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn page_collector_reports_no_more_when_result_is_exhausted() {
+        let mut page = PageCollector::new(1, 3);
+        for value in 0..4 {
+            page.push(vec![CellValue::Signed(value.to_string())]);
+        }
+        assert_eq!(page.rows.len(), 3);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn page_collector_returns_empty_page_when_offset_past_the_end() {
+        let mut page = PageCollector::new(10, 2);
+        for value in 0..3 {
+            page.push(vec![CellValue::Signed(value.to_string())]);
+        }
+        assert!(page.rows.is_empty());
+        assert!(!page.has_more);
     }
 }

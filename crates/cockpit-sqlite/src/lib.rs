@@ -1,4 +1,8 @@
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -11,7 +15,6 @@ use cockpit_core::{
     TriggerInfo, UserAccount, safety::assess_sql,
 };
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as SqliteValue};
-use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -19,9 +22,8 @@ pub struct SqliteDriver;
 
 pub struct SqliteSession {
     profile: ConnectionProfile,
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
     interrupt_handle: rusqlite::InterruptHandle,
-    transaction_active: RwLock<bool>,
 }
 
 fn quote_identifier(value: &str) -> String {
@@ -30,6 +32,16 @@ fn quote_identifier(value: &str) -> String {
 
 fn sqlite_error(error: rusqlite::Error) -> CockpitError {
     CockpitError::Query(error.to_string())
+}
+
+fn blocking_error(error: tokio::task::JoinError) -> CockpitError {
+    CockpitError::Query(format!("数据库操作线程异常：{error}"))
+}
+
+fn lock_connection(connection: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
+    connection
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn open_connection(profile: &ConnectionProfile) -> Result<Connection> {
@@ -67,17 +79,22 @@ impl DatabaseDriver for SqliteDriver {
     }
 
     async fn test(&self, profile: &ConnectionProfile, _password: &str) -> Result<ConnectionInfo> {
-        let connection = open_connection(profile)?;
-        let version: String = connection
-            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
-            .map_err(sqlite_error)?;
-        Ok(ConnectionInfo {
-            server_version: version,
-            server_comment: Some("SQLite embedded database".into()),
-            connection_id: 0,
-            current_database: Some("main".into()),
-            tls_cipher: None,
+        let profile = profile.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&profile)?;
+            let version: String = connection
+                .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+                .map_err(sqlite_error)?;
+            Ok(ConnectionInfo {
+                server_version: version,
+                server_comment: Some("SQLite embedded database".into()),
+                connection_id: 0,
+                current_database: Some("main".into()),
+                tls_cipher: None,
+            })
         })
+        .await
+        .map_err(blocking_error)?
     }
 
     async fn open(
@@ -85,13 +102,15 @@ impl DatabaseDriver for SqliteDriver {
         profile: ConnectionProfile,
         _password: String,
     ) -> Result<Arc<dyn DriverSession>> {
-        let connection = open_connection(&profile)?;
+        let open_profile = profile.clone();
+        let connection = tokio::task::spawn_blocking(move || open_connection(&open_profile))
+            .await
+            .map_err(blocking_error)??;
         let interrupt_handle = connection.get_interrupt_handle();
         Ok(Arc::new(SqliteSession {
             profile,
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
             interrupt_handle,
-            transaction_active: RwLock::new(false),
         }))
     }
 }
@@ -103,29 +122,39 @@ impl DriverSession for SqliteSession {
     }
 
     async fn connection_info(&self) -> Result<ConnectionInfo> {
-        let connection = self.connection.lock().await;
-        let version: String = connection
-            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
-            .map_err(sqlite_error)?;
-        Ok(ConnectionInfo {
-            server_version: version,
-            server_comment: Some("SQLite embedded database".into()),
-            connection_id: 0,
-            current_database: Some("main".into()),
-            tls_cipher: None,
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            let version: String = connection
+                .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+                .map_err(sqlite_error)?;
+            Ok(ConnectionInfo {
+                server_version: version,
+                server_comment: Some("SQLite embedded database".into()),
+                connection_id: 0,
+                current_database: Some("main".into()),
+                tls_cipher: None,
+            })
         })
+        .await
+        .map_err(blocking_error)?
     }
 
     async fn list_databases(&self) -> Result<Vec<DatabaseInfo>> {
-        let connection = self.connection.lock().await;
-        let mut statement = connection
-            .prepare("PRAGMA database_list")
-            .map_err(sqlite_error)?;
-        statement
-            .query_map([], |row| Ok(DatabaseInfo { name: row.get(1)? }))
-            .map_err(sqlite_error)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(sqlite_error)
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            let mut statement = connection
+                .prepare("PRAGMA database_list")
+                .map_err(sqlite_error)?;
+            statement
+                .query_map([], |row| Ok(DatabaseInfo { name: row.get(1)? }))
+                .map_err(sqlite_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sqlite_error)
+        })
+        .await
+        .map_err(blocking_error)?
     }
 
     async fn list_tables(
@@ -135,170 +164,195 @@ impl DriverSession for SqliteSession {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<TableInfo>> {
-        let connection = self.connection.lock().await;
-        let sql = format!(
-            "SELECT name, type, COALESCE(sql, '') FROM {}.sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' AND (?1 = '' OR lower(name) LIKE '%' || lower(?1) || '%') ORDER BY name LIMIT ?2 OFFSET ?3",
-            quote_identifier(database),
-        );
-        let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
-        statement
-            .query_map(
-                (filter.unwrap_or_default(), limit as i64, offset as i64),
-                |row| {
-                    let kind: String = row.get(1)?;
-                    Ok(TableInfo {
-                        database: database.into(),
-                        name: row.get(0)?,
-                        table_type: if kind == "view" {
-                            "VIEW".into()
-                        } else {
-                            "BASE TABLE".into()
-                        },
-                        comment: None,
-                        estimated_rows: None,
-                        total_bytes: None,
-                    })
-                },
-            )
-            .map_err(sqlite_error)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(sqlite_error)
+        let database = database.to_string();
+        let filter = filter.map(str::to_string);
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            let sql = format!(
+                "SELECT name, type, COALESCE(sql, '') FROM {}.sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' AND (?1 = '' OR lower(name) LIKE '%' || lower(?1) || '%') ORDER BY name LIMIT ?2 OFFSET ?3",
+                quote_identifier(&database),
+            );
+            let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
+            statement
+                .query_map(
+                    (
+                        filter.as_deref().unwrap_or_default(),
+                        limit as i64,
+                        offset as i64,
+                    ),
+                    |row| {
+                        let kind: String = row.get(1)?;
+                        Ok(TableInfo {
+                            database: database.clone(),
+                            name: row.get(0)?,
+                            table_type: if kind == "view" {
+                                "VIEW".into()
+                            } else {
+                                "BASE TABLE".into()
+                            },
+                            comment: None,
+                            estimated_rows: None,
+                            total_bytes: None,
+                        })
+                    },
+                )
+                .map_err(sqlite_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sqlite_error)
+        })
+        .await
+        .map_err(blocking_error)?
     }
 
     async fn list_columns(&self, database: &str, table: &str) -> Result<Vec<ColumnInfo>> {
-        let connection = self.connection.lock().await;
-        list_columns_sync(&connection, database, table)
+        let database = database.to_string();
+        let table = table.to_string();
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            list_columns_sync(&connection, &database, &table)
+        })
+        .await
+        .map_err(blocking_error)?
     }
 
     async fn table_detail(&self, database: &str, table: &str) -> Result<TableDetail> {
-        let connection = self.connection.lock().await;
-        let columns = list_columns_sync(&connection, database, table)?;
-        let mut ddl: String = connection
-            .query_row(
-                &format!(
-                    "SELECT sql FROM {}.sqlite_master WHERE name = ?1",
-                    quote_identifier(database)
-                ),
-                [table],
-                |row| row.get(0),
-            )
-            .map_err(sqlite_error)?;
-        let table_type: String = connection
-            .query_row(
-                &format!(
-                    "SELECT type FROM {}.sqlite_master WHERE name = ?1",
-                    quote_identifier(database)
-                ),
-                [table],
-                |row| row.get(0),
-            )
-            .map_err(sqlite_error)?;
-        let mut indexes = Vec::new();
-        let mut index_statement = connection
-            .prepare(&format!(
-                "PRAGMA {}.index_list({})",
-                quote_identifier(database),
-                quote_identifier(table)
-            ))
-            .map_err(sqlite_error)?;
-        let index_rows = index_statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)? != 0,
-                    row.get::<_, String>(3).unwrap_or_default(),
-                ))
-            })
-            .map_err(sqlite_error)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(sqlite_error)?;
-        for (name, unique, origin) in index_rows {
-            let mut column_statement = connection
+        let database = database.to_string();
+        let table = table.to_string();
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            let columns = list_columns_sync(&connection, &database, &table)?;
+            let mut ddl: String = connection
+                .query_row(
+                    &format!(
+                        "SELECT sql FROM {}.sqlite_master WHERE name = ?1",
+                        quote_identifier(&database)
+                    ),
+                    [table.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error)?;
+            let table_type: String = connection
+                .query_row(
+                    &format!(
+                        "SELECT type FROM {}.sqlite_master WHERE name = ?1",
+                        quote_identifier(&database)
+                    ),
+                    [table.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error)?;
+            let mut indexes = Vec::new();
+            let mut index_statement = connection
                 .prepare(&format!(
-                    "PRAGMA {}.index_info({})",
-                    quote_identifier(database),
-                    quote_identifier(&name)
+                    "PRAGMA {}.index_list({})",
+                    quote_identifier(&database),
+                    quote_identifier(&table)
                 ))
                 .map_err(sqlite_error)?;
-            let index_columns = column_statement
-                .query_map([], |row| row.get::<_, String>(2))
+            let index_rows = index_statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, String>(3).unwrap_or_default(),
+                    ))
+                })
                 .map_err(sqlite_error)?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(sqlite_error)?;
-            indexes.push(IndexInfo {
-                name,
-                columns: index_columns,
-                unique,
-                primary: origin == "pk",
-                index_type: Some("BTREE".into()),
-            });
-        }
-        let mut ddl_statement = connection
-            .prepare(&format!(
-                "SELECT sql FROM {}.sqlite_master WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL ORDER BY name",
-                quote_identifier(database)
-            ))
-            .map_err(sqlite_error)?;
-        let index_ddls = ddl_statement
-            .query_map([table], |row| row.get::<_, String>(0))
-            .map_err(sqlite_error)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(sqlite_error)?;
-        for index_ddl in index_ddls {
-            ddl.push_str(";\n");
-            ddl.push_str(index_ddl.trim_end_matches(';'));
-        }
-        let mut foreign_keys = Vec::new();
-        let mut fk_statement = connection
-            .prepare(&format!(
-                "PRAGMA {}.foreign_key_list({})",
-                quote_identifier(database),
-                quote_identifier(table)
-            ))
-            .map_err(sqlite_error)?;
-        let rows = fk_statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
+            for (name, unique, origin) in index_rows {
+                let mut column_statement = connection
+                    .prepare(&format!(
+                        "PRAGMA {}.index_info({})",
+                        quote_identifier(&database),
+                        quote_identifier(&name)
+                    ))
+                    .map_err(sqlite_error)?;
+                let index_columns = column_statement
+                    .query_map([], |row| row.get::<_, String>(2))
+                    .map_err(sqlite_error)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sqlite_error)?;
+                indexes.push(IndexInfo {
+                    name,
+                    columns: index_columns,
+                    unique,
+                    primary: origin == "pk",
+                    index_type: Some("BTREE".into()),
+                });
+            }
+            let mut ddl_statement = connection
+                .prepare(&format!(
+                    "SELECT sql FROM {}.sqlite_master WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL ORDER BY name",
+                    quote_identifier(&database)
                 ))
-            })
-            .map_err(sqlite_error)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(sqlite_error)?;
-        for (id, referenced_table, column, referenced_column, on_update, on_delete) in rows {
-            foreign_keys.push(ForeignKeyInfo {
-                name: format!("fk_{table}_{id}"),
-                columns: vec![column],
-                referenced_database: database.into(),
-                referenced_table,
-                referenced_columns: vec![referenced_column],
-                on_update: Some(on_update),
-                on_delete: Some(on_delete),
-            });
-        }
-        Ok(TableDetail {
-            table: TableInfo {
-                database: database.into(),
-                name: table.into(),
-                table_type: if table_type == "view" {
-                    "VIEW".into()
-                } else {
-                    "BASE TABLE".into()
+                .map_err(sqlite_error)?;
+            let index_ddls = ddl_statement
+                .query_map([table.as_str()], |row| row.get::<_, String>(0))
+                .map_err(sqlite_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sqlite_error)?;
+            for index_ddl in index_ddls {
+                ddl.push_str(";\n");
+                ddl.push_str(index_ddl.trim_end_matches(';'));
+            }
+            let mut foreign_keys = Vec::new();
+            let mut fk_statement = connection
+                .prepare(&format!(
+                    "PRAGMA {}.foreign_key_list({})",
+                    quote_identifier(&database),
+                    quote_identifier(&table)
+                ))
+                .map_err(sqlite_error)?;
+            let rows = fk_statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })
+                .map_err(sqlite_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sqlite_error)?;
+            for (id, referenced_table, column, referenced_column, on_update, on_delete) in rows {
+                foreign_keys.push(ForeignKeyInfo {
+                    name: format!("fk_{table}_{id}"),
+                    columns: vec![column],
+                    referenced_database: database.clone(),
+                    referenced_table,
+                    referenced_columns: vec![referenced_column],
+                    on_update: Some(on_update),
+                    on_delete: Some(on_delete),
+                });
+            }
+            Ok(TableDetail {
+                table: TableInfo {
+                    database: database.clone(),
+                    name: table.clone(),
+                    table_type: if table_type == "view" {
+                        "VIEW".into()
+                    } else {
+                        "BASE TABLE".into()
+                    },
+                    comment: None,
+                    estimated_rows: None,
+                    total_bytes: None,
                 },
-                comment: None,
-                estimated_rows: None,
-                total_bytes: None,
-            },
-            columns,
-            indexes,
-            foreign_keys,
-            ddl,
+                columns,
+                indexes,
+                foreign_keys,
+                ddl,
+            })
         })
+        .await
+        .map_err(blocking_error)?
     }
 
     async fn list_routines(&self, _database: &str) -> Result<Vec<RoutineInfo>> {
@@ -306,25 +360,31 @@ impl DriverSession for SqliteSession {
     }
 
     async fn list_triggers(&self, database: &str) -> Result<Vec<TriggerInfo>> {
-        let connection = self.connection.lock().await;
-        let sql = format!(
-            "SELECT name, tbl_name, sql FROM {}.sqlite_master WHERE type='trigger' ORDER BY name",
-            quote_identifier(database)
-        );
-        let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
-        statement
-            .query_map([], |row| {
-                Ok(TriggerInfo {
-                    database: database.into(),
-                    name: row.get(0)?,
-                    table_name: row.get(1)?,
-                    timing: "".into(),
-                    event: "".into(),
+        let database = database.to_string();
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            let sql = format!(
+                "SELECT name, tbl_name, sql FROM {}.sqlite_master WHERE type='trigger' ORDER BY name",
+                quote_identifier(&database)
+            );
+            let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
+            statement
+                .query_map([], |row| {
+                    Ok(TriggerInfo {
+                        database: database.clone(),
+                        name: row.get(0)?,
+                        table_name: row.get(1)?,
+                        timing: "".into(),
+                        event: "".into(),
+                    })
                 })
-            })
-            .map_err(sqlite_error)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(sqlite_error)
+                .map_err(sqlite_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sqlite_error)
+        })
+        .await
+        .map_err(blocking_error)?
     }
 
     async fn list_events(&self, _database: &str) -> Result<Vec<EventInfo>> {
@@ -346,25 +406,32 @@ impl DriverSession for SqliteSession {
                 ));
             }
         };
-        let connection = self.connection.lock().await;
-        let ddl = connection
-            .query_row(
-                &format!(
-                    "SELECT sql FROM {}.sqlite_master WHERE type=?1 AND name=?2",
-                    quote_identifier(database)
-                ),
-                (object_type, name),
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sqlite_error)?
-            .ok_or_else(|| CockpitError::NotFound(format!("对象不存在：{name}")))?;
-        Ok(DatabaseObjectDefinition {
-            database: database.into(),
-            name: name.into(),
-            kind,
-            ddl,
+        let database = database.to_string();
+        let name = name.to_string();
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            let ddl = connection
+                .query_row(
+                    &format!(
+                        "SELECT sql FROM {}.sqlite_master WHERE type=?1 AND name=?2",
+                        quote_identifier(&database)
+                    ),
+                    (object_type, name.as_str()),
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?
+                .ok_or_else(|| CockpitError::NotFound(format!("对象不存在：{name}")))?;
+            Ok(DatabaseObjectDefinition {
+                database,
+                name,
+                kind,
+                ddl,
+            })
         })
+        .await
+        .map_err(blocking_error)?
     }
 
     async fn routine_parameters(
@@ -381,34 +448,39 @@ impl DriverSession for SqliteSession {
         Err(CockpitError::Unsupported("SQLite 没有服务器会话".into()))
     }
     async fn server_status(&self) -> Result<Vec<ServerMetric>> {
-        let connection = self.connection.lock().await;
-        let page_count: i64 = connection
-            .query_row("PRAGMA page_count", [], |row| row.get(0))
-            .map_err(sqlite_error)?;
-        let page_size: i64 = connection
-            .query_row("PRAGMA page_size", [], |row| row.get(0))
-            .map_err(sqlite_error)?;
-        let journal_mode: String = connection
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-            .map_err(sqlite_error)?;
-        Ok(vec![
-            ServerMetric {
-                name: "page_count".into(),
-                value: page_count.to_string(),
-            },
-            ServerMetric {
-                name: "page_size".into(),
-                value: page_size.to_string(),
-            },
-            ServerMetric {
-                name: "database_bytes".into(),
-                value: (page_count * page_size).to_string(),
-            },
-            ServerMetric {
-                name: "journal_mode".into(),
-                value: journal_mode,
-            },
-        ])
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            let page_count: i64 = connection
+                .query_row("PRAGMA page_count", [], |row| row.get(0))
+                .map_err(sqlite_error)?;
+            let page_size: i64 = connection
+                .query_row("PRAGMA page_size", [], |row| row.get(0))
+                .map_err(sqlite_error)?;
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .map_err(sqlite_error)?;
+            Ok(vec![
+                ServerMetric {
+                    name: "page_count".into(),
+                    value: page_count.to_string(),
+                },
+                ServerMetric {
+                    name: "page_size".into(),
+                    value: page_size.to_string(),
+                },
+                ServerMetric {
+                    name: "database_bytes".into(),
+                    value: (page_count * page_size).to_string(),
+                },
+                ServerMetric {
+                    name: "journal_mode".into(),
+                    value: journal_mode,
+                },
+            ])
+        })
+        .await
+        .map_err(blocking_error)?
     }
     async fn list_users(&self) -> Result<Vec<UserAccount>> {
         Ok(Vec::new())
@@ -429,123 +501,79 @@ impl DriverSession for SqliteSession {
                     .unwrap_or_else(|| "该语句需要确认后执行".into()),
             ));
         }
-        let started = Instant::now();
-        let connection = self.connection.lock().await;
-        let mut statement = connection.prepare(&request.sql).map_err(sqlite_error)?;
-        let column_count = statement.column_count();
-        if column_count == 0 {
-            drop(statement);
-            let affected_rows = connection
-                .execute_batch(&request.sql)
-                .map_err(sqlite_error)
-                .map(|_| connection.changes())?;
-            return Ok(empty_result(request.execution_id, affected_rows, started));
-        }
-        let columns = statement
-            .column_names()
-            .iter()
-            .map(|name| ColumnMeta {
-                name: (*name).into(),
-                database_type: "DYNAMIC".into(),
-                nullable: true,
-                unsigned: false,
-                binary: false,
-            })
-            .collect::<Vec<_>>();
-        let mut cursor = statement.query([]).map_err(sqlite_error)?;
-        let mut rows = Vec::new();
-        while let Some(row) = cursor.next().map_err(sqlite_error)? {
-            let values = (0..column_count)
-                .map(|index| {
-                    row.get_ref(index)
-                        .map(sqlite_ref_to_cell)
-                        .map_err(sqlite_error)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            rows.push(values);
-            if rows.len() > request.page_size {
-                break;
-            }
-        }
-        let has_more = rows.len() > request.page_size;
-        if has_more {
-            rows.truncate(request.page_size);
-        }
-        Ok(QueryResultPage {
-            execution_id: request.execution_id,
-            columns,
-            rows,
-            affected_rows: 0,
-            execution_time_ms: started.elapsed().as_millis(),
-            truncated: has_more,
-            has_more,
-            result_set_index: 0,
-            messages: Vec::new(),
-            row_offset: request.row_offset,
-            page_size: request.page_size,
-            additional_result_sets: Vec::new(),
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            execute_sync(&connection, request)
         })
+        .await
+        .map_err(blocking_error)?
     }
 
     async fn mutate_row(&self, request: RowMutationRequest) -> Result<RowMutationResult> {
         if self.profile.read_only {
             return Err(CockpitError::Query("该连接处于只读模式".into()));
         }
-        let connection = self.connection.lock().await;
-        let table = format!(
-            "{}.{}",
-            quote_identifier(&request.database),
-            quote_identifier(&request.table)
-        );
-        let (sql, values) = match request.kind {
-            RowMutationKind::Insert => {
-                let columns = request
-                    .values
-                    .iter()
-                    .map(|(name, _)| quote_identifier(name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let placeholders = vec!["?"; request.values.len()].join(", ");
-                (
-                    format!("INSERT INTO {table} ({columns}) VALUES ({placeholders})"),
-                    request
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            let table = format!(
+                "{}.{}",
+                quote_identifier(&request.database),
+                quote_identifier(&request.table)
+            );
+            let (sql, values) = match request.kind {
+                RowMutationKind::Insert => {
+                    let columns = request
+                        .values
+                        .iter()
+                        .map(|(name, _)| quote_identifier(name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let placeholders = vec!["?"; request.values.len()].join(", ");
+                    (
+                        format!("INSERT INTO {table} ({columns}) VALUES ({placeholders})"),
+                        request
+                            .values
+                            .iter()
+                            .map(|(_, value)| cell_to_sqlite(value))
+                            .collect::<Result<Vec<_>>>()?,
+                    )
+                }
+                RowMutationKind::Update => {
+                    let set = request
+                        .values
+                        .iter()
+                        .map(|(name, _)| format!("{} = ?", quote_identifier(name)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let (where_sql, mut where_values) = mutation_where(&request)?;
+                    let mut values = request
                         .values
                         .iter()
                         .map(|(_, value)| cell_to_sqlite(value))
-                        .collect::<Result<Vec<_>>>()?,
-                )
-            }
-            RowMutationKind::Update => {
-                let set = request
-                    .values
-                    .iter()
-                    .map(|(name, _)| format!("{} = ?", quote_identifier(name)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let (where_sql, mut where_values) = mutation_where(&request)?;
-                let mut values = request
-                    .values
-                    .iter()
-                    .map(|(_, value)| cell_to_sqlite(value))
-                    .collect::<Result<Vec<_>>>()?;
-                values.append(&mut where_values);
-                (
-                    format!("UPDATE {table} SET {set} WHERE {where_sql}"),
-                    values,
-                )
-            }
-            RowMutationKind::Delete => {
-                let (where_sql, values) = mutation_where(&request)?;
-                (format!("DELETE FROM {table} WHERE {where_sql}"), values)
-            }
-        };
-        let affected = connection
-            .execute(&sql, params_from_iter(values))
-            .map_err(sqlite_error)?;
-        Ok(RowMutationResult {
-            affected_rows: affected as u64,
-            concurrent_change: request.kind != RowMutationKind::Insert && affected == 0,
+                        .collect::<Result<Vec<_>>>()?;
+                    values.append(&mut where_values);
+                    (
+                        format!("UPDATE {table} SET {set} WHERE {where_sql}"),
+                        values,
+                    )
+                }
+                RowMutationKind::Delete => {
+                    let (where_sql, values) = mutation_where(&request)?;
+                    (format!("DELETE FROM {table} WHERE {where_sql}"), values)
+                }
+            };
+            let affected = connection
+                .execute(&sql, params_from_iter(values))
+                .map_err(sqlite_error)?;
+            Ok(RowMutationResult {
+                affected_rows: affected as u64,
+                concurrent_change: request.kind != RowMutationKind::Insert && affected == 0,
+            })
         })
+        .await
+        .map_err(blocking_error)?
     }
 
     async fn insert_rows(
@@ -567,91 +595,111 @@ impl DriverSession for SqliteSession {
         rows: &[Vec<CellValue>],
         policy: ImportConflictPolicy,
     ) -> Result<u64> {
+        if self.profile.read_only {
+            return Err(CockpitError::Query("该连接处于只读模式".into()));
+        }
         if rows.is_empty() {
             return Ok(0);
         }
-        let verb = match policy {
-            ImportConflictPolicy::Error | ImportConflictPolicy::Upsert => "INSERT",
-            ImportConflictPolicy::Ignore => "INSERT OR IGNORE",
-            ImportConflictPolicy::Replace => "INSERT OR REPLACE",
-        };
-        let placeholders = format!("({})", vec!["?"; columns.len()].join(", "));
-        let upsert = if policy == ImportConflictPolicy::Upsert {
-            format!(
-                " ON CONFLICT DO UPDATE SET {}",
+        let database = database.to_string();
+        let table = table.to_string();
+        let columns = columns.to_vec();
+        let rows = rows.to_vec();
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            let verb = match policy {
+                ImportConflictPolicy::Error | ImportConflictPolicy::Upsert => "INSERT",
+                ImportConflictPolicy::Ignore => "INSERT OR IGNORE",
+                ImportConflictPolicy::Replace => "INSERT OR REPLACE",
+            };
+            let placeholders = format!("({})", vec!["?"; columns.len()].join(", "));
+            let upsert = if policy == ImportConflictPolicy::Upsert {
+                format!(
+                    " ON CONFLICT DO UPDATE SET {}",
+                    columns
+                        .iter()
+                        .map(|column| format!("{0}=excluded.{0}", quote_identifier(column)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                String::new()
+            };
+            let sql = format!(
+                "{verb} INTO {}.{} ({}) VALUES {}{upsert}",
+                quote_identifier(&database),
+                quote_identifier(&table),
                 columns
                     .iter()
-                    .map(|column| format!("{0}=excluded.{0}", quote_identifier(column)))
+                    .map(|column| quote_identifier(column))
                     .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        } else {
-            String::new()
-        };
-        let sql = format!(
-            "{verb} INTO {}.{} ({}) VALUES {}{upsert}",
-            quote_identifier(database),
-            quote_identifier(table),
-            columns
+                    .join(", "),
+                vec![placeholders; rows.len()].join(", ")
+            );
+            let values = rows
                 .iter()
-                .map(|column| quote_identifier(column))
-                .collect::<Vec<_>>()
-                .join(", "),
-            vec![placeholders; rows.len()].join(", ")
-        );
-        let values = rows
-            .iter()
-            .flatten()
-            .map(cell_to_sqlite)
-            .collect::<Result<Vec<_>>>()?;
-        let connection = self.connection.lock().await;
-        let affected = connection
-            .execute(&sql, params_from_iter(values))
-            .map_err(sqlite_error)?;
-        Ok(affected as u64)
+                .flatten()
+                .map(cell_to_sqlite)
+                .collect::<Result<Vec<_>>>()?;
+            let affected = connection
+                .execute(&sql, params_from_iter(values))
+                .map_err(sqlite_error)?;
+            Ok(affected as u64)
+        })
+        .await
+        .map_err(blocking_error)?
     }
 
     async fn begin_transaction(&self) -> Result<()> {
-        let mut active = self.transaction_active.write().await;
-        if *active {
-            return Err(CockpitError::Query("当前连接已有活动事务".into()));
+        if self.profile.read_only {
+            return Err(CockpitError::Query("只读连接不能开启写事务".into()));
         }
-        self.connection
-            .lock()
-            .await
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(sqlite_error)?;
-        *active = true;
-        Ok(())
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            if !connection.is_autocommit() {
+                return Err(CockpitError::Query("当前连接已有活动事务".into()));
+            }
+            connection
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(sqlite_error)
+        })
+        .await
+        .map_err(blocking_error)?
     }
     async fn commit_transaction(&self) -> Result<()> {
-        let mut active = self.transaction_active.write().await;
-        if !*active {
-            return Err(CockpitError::Query("当前连接没有活动事务".into()));
-        }
-        self.connection
-            .lock()
-            .await
-            .execute_batch("COMMIT")
-            .map_err(sqlite_error)?;
-        *active = false;
-        Ok(())
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            if connection.is_autocommit() {
+                return Err(CockpitError::Query("当前连接没有活动事务".into()));
+            }
+            connection.execute_batch("COMMIT").map_err(sqlite_error)
+        })
+        .await
+        .map_err(blocking_error)?
     }
     async fn rollback_transaction(&self) -> Result<()> {
-        let mut active = self.transaction_active.write().await;
-        if !*active {
-            return Ok(());
-        }
-        self.connection
-            .lock()
-            .await
-            .execute_batch("ROLLBACK")
-            .map_err(sqlite_error)?;
-        *active = false;
-        Ok(())
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            if connection.is_autocommit() {
+                return Ok(());
+            }
+            connection.execute_batch("ROLLBACK").map_err(sqlite_error)
+        })
+        .await
+        .map_err(blocking_error)?
     }
     async fn transaction_active(&self) -> bool {
-        *self.transaction_active.read().await
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(&connection);
+            !connection.is_autocommit()
+        })
+        .await
+        .unwrap_or(false)
     }
     async fn cancel(&self, _execution_id: Uuid) -> Result<bool> {
         self.interrupt_handle.interrupt();
@@ -776,7 +824,85 @@ fn mutation_where(request: &RowMutationRequest) -> Result<(String, Vec<SqliteVal
     Ok((clauses.join(" AND "), values))
 }
 
-fn empty_result(execution_id: Uuid, affected_rows: u64, started: Instant) -> QueryResultPage {
+fn execute_sync(connection: &Connection, request: ExecuteQueryRequest) -> Result<QueryResultPage> {
+    let started = Instant::now();
+    let page_size = request.page_size.clamp(1, 5_000);
+    let row_offset = request.row_offset;
+    let mut statement = connection.prepare(&request.sql).map_err(sqlite_error)?;
+    let column_count = statement.column_count();
+    if column_count == 0 {
+        drop(statement);
+        let affected_rows = connection
+            .execute_batch(&request.sql)
+            .map_err(sqlite_error)
+            .map(|_| connection.changes())?;
+        return Ok(empty_result(
+            request.execution_id,
+            affected_rows,
+            started,
+            row_offset,
+            page_size,
+        ));
+    }
+    let columns = statement
+        .column_names()
+        .iter()
+        .map(|name| ColumnMeta {
+            name: (*name).into(),
+            database_type: "DYNAMIC".into(),
+            nullable: true,
+            unsigned: false,
+            binary: false,
+        })
+        .collect::<Vec<_>>();
+    let mut cursor = statement.query([]).map_err(sqlite_error)?;
+    let mut rows = Vec::new();
+    let mut seen = 0usize;
+    let mut has_more = false;
+    while let Some(row) = cursor.next().map_err(sqlite_error)? {
+        if seen < row_offset {
+            seen += 1;
+            continue;
+        }
+        if rows.len() < page_size {
+            let values = (0..column_count)
+                .map(|index| {
+                    row.get_ref(index)
+                        .map(sqlite_ref_to_cell)
+                        .map_err(sqlite_error)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rows.push(values);
+        } else {
+            has_more = true;
+        }
+        seen += 1;
+    }
+    drop(cursor);
+    drop(statement);
+    Ok(QueryResultPage {
+        execution_id: request.execution_id,
+        columns,
+        rows,
+        affected_rows: 0,
+        execution_time_ms: started.elapsed().as_millis(),
+        truncated: has_more,
+        has_more,
+        result_set_index: 0,
+        messages: Vec::new(),
+        row_offset,
+        page_size,
+        additional_result_sets: Vec::new(),
+    })
+}
+
+fn empty_result(
+    execution_id: Uuid,
+    affected_rows: u64,
+    started: Instant,
+    row_offset: usize,
+    page_size: usize,
+) -> QueryResultPage {
     QueryResultPage {
         execution_id,
         columns: Vec::new(),
@@ -787,8 +913,8 @@ fn empty_result(execution_id: Uuid, affected_rows: u64, started: Instant) -> Que
         has_more: false,
         result_set_index: 0,
         messages: Vec::new(),
-        row_offset: 0,
-        page_size: 0,
+        row_offset,
+        page_size,
         additional_result_sets: Vec::new(),
     }
 }

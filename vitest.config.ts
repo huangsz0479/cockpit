@@ -9,5 +9,10 @@ export default defineConfig({
     environment: "happy-dom",
     include: ["src/**/*.spec.ts"],
     css: { include: [/styles\.css(?:\?|$)/] },
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "json-summary"],
+      include: ["src/**/*.{ts,vue}"],
+    },
   },
 });

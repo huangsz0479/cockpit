@@ -1,24 +1,19 @@
+# 手动触发生成 preview 安装包。
+# Manually triggered workflow: run it from the Actions page to build preview installers.
 name: Desktop installers
 
 on:
   workflow_dispatch:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-    branches: [release]
 
 permissions:
   contents: write
 
 concurrency:
-  group: desktop-installers-release
+  group: desktop-installers-preview
   cancel-in-progress: true
 
 jobs:
   package:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -37,8 +32,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -47,13 +40,13 @@ jobs:
           cache: npm
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88
         with:
           targets: ${{ matrix.rust_targets }}
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libsecret-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libsecret-1-dev
 
       - name: Install dependencies
         run: npm ci
@@ -65,8 +58,7 @@ jobs:
         with:
           tagName: preview-v__VERSION__
           releaseName: Cockpit v__VERSION__ Preview
-          releaseBody: "Automated preview build from the release branch. These packages are not code signed."
-          releaseCommitish: ${{ github.event.workflow_run.head_sha || github.sha }}
+          releaseBody: "Automated preview build triggered manually. These packages are not code signed."
           releaseDraft: false
           prerelease: true
           retryAttempts: 1

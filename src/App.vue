@@ -6,7 +6,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { join } from "@tauri-apps/api/path";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ArrowDownWideNarrow, ArrowUpDown, ArrowUpNarrowWide, Braces, ChevronDown, ChevronLeft, ChevronRight, CircleCheck, CircleMinus, Clipboard, Columns3, Copy, Database, Download, ExternalLink, Eye, FileCode2, FileUp, FolderOpen, ListFilter, MoreHorizontal, Pencil, Play, Plus, RefreshCw, RotateCcw, Search, Table2, Trash2, Unplug, X } from "lucide-vue-next";
+import { ArrowDownWideNarrow, ArrowUpDown, ArrowUpNarrowWide, Braces, ChevronDown, ChevronLeft, ChevronRight, CircleCheck, CircleMinus, Clipboard, Columns3, Copy, Database, Download, ExternalLink, Eye, FileCode2, FileUp, ListFilter, MoreHorizontal, Pencil, Play, Plus, RefreshCw, RotateCcw, Search, Table2, Trash2, Unplug, X } from "lucide-vue-next";
 import commitIcon from "../src-tauri/icons/database/commit.svg";
 import databaseIcon from "../src-tauri/icons/database/database.svg";
 import exportIcon from "../src-tauri/icons/database/export.svg";
@@ -412,7 +412,7 @@ const totalAffectedRows = computed(() => allResultSets.value.reduce((total, resu
 const resultHasMore = computed(() => allResultSets.value.some((resultSet) => resultSet.hasMore || resultSet.truncated));
 const visibleResultRows = computed(() => {
   const rows = displayedResult.value?.rows ?? [];
-  const filter = activeWorkspaceTab.value?.resultFilter?.trim().toLocaleLowerCase() ?? "";
+  const filter = debouncedResultFilter.value.trim().toLocaleLowerCase();
   const visibleRows = rows
     .map((row, rowIndex) => ({ row, rowIndex }))
     .filter(({ row }) => !filter || row.some((cell) => cellText(cell).toLocaleLowerCase().includes(filter)));
@@ -470,6 +470,8 @@ const activeTransaction = computed(() => Boolean(
 const activeInlineRowEditor = computed(() => inlineRowEditor.value?.tabId === activeWorkspaceTabId.value
   ? inlineRowEditor.value
   : null);
+const debouncedResultFilter = ref("");
+let resultFilterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 const selectedRowIndexes = computed(() => activeWorkspaceTab.value?.selectedRowIndexes ?? []);
 const selectedVisibleRowCount = computed(() => {
   const selected = new Set(selectedRowIndexes.value);
@@ -607,6 +609,7 @@ onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", handleOutsidePointer);
   if (workspaceSaveTimer) clearTimeout(workspaceSaveTimer);
   if (queryFileNoticeTimer) clearTimeout(queryFileNoticeTimer);
+  if (resultFilterDebounceTimer) clearTimeout(resultFilterDebounceTimer);
   unlistenTransferProgress?.();
   if (backupScheduleTimer) clearInterval(backupScheduleTimer);
   if (runtimeStatsTimer) clearInterval(runtimeStatsTimer);
@@ -616,7 +619,9 @@ onBeforeUnmount(() => {
 function persistTransferTasks() {
   const retained = transferTasks.value.slice(0, 100);
   transferTasks.value = retained;
-  localStorage.setItem(TRANSFER_TASKS_STORAGE_KEY, JSON.stringify(retained));
+  try {
+    localStorage.setItem(TRANSFER_TASKS_STORAGE_KEY, JSON.stringify(retained));
+  } catch { /* 本地存储不可用时仅保留内存中的任务记录。 */ }
 }
 
 function updateTransferProgress(progress: TransferProgress) {
@@ -668,7 +673,11 @@ function confirmDestructiveAction(message: string, detail = "此操作不可撤�
 }
 
 async function cancelTransferTask(taskId: UUID) {
-  if (await api.cancelTransfer(taskId)) finishTransferTask(taskId, "cancelled", { phase: "已取消" });
+  try {
+    if (await api.cancelTransfer(taskId)) finishTransferTask(taskId, "cancelled", { phase: "已取消" });
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause);
+  }
 }
 
 async function clearTransferTasks() {
@@ -688,7 +697,9 @@ function saveBackupSchedule(schedule: BackupSchedule | null) {
 }
 
 function persistSnippets() {
-  localStorage.setItem(SNIPPETS_STORAGE_KEY, JSON.stringify(snippets.value));
+  try {
+    localStorage.setItem(SNIPPETS_STORAGE_KEY, JSON.stringify(snippets.value));
+  } catch { /* 本地存储不可用时仅保留内存中的片段。 */ }
 }
 
 function saveSnippet(snippet: QuerySnippet) {
@@ -789,6 +800,22 @@ watch([
   () => activeWorkspaceTab.value?.resultFilter,
   () => displayedResult.value?.rows,
 ], resetGridRowWindow);
+
+// 页内搜索防抖：同一标签页内连续输入时延迟应用过滤，切换标签页/结果集时立即生效。
+watch(
+  () => [activeWorkspaceTabId.value, activeWorkspaceTab.value?.resultFilter] as const,
+  ([tabId, filter], previous) => {
+    if (resultFilterDebounceTimer) clearTimeout(resultFilterDebounceTimer);
+    if (previous && previous[0] === tabId && filter !== previous[1]) {
+      resultFilterDebounceTimer = setTimeout(() => {
+        debouncedResultFilter.value = filter ?? "";
+      }, 200);
+    } else {
+      debouncedResultFilter.value = filter ?? "";
+    }
+  },
+  { immediate: true },
+);
 
 watch([activeWorkspaceTabId, () => displayedResult.value?.executionId], () => { showQueryExportDialog.value = false; });
 
@@ -2301,6 +2328,8 @@ async function closeWorkspaceTab(tabId: string) {
 }
 
 async function execute(overrideSql?: unknown) {
+  const pendingEditor = activeInlineRowEditor.value;
+  if (pendingEditor && !await finishInlineRowEdit(pendingEditor)) return;
   syncActiveSqlEditor();
   const tab = activeWorkspaceTab.value;
   if (!tab) return;
@@ -2316,7 +2345,13 @@ async function execute(overrideSql?: unknown) {
     parameterSql.value = sqlToRun;
     return;
   }
-  const assessment = await api.assess(sqlToRun);
+  let assessment: Awaited<ReturnType<typeof api.assess>>;
+  try {
+    assessment = await api.assess(sqlToRun);
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause);
+    return;
+  }
   const allowWrite = assessment.requiresConfirmation;
   const safeSelect = assessment.statementKind === "SELECT" && !assessment.requiresConfirmation;
   const canPageQuery = tab.kind === "console" && safeSelect && canPageSelectQuery(sqlToRun);
@@ -2386,6 +2421,8 @@ function selectResultView(view: ResultView) {
 }
 
 async function changeResultPage(direction: -1 | 1) {
+  const pendingEditor = activeInlineRowEditor.value;
+  if (pendingEditor && !await finishInlineRowEdit(pendingEditor)) return;
   const tab = activeWorkspaceTab.value;
   const page = displayedResult.value;
   if (!tab || !page || (tab.resultSetIndex ?? 0) !== 0 || !tab.pageable) return;
@@ -2429,9 +2466,11 @@ async function changeResultPage(direction: -1 | 1) {
   }
 }
 
-function selectResultSet(index: number) {
+async function selectResultSet(index: number) {
   const tab = activeWorkspaceTab.value;
   if (!tab) return;
+  const pendingEditor = activeInlineRowEditor.value;
+  if (pendingEditor && !await finishInlineRowEdit(pendingEditor)) return;
   tab.resultSetIndex = index;
   selectConsoleEditableResult(tab, index);
   tab.selectedRowIndex = null;
@@ -3345,7 +3384,11 @@ function cellSqlLiteral(value: CellValue) {
 
 async function openSelectedForeignKey() {
   const reference = selectedForeignKey.value;
-  if (!reference?.value || !activeConnectionId.value) return;
+  if (!reference || !activeConnectionId.value) return;
+  if (!reference.value || reference.value.kind === "null") {
+    error.value = "外键值为 NULL，无法跳转到引用行";
+    return;
+  }
   const table: TableInfo = {
     database: reference.foreignKey.referencedDatabase,
     name: reference.foreignKey.referencedTable,
@@ -3795,7 +3838,7 @@ async function importSqlFile(targetDatabase?: string) {
                 </div>
                 <div class="query-toolbar-group" role="group" aria-label="执行与导出">
                   <button v-if="executingId" class="danger compact" @click="store.cancel"><img class="query-toolbar-icon" :src="stopIcon" alt="" aria-hidden="true" /> 停止</button>
-                  <button v-else class="window-tool execute-button" :disabled="!connected || !activeWorkspaceTab.connectionId" @click="executeEditorSql"><img class="query-toolbar-icon" :src="runIcon" alt="" aria-hidden="true" /> 执行 <kbd>{{ shortcutModifier }}↵</kbd></button>
+                  <button v-else class="window-tool execute-button" :disabled="!connected || !activeWorkspaceTab.connectionId || Boolean(activeInlineRowEditor)" @click="executeEditorSql"><img class="query-toolbar-icon" :src="runIcon" alt="" aria-hidden="true" /> 执行 <kbd>{{ shortcutModifier }}↵</kbd></button>
                   <button type="button" class="ghost compact query-export-trigger" aria-haspopup="dialog" aria-controls="query-export-dialog" :disabled="busy || !displayedResult?.columns.length" :title="displayedResult?.columns.length ? '导出查询结果' : '查询完成后可导出结果'" @click="showQueryExportDialog = true"><img class="query-toolbar-icon" :src="exportIcon" alt="" aria-hidden="true" /> 导出</button>
                 </div>
               </div>
@@ -3857,15 +3900,15 @@ async function importSqlFile(targetDatabase?: string) {
                 </div>
               </template>
               <div v-if="displayedResult?.columns.length" class="result-pagination">
-                <button class="ghost compact icon-only" aria-label="上一页" :disabled="Boolean(executingId) || !activeWorkspaceTab.pageable || (displayedResult.rowOffset ?? 0) === 0 || (activeWorkspaceTab.resultSetIndex ?? 0) !== 0" @click="changeResultPage(-1)"><ChevronLeft :size="13" /></button>
+                <button class="ghost compact icon-only" aria-label="上一页" :disabled="Boolean(executingId) || Boolean(activeInlineRowEditor) || !activeWorkspaceTab.pageable || (displayedResult.rowOffset ?? 0) === 0 || (activeWorkspaceTab.resultSetIndex ?? 0) !== 0" @click="changeResultPage(-1)"><ChevronLeft :size="13" /></button>
                 <span>{{ Math.floor((displayedResult.rowOffset ?? 0) / (displayedResult.pageSize ?? 500)) + 1 }}</span>
-                <button class="ghost compact icon-only" aria-label="下一页" :disabled="Boolean(executingId) || !activeWorkspaceTab.pageable || !displayedResult.hasMore || (activeWorkspaceTab.resultSetIndex ?? 0) !== 0" @click="changeResultPage(1)"><ChevronRight :size="13" /></button>
+                <button class="ghost compact icon-only" aria-label="下一页" :disabled="Boolean(executingId) || Boolean(activeInlineRowEditor) || !activeWorkspaceTab.pageable || !displayedResult.hasMore || (activeWorkspaceTab.resultSetIndex ?? 0) !== 0" @click="changeResultPage(1)"><ChevronRight :size="13" /></button>
               </div>
             </div>
             <button class="ghost compact icon-only result-panel-close" aria-label="关闭结果面板" :disabled="Boolean(activeInlineRowEditor)" @click="closeResultPanel"><X :size="13" /></button>
           </div>
           <div v-if="activeResultView === 'result'" id="query-result-panel" class="result-view-panel" role="tabpanel" aria-labelledby="query-result-tab">
-          <nav v-if="allResultSets.length > 1" class="result-set-tabs" role="tablist" aria-label="查询结果集"><button v-for="set in allResultSets" :key="set.resultSetIndex" role="tab" :aria-selected="(activeWorkspaceTab.resultSetIndex ?? 0) === set.resultSetIndex" :class="{ active: (activeWorkspaceTab.resultSetIndex ?? 0) === set.resultSetIndex }" @click="selectResultSet(set.resultSetIndex)">结果 {{ set.resultSetIndex + 1 }} <small>{{ set.rows.length }}</small></button></nav>
+          <nav v-if="allResultSets.length > 1" class="result-set-tabs" role="tablist" aria-label="查询结果集"><button v-for="set in allResultSets" :key="set.resultSetIndex" role="tab" :aria-selected="(activeWorkspaceTab.resultSetIndex ?? 0) === set.resultSetIndex" :class="{ active: (activeWorkspaceTab.resultSetIndex ?? 0) === set.resultSetIndex }" :disabled="Boolean(activeInlineRowEditor)" @click="selectResultSet(set.resultSetIndex)">结果 {{ set.resultSetIndex + 1 }} <small>{{ set.rows.length }}</small></button></nav>
           <input
             v-if="activeEditableTable && activeBatchEditColumn"
             v-model="columnBatchEditValue"
@@ -3997,7 +4040,7 @@ async function importSqlFile(targetDatabase?: string) {
                 <tr v-if="virtualResultPaddingBottom" class="virtual-spacer-row" aria-hidden="true"><td class="virtual-spacer-cell" :colspan="visibleColumnEntries.length + (activeEditableTable ? 1 : 0)" :style="{ height: `${virtualResultPaddingBottom}px` }"></td></tr>
               </tbody>
             </table>
-            <div v-if="!visibleResultRows.length" class="grid-empty-state"><Search :size="18" /><strong>{{ activeWorkspaceTab.resultFilter ? '没有匹配的数据' : '查询结果为空' }}</strong><span>{{ activeWorkspaceTab.resultFilter ? '请调整页内搜索条件' : '查询已成功执行，但没有返回数据行' }}</span></div>
+            <div v-if="!visibleResultRows.length" class="grid-empty-state"><Search :size="18" /><strong>{{ debouncedResultFilter ? '没有匹配的数据' : '查询结果为空' }}</strong><span>{{ debouncedResultFilter ? '请调整页内搜索条件' : '查询已成功执行，但没有返回数据行' }}</span></div>
           </div>
           <div v-if="displayedResult && !displayedResult.columns.length" class="result-success-state"><span aria-hidden="true">✓</span><strong>执行成功</strong><p>语句已完成，影响 {{ displayedResult.affectedRows }} 行</p><small>{{ displayedResult.executionTimeMs }} ms</small></div>
           </div>
@@ -4207,7 +4250,7 @@ async function importSqlFile(targetDatabase?: string) {
             </tr>
             <tr v-if="virtualResultPaddingBottom" class="virtual-spacer-row" aria-hidden="true"><td class="virtual-spacer-cell" :colspan="visibleColumnEntries.length + 2" :style="{ height: `${virtualResultPaddingBottom}px` }"></td></tr>
           </tbody></table>
-          <div v-if="!visibleResultRows.length" class="grid-empty-state"><Search :size="18" /><strong>{{ activeWorkspaceTab.resultFilter ? '没有匹配的数据' : '当前数据页为空' }}</strong><span>{{ activeWorkspaceTab.resultFilter ? '请调整页内搜索条件' : '可以调整筛选条件或切换分页后重试' }}</span></div>
+          <div v-if="!visibleResultRows.length" class="grid-empty-state"><Search :size="18" /><strong>{{ debouncedResultFilter ? '没有匹配的数据' : '当前数据页为空' }}</strong><span>{{ debouncedResultFilter ? '请调整页内搜索条件' : '可以调整筛选条件或切换分页后重试' }}</span></div>
         </div>
         <div v-if="displayedResult?.columns.length" class="card-toolbar table-toolbar">
           <div class="table-toolbar-heading"><strong>{{ activeWorkspaceTab.title }}</strong><RefreshCw v-if="executingId" :size="13" class="loading-icon table-loading-indicator" aria-label="正在加载数据" /><span class="muted">{{ visibleResultRows.length - (activeInlineRowEditor?.mode === 'insert' ? 1 : 0) }} / {{ displayedResult.rows.length }} 行</span><span v-if="selectedRowIndexes.length" class="connection-badge">已选 {{ selectedRowIndexes.length }}</span><span v-if="activeTransaction" class="connection-badge transaction">事务中</span></div>

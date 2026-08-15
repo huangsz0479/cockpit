@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { alterTableSql, canAppendSelectQueryLimit, canPageSelectQuery, createDefaultTableDefinition, createTableSql, quoteIdentifier, quoteMysqlIdentifier, selectPreviewSql, selectQueryPageSql, selectTablePageSql, singleTableSelectAllTarget, singleTableSelectAllTargets, tableDetailToDefinition, validateCreateTableDefinition } from "./sql";
+import { alterTableSql, canAppendSelectQueryLimit, canPageSelectQuery, createDefaultTableDefinition, createTableSql, quoteIdentifier, quoteMysqlIdentifier, selectPreviewSql, selectQueryPageSql, selectTablePageSql, singleTableSelectAllTargets, tableDetailToDefinition, validateCreateTableDefinition } from "./sql";
 
 describe("MySQL identifier SQL helpers", () => {
   it("quotes identifiers and escapes embedded backticks", () => {
@@ -41,19 +41,19 @@ describe("MySQL identifier SQL helpers", () => {
   });
 
   it("recognizes editable SELECT * queries against one table", () => {
-    expect(singleTableSelectAllTarget("SELECT * FROM users WHERE active = 1 ORDER BY id", "demo")).toEqual({
+    expect(singleTableSelectAllTargets("SELECT * FROM users WHERE active = 1 ORDER BY id", "demo")[0]).toEqual({
       database: "demo",
       table: "users",
     });
-    expect(singleTableSelectAllTarget("SELECT * FROM `audit-db`.`entry log` AS e LIMIT 20", "demo")).toEqual({
+    expect(singleTableSelectAllTargets("SELECT * FROM `audit-db`.`entry log` AS e LIMIT 20", "demo")[0]).toEqual({
       database: "audit-db",
       table: "entry log",
     });
-    expect(singleTableSelectAllTarget('SELECT * FROM "public"."users" u OFFSET 10', "other")).toEqual({
+    expect(singleTableSelectAllTargets('SELECT * FROM "public"."users" u OFFSET 10', "other")[0]).toEqual({
       database: "public",
       table: "users",
     });
-    expect(singleTableSelectAllTarget(`
+    expect(singleTableSelectAllTargets(`
 -- SELECT
 --   *
 -- FROM
@@ -69,26 +69,25 @@ WHERE
   apn IS NOT NULL
 LIMIT
   100;
-`, "demo")).toEqual({
+`, "demo")[0]).toEqual({
       database: "demo",
       table: "bus_card_info",
     });
-    expect(singleTableSelectAllTarget("SELECT /* editable row */ * FROM users WHERE note = 'a;b'", "demo")).toEqual({
+    expect(singleTableSelectAllTargets("SELECT /* editable row */ * FROM users WHERE note = 'a;b'", "demo")[0]).toEqual({
       database: "demo",
       table: "users",
     });
   });
 
   it("rejects query results that cannot safely map to one complete table row", () => {
-    expect(singleTableSelectAllTarget("SELECT id, name FROM users", "demo")).toBeNull();
-    expect(singleTableSelectAllTarget("SELECT users.* FROM users", "demo")).toBeNull();
-    expect(singleTableSelectAllTarget("SELECT * FROM users JOIN teams ON teams.id = users.team_id", "demo")).toBeNull();
-    expect(singleTableSelectAllTarget("SELECT * FROM users, teams", "demo")).toBeNull();
-    expect(singleTableSelectAllTarget("SELECT * FROM users GROUP BY team_id", "demo")).toBeNull();
-    expect(singleTableSelectAllTarget("SELECT * FROM users WHERE active = 1 GROUP BY team_id", "demo")).toBeNull();
-    expect(singleTableSelectAllTarget("SELECT * FROM users WHERE team_id IN (SELECT id FROM teams)", "demo")).toBeNull();
-    expect(singleTableSelectAllTarget("SELECT * FROM users; SELECT * FROM teams", "demo")).toBeNull();
-    expect(singleTableSelectAllTarget("SELECT * FROM users /*! JOIN teams ON teams.id = users.team_id */", "demo")).toBeNull();
+    expect(singleTableSelectAllTargets("SELECT id, name FROM users", "demo")[0]).toBeNull();
+    expect(singleTableSelectAllTargets("SELECT users.* FROM users", "demo")[0]).toBeNull();
+    expect(singleTableSelectAllTargets("SELECT * FROM users JOIN teams ON teams.id = users.team_id", "demo")[0]).toBeNull();
+    expect(singleTableSelectAllTargets("SELECT * FROM users, teams", "demo")[0]).toBeNull();
+    expect(singleTableSelectAllTargets("SELECT * FROM users GROUP BY team_id", "demo")[0]).toBeNull();
+    expect(singleTableSelectAllTargets("SELECT * FROM users WHERE active = 1 GROUP BY team_id", "demo")[0]).toBeNull();
+    expect(singleTableSelectAllTargets("SELECT * FROM users WHERE team_id IN (SELECT id FROM teams)", "demo")[0]).toBeNull();
+    expect(singleTableSelectAllTargets("SELECT * FROM users /*! JOIN teams ON teams.id = users.team_id */", "demo")).toEqual([]);
   });
 
   it("maps each statement in a multi-result query to its own editable table", () => {
@@ -102,7 +101,10 @@ LIMIT
       { database: "demo", table: "audit_log" },
       { database: "other-db", table: "events" },
     ]);
-    expect(singleTableSelectAllTarget("SELECT * FROM users; SELECT * FROM teams", "demo")).toBeNull();
+    expect(singleTableSelectAllTargets("SELECT * FROM users; SELECT * FROM teams", "demo")).toEqual([
+      { database: "demo", table: "users" },
+      { database: "demo", table: "teams" },
+    ]);
   });
 
   it("builds an editable create-table template for the selected database", () => {

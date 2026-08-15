@@ -332,6 +332,40 @@ Windows 和 Linux 使用 `Ctrl`，macOS 使用 `⌘`。
 - CSV 和 Excel 导入会在提交前将已解析数据保留在内存中，超大文件建议分批处理。
 - 不同数据库版本和账号权限可能导致部分元数据或管理功能不可用。
 
+## 16. 构建与发布
+
+以下内容面向开发者。
+
+### 本地构建
+
+```bash
+# 前端产物（Vite 构建到 dist/）
+npm run build
+
+# Rust 后端（工作区，含全部 crates 与 src-tauri）
+cargo build
+
+# 完整桌面安装包（Tauri 打包，先执行 npm install）
+npm run tauri build
+```
+
+`npm run tauri build` 会先构建前端，再编译 Rust 并生成当前平台的安装包（Windows：NSIS/MSI，macOS：DMG，Linux：AppImage/DEB）。
+
+### 发布正式版本
+
+1. 同步提升三处版本号：`package.json`、`src-tauri/tauri.conf.json`、根目录 `Cargo.toml` 的 `[workspace.package] version`，三者必须一致。
+2. 提交改动并打标签：`git tag vX.Y.Z`（如 `v0.0.5`）。
+3. 推送标签：`git push origin vX.Y.Z`，触发 `.github/workflows/release.yml` 构建三个平台（macOS / Windows / Linux）的安装包并发布到 GitHub Releases。该工作流会校验标签版本与 `tauri.conf.json` 中的版本一致，不一致会失败。
+4. macOS 安装包是否签名/公证取决于仓库 secrets 配置（`APPLE_CERTIFICATE`、`APPLE_API_KEY` 等）；未配置 secrets 时产出未签名安装包。
+
+### 预览安装包
+
+在 GitHub Actions 页面手动运行 **Desktop installers**（`.github/workflows/windows-package.yml`），可生成三平台的 preview 安装包，发布为 `preview-vX.Y.Z` 标签下的草稿版本。
+
+### 更新机制
+
+Cockpit 当前没有自动更新：启动时会检查 GitHub Releases 的正式版本，发现新版本时提示用户；下载和安装需要手动完成。
+
 ## 许可证
 
 Cockpit 基于 [Apache License 2.0](LICENSE) 发布。
