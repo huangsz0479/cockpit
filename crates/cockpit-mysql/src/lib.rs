@@ -1512,21 +1512,23 @@ fn value_to_cell(value: &Value, column: &mysql_async::Column) -> CellValue {
                 srid,
             }
         }
-        Value::Bytes(bytes)
+        Value::Bytes(bytes) => {
             if let Some(value) = text_protocol_cell(
                 bytes,
                 column_type,
                 column.flags().contains(ColumnFlags::UNSIGNED_FLAG),
-            ) =>
-        {
-            value
+            ) {
+                value
+            } else if column.character_set() == 63 {
+                CellValue::Bytes {
+                    base64: BASE64.encode(bytes),
+                    preview: printable_preview(bytes),
+                    length: bytes.len(),
+                }
+            } else {
+                CellValue::Text(String::from_utf8_lossy(bytes).into_owned())
+            }
         }
-        Value::Bytes(bytes) if column.character_set() == 63 => CellValue::Bytes {
-            base64: BASE64.encode(bytes),
-            preview: printable_preview(bytes),
-            length: bytes.len(),
-        },
-        Value::Bytes(bytes) => CellValue::Text(String::from_utf8_lossy(bytes).into_owned()),
     }
 }
 
