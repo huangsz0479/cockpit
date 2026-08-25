@@ -55,6 +55,14 @@ export const api = {
   writeBinaryFile: (outputPath: string, base64: string) => invoke<string>("write_binary_file", { outputPath, base64 }),
   mutateRow: (connectionId: UUID, sessionId: UUID | null, request: RowMutationRequest) =>
     invoke<RowMutationResult>("mutate_row", { connectionId, sessionId, request }),
+  updateDocument: (connectionId: UUID, sessionId: UUID | null, index: string, documentId: string, source: unknown) =>
+    invoke<void>("update_document", { connectionId, sessionId, index, documentId, source }),
+  deleteIndex: (connectionId: UUID, index: string) =>
+    invoke<void>("delete_index", { connectionId, index }),
+  clearIndex: (connectionId: UUID, index: string) =>
+    invoke<number>("clear_index", { connectionId, index }),
+  createIndex: (connectionId: UUID, name: string, body?: unknown) =>
+    invoke<void>("create_index", { connectionId, name, body: body ?? null }),
   beginTransaction: (connectionId: UUID, sessionId: UUID | null) => invoke<void>("begin_transaction", { connectionId, sessionId }),
   commitTransaction: (connectionId: UUID, sessionId: UUID | null) => invoke<void>("commit_transaction", { connectionId, sessionId }),
   rollbackTransaction: (connectionId: UUID, sessionId: UUID | null) => invoke<void>("rollback_transaction", { connectionId, sessionId }),

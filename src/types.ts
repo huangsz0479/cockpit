@@ -1,5 +1,5 @@
 export type UUID = string;
-export type DatabaseKind = "mysql" | "mariadb" | "postgresql" | "sqlite";
+export type DatabaseKind = "mysql" | "mariadb" | "postgresql" | "sqlite" | "elasticsearch";
 
 export type TlsMode = "disabled" | "preferred" | "required" | "verify_ca" | "verify_identity";
 export type SshAuthMethod = "password" | "private_key" | "agent";
@@ -141,6 +141,8 @@ export interface QueryResultPage {
   rowOffset?: number;
   pageSize?: number;
   additionalResultSets?: QueryResultSet[];
+  /** 结果行所属的数据源对象（Elasticsearch `_search` 路径为索引名），供整文档编辑写回 */
+  sourceTable?: string | null;
 }
 
 export interface QueryResultSet {

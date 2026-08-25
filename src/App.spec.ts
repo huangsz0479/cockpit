@@ -101,6 +101,17 @@ function sqliteProfile(): ConnectionProfile {
   };
 }
 
+function elasticsearchProfile(): ConnectionProfile {
+  return {
+    ...profile(),
+    driverKind: "elasticsearch",
+    name: "本地 ES",
+    host: "127.0.0.1",
+    port: 9200,
+    username: "",
+  };
+}
+
 function mountApp() {
   const host = document.createElement("div");
   document.body.append(host);
@@ -2196,6 +2207,115 @@ describe("App connection actions", () => {
     expect(host.querySelector(".detail-toggle")).toBeNull();
     expect(host.querySelector(".table-structure-view")).toBeNull();
     expect(host.querySelectorAll(".workspace-tab")).toHaveLength(1);
+    app.unmount();
+  });
+});
+
+describe("App Elasticsearch index management", () => {
+  function mountElasticsearchWorkspace() {
+    const { app, host, store } = mountApp();
+    const connection = elasticsearchProfile();
+    const table: TableInfo = { database: "docker-cluster", name: "orders", tableType: "BASE TABLE" };
+    store.connections.push(connection);
+    store.activeConnectionId = connection.id;
+    store.connectionInfo[connection.id] = { serverVersion: "8.15.0", connectionId: 0, currentDatabase: "docker-cluster" };
+    store.databases.push({ name: "docker-cluster" });
+    store.selectedDatabase = "docker-cluster";
+    store.tables = [table];
+    vi.spyOn(store, "connect").mockResolvedValue();
+    vi.spyOn(store, "selectDatabase").mockImplementation(async (database) => {
+      store.selectedDatabase = database;
+    });
+    const loadTables = vi.spyOn(store, "loadTables").mockResolvedValue();
+    return { app, host, store, connection, table, loadTables };
+  }
+
+  async function confirmActionDialog(host: HTMLElement, label = "继续操作") {
+    Array.from(host.querySelectorAll<HTMLButtonElement>(".action-dialog button"))
+      .find((button) => button.textContent === label)!.click();
+    await nextTick();
+  }
+
+  it("clears and deletes indexes from the index context menu", async () => {
+    const { app, host } = mountElasticsearchWorkspace();
+    const clearIndex = vi.spyOn(api, "clearIndex").mockResolvedValue(3);
+    const deleteIndex = vi.spyOn(api, "deleteIndex").mockResolvedValue(undefined);
+    await nextTick();
+
+    host.querySelector<HTMLButtonElement>(".connection-toggle")!.click();
+    await nextTick();
+    host.querySelector<HTMLElement>(".database-node")!.click();
+    await nextTick();
+    host.querySelector<HTMLButtonElement>(".object-group-title")!.click();
+    await nextTick();
+    const objectNode = host.querySelector<HTMLButtonElement>(".object-node")!;
+
+    objectNode.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    await nextTick();
+    const labels = Array.from(host.querySelectorAll<HTMLElement>('[data-testid="context-menu"] button'))
+      .map((button) => button.textContent?.trim());
+    expect(labels).toContain("清空索引");
+    expect(labels).toContain("删除索引");
+    expect(labels).not.toContain("清空表");
+    expect(labels).not.toContain("删除表");
+
+    Array.from(host.querySelectorAll<HTMLButtonElement>('[data-testid="context-menu"] button'))
+      .find((button) => button.textContent?.includes("清空索引"))!.click();
+    await nextTick();
+    expect(host.querySelector(".action-dialog")?.textContent).toContain("清空索引“orders”中的全部文档");
+    await confirmActionDialog(host);
+    await vi.waitFor(() => expect(clearIndex).toHaveBeenCalledTimes(1));
+
+    objectNode.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    await nextTick();
+    Array.from(host.querySelectorAll<HTMLButtonElement>('[data-testid="context-menu"] button'))
+      .find((button) => button.textContent?.includes("删除索引"))!.click();
+    await nextTick();
+    expect(host.querySelector(".action-dialog")?.textContent).toContain("永久删除索引“orders”");
+    await confirmActionDialog(host);
+    await vi.waitFor(() => expect(deleteIndex).toHaveBeenCalledTimes(1));
+    app.unmount();
+  });
+
+  it("creates indexes from the index group menu after validating the name", async () => {
+    const { app, host, store } = mountElasticsearchWorkspace();
+    const createIndex = vi.spyOn(api, "createIndex").mockResolvedValue(undefined);
+    await nextTick();
+
+    host.querySelector<HTMLButtonElement>(".connection-toggle")!.click();
+    await nextTick();
+    host.querySelector<HTMLElement>(".database-node")!.click();
+    await nextTick();
+    const tableGroup = host.querySelector<HTMLButtonElement>(".object-group-title")!;
+    tableGroup.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    await nextTick();
+    expect(host.querySelector<HTMLElement>('[data-testid="context-menu"]')?.textContent).toContain("索引");
+    expect(Array.from(host.querySelectorAll<HTMLElement>('[data-testid="context-menu"] button'))
+      .map((button) => button.textContent?.trim())).toContain("新建索引");
+
+    Array.from(host.querySelectorAll<HTMLButtonElement>('[data-testid="context-menu"] button'))
+      .find((button) => button.textContent?.includes("新建索引"))!.click();
+    await nextTick();
+    const input = host.querySelector<HTMLInputElement>(".action-dialog input")!;
+    input.value = "Bad Name";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    await confirmActionDialog(host, "创建");
+    await Promise.resolve();
+    expect(createIndex).not.toHaveBeenCalled();
+    expect(store.error).toContain("索引名仅允许小写字母");
+
+    tableGroup.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    await nextTick();
+    Array.from(host.querySelectorAll<HTMLButtonElement>('[data-testid="context-menu"] button'))
+      .find((button) => button.textContent?.includes("新建索引"))!.click();
+    await nextTick();
+    const retry = host.querySelector<HTMLInputElement>(".action-dialog input")!;
+    retry.value = "orders_2026";
+    retry.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    await confirmActionDialog(host, "创建");
+    await vi.waitFor(() => expect(createIndex).toHaveBeenCalledWith(expect.any(String), "orders_2026"));
     app.unmount();
   });
 });

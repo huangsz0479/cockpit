@@ -37,9 +37,9 @@ const passwordStored = ref<boolean | null>(props.initial ? null : false);
 const testing = ref(false);
 const testMessage = ref("");
 const testState = ref<"success" | "error" | null>(null);
-const needsPassword = computed(() => profile.driverKind !== "sqlite");
+const needsPassword = computed(() => profile.driverKind !== "sqlite" && profile.driverKind !== "elasticsearch");
 const valid = computed(() => profile.name.trim() && profile.host.trim() && (
-  profile.driverKind === "sqlite" || (profile.username.trim() && profile.port > 0)
+  profile.driverKind === "sqlite" || profile.driverKind === "elasticsearch" || (profile.username.trim() && profile.port > 0)
 ));
 const canSave = computed(() => Boolean(valid.value) && (
   !needsPassword.value || !props.initial || (passwordStored.value !== null && (passwordStored.value || password.value.length > 0))
@@ -73,7 +73,7 @@ async function test() {
   try {
     const info = await api.testConnection(profile, password.value || undefined);
     testState.value = "success";
-    const label = profile.driverKind === "mariadb" ? "MariaDB" : profile.driverKind === "postgresql" ? "PostgreSQL" : profile.driverKind === "sqlite" ? "SQLite" : "MySQL";
+    const label = profile.driverKind === "mariadb" ? "MariaDB" : profile.driverKind === "postgresql" ? "PostgreSQL" : profile.driverKind === "sqlite" ? "SQLite" : profile.driverKind === "elasticsearch" ? "Elasticsearch" : "MySQL";
     testMessage.value = `连接成功 · ${label} ${info.serverVersion}${info.tlsCipher ? ` · TLS ${info.tlsCipher}` : ""}`;
   } catch (error) {
     const message = messageOf(error);
@@ -122,17 +122,20 @@ function changeDriver(kind: DatabaseKind) {
     profile.username = "";
     profile.database = "main";
     passwordStored.value = true;
+  } else if (kind === "elasticsearch") {
+    if (profile.port <= 1 || profile.port === 3306 || profile.port === 5432) profile.port = 9200;
+    passwordStored.value = true;
   } else {
     if (!profile.username) profile.username = kind === "postgresql" ? "postgres" : "root";
     if (profile.port <= 1) profile.port = kind === "postgresql" ? 5432 : 3306;
-    if (kind !== "postgresql" && profile.port === 5432) profile.port = 3306;
-    if (kind === "postgresql" && profile.port === 3306) profile.port = 5432;
+    if (kind !== "postgresql" && (profile.port === 5432 || profile.port === 9200)) profile.port = 3306;
+    if (kind === "postgresql" && (profile.port === 3306 || profile.port === 9200)) profile.port = 5432;
     if (!props.initial) passwordStored.value = false;
   }
 }
 
 function onDriverChange(kind: unknown) {
-  if (["mysql", "mariadb", "postgresql", "sqlite"].includes(String(kind))) changeDriver(kind as DatabaseKind);
+  if (["mysql", "mariadb", "postgresql", "sqlite", "elasticsearch"].includes(String(kind))) changeDriver(kind as DatabaseKind);
 }
 
 function toggleSsh(enabled: boolean) {
@@ -152,15 +155,15 @@ function onSshToggle(event: Event) {
 
       <div class="connection-dialog-body">
         <div class="form-grid connection-basics-grid">
-          <label><span>数据库类型</span><AppSelect :model-value="profile.driverKind" :options="[{ value: 'mysql', label: 'MySQL' }, { value: 'mariadb', label: 'MariaDB' }, { value: 'postgresql', label: 'PostgreSQL' }, { value: 'sqlite', label: 'SQLite' }]" label="数据库类型" @update:model-value="onDriverChange" /></label>
+          <label><span>数据库类型</span><AppSelect :model-value="profile.driverKind" :options="[{ value: 'mysql', label: 'MySQL' }, { value: 'mariadb', label: 'MariaDB' }, { value: 'postgresql', label: 'PostgreSQL' }, { value: 'sqlite', label: 'SQLite' }, { value: 'elasticsearch', label: 'Elasticsearch' }]" label="数据库类型" @update:model-value="onDriverChange" /></label>
           <label><span>连接分组</span><input v-model="profile.group" placeholder="例如：生产 / 测试" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
           <label class="wide"><span>连接名称 <b>*</b></span><input v-model="profile.name" placeholder="请输入连接名称" autofocus required autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
           <label v-if="profile.driverKind === 'sqlite'" class="wide"><span>数据库文件 <b>*</b></span><div class="path-field"><input v-model="profile.host" required autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><button type="button" class="secondary compact" @click="pickSqliteFile">选择</button></div></label>
           <template v-else><label class="wide"><span>主机 <b>*</b></span><input v-model="profile.host" placeholder="127.0.0.1" required autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
           <label><span>端口</span><input v-model.number="profile.port" type="number" min="1" max="65535" /></label>
-          <label><span>默认数据库</span><input v-model="profile.database" placeholder="可选" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
-          <label><span>用户名 <b>*</b></span><input v-model="profile.username" autocomplete="username" required autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
-          <label><span>密码 <b v-if="!initial || passwordStored === false">*</b></span><input v-model="password" type="password" autocomplete="current-password" :required="!initial || passwordStored === false" :placeholder="passwordPlaceholder" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><small v-if="initial && passwordStored === false && !password" class="password-warning">重启后未找到已保存密码，请重新输入</small></label>
+          <label v-if="profile.driverKind !== 'elasticsearch'"><span>默认数据库</span><input v-model="profile.database" placeholder="可选" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
+          <label><span>用户名 <b v-if="needsPassword">*</b></span><input v-model="profile.username" autocomplete="username" :required="needsPassword" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /></label>
+          <label><span>密码 <b v-if="needsPassword && (!initial || passwordStored === false)">*</b></span><input v-model="password" type="password" autocomplete="current-password" :required="needsPassword && (!initial || passwordStored === false)" :placeholder="passwordPlaceholder" autocorrect="off" autocapitalize="none" spellcheck="false" data-gramm="false" /><small v-if="needsPassword && initial && passwordStored === false && !password" class="password-warning">重启后未找到已保存密码，请重新输入</small></label>
           </template>
         </div>
 

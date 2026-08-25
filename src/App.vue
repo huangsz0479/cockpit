@@ -9,6 +9,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { ArrowDownWideNarrow, ArrowUpDown, ArrowUpNarrowWide, Braces, ChevronDown, ChevronLeft, ChevronRight, CircleCheck, CircleMinus, Clipboard, Columns3, Copy, Database, Download, ExternalLink, Eye, FileCode2, FileUp, ListFilter, MoreHorizontal, Pencil, Play, Plus, RefreshCw, RotateCcw, Search, Table2, Trash2, Unplug, X } from "lucide-vue-next";
 import commitIcon from "../src-tauri/icons/database/commit.svg";
 import databaseIcon from "../src-tauri/icons/database/database.svg";
+import elasticsearchIcon from "../src-tauri/icons/database/elasticsearch.svg";
 import exportIcon from "../src-tauri/icons/database/export.svg";
 import formatIcon from "../src-tauri/icons/database/fmatter.svg";
 import mysqlIcon from "../src-tauri/icons/database/mysql.svg";
@@ -24,6 +25,7 @@ import ConnectionDialog from "@/components/ConnectionDialog.vue";
 import ContextMenu from "@/components/ContextMenu.vue";
 import CreateTableEditor from "@/components/CreateTableEditor.vue";
 import CellViewer from "@/components/CellViewer.vue";
+import RowJsonViewer from "@/components/RowJsonViewer.vue";
 import InlineDatePicker from "@/components/InlineDatePicker.vue";
 import ImportDataDialog from "@/components/ImportDataDialog.vue";
 import QueryExportDialog from "@/components/QueryExportDialog.vue";
@@ -52,6 +54,7 @@ import { columnIsNullable, hasDatabaseDefault, isGeneratedColumn, parseRowCell, 
 import { findSqlParameters } from "@/lib/sqlParameters";
 import { useActionDialog } from "@/lib/actionDialog";
 import { api } from "@/lib/api";
+import { driverSupportsObjectGroup, driverTableGroupLabel, isValidElasticsearchIndexName } from "@/lib/driverCapabilities";
 import { fetchLatestGitHubRelease, isNewerVersion } from "@/lib/githubRelease";
 import { alterTableSql, canAppendSelectQueryLimit, canPageSelectQuery, createDefaultTableDefinition, createTableSql, quoteIdentifier, quoteMysqlIdentifier, selectPreviewSql, selectQueryPageSql, selectTablePageSql, singleTableSelectAllTargets, tableDetailToDefinition } from "@/lib/sql";
 import type { CreateTableDefinition } from "@/lib/sql";
@@ -168,6 +171,13 @@ const contextMenu = ref<{ x: number; y: number; target: ContextTarget } | null>(
 const queryFileNotice = ref<{ kind: "info" | "success" | "warning"; message: string } | null>(null);
 const inlineRowEditor = ref<InlineRowEditorState | null>(null);
 const cellViewer = ref<{ column: string; value: CellValue } | null>(null);
+const rowJsonViewer = ref<{
+  columns: ColumnMeta[];
+  row: CellValue[];
+  rowNumber: number;
+  index: string | null;
+  documentId: string | null;
+} | null>(null);
 const workspaceRestored = ref(false);
 let workspaceSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let queryFileNoticeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -362,10 +372,16 @@ const activeQueryConnectionIcon = computed(() => {
   const kind = connection.driverKind;
   if (kind === "postgresql") return postgresqlIcon;
   if (kind === "sqlite") return sqliteIcon;
+  if (kind === "elasticsearch") return elasticsearchIcon;
   if (kind === "mysql" || kind === "mariadb" || !kind) return mysqlIcon;
   return databaseIcon;
 });
 const activeConnectionKind = computed(() => connections.value.find((connection) => connection.id === activeConnectionId.value)?.driverKind ?? "mysql");
+const tableGroupLabel = computed(() => driverTableGroupLabel(activeConnectionKind.value));
+// Elasticsearch 第一版只读：写操作入口与只读连接同样禁用。
+const activeConnectionWriteBlocked = computed(() => Boolean(activeQueryConnection.value?.readOnly) || activeQueryConnection.value?.driverKind === "elasticsearch");
+// ES 查询结果以文档为中心：双击行查看整行 JSON（_search 路径下含 _id 与嵌套结构）。
+const activeConnectionIsEs = computed(() => activeQueryConnection.value?.driverKind === "elasticsearch");
 const activeCreateTableConnection = computed(() => connections.value.find((connection) => connection.id === activeWorkspaceTab.value?.connectionId) ?? null);
 const sql = computed(() => activeWorkspaceTab.value?.sql ?? "");
 
@@ -1432,6 +1448,10 @@ async function runTableGroupContextAction(action: "create" | "view" | "query" | 
     else await store.loadTables("", false);
   } else if (action === "create") {
     error.value = null;
+    if (activeConnectionKind.value === "elasticsearch") {
+      await createElasticsearchIndex(database);
+      return;
+    }
     if (["mysql", "mariadb", "sqlite"].includes(activeConnectionKind.value)) createTableTab(database);
     else createQueryTab(`CREATE TABLE ${quoteIdentifier(database, "postgresql")}.${quoteIdentifier("new_table", "postgresql")} (\n  id BIGSERIAL PRIMARY KEY\n);`, database);
   } else if (action === "view") {
@@ -1465,6 +1485,10 @@ function setObjectGroupExpanded(group: ObjectGroupKind, expanded: boolean) {
 }
 
 function createObjectFromGroup(database: string, kind: DatabaseObjectKind) {
+  if (activeConnectionKind.value === "elasticsearch") {
+    error.value = "Elasticsearch 没有视图、函数、触发器等数据库对象。";
+    return;
+  }
   if (activeConnectionKind.value === "sqlite" && (kind === "procedure" || kind === "function" || kind === "event")) {
     error.value = "SQLite 仅支持创建视图和触发器。";
     return;
@@ -1516,6 +1540,10 @@ async function createDatabase() {
     error.value = "SQLite 数据库对应连接文件；请通过“新建连接”创建或打开另一个文件。";
     return;
   }
+  if (activeConnectionKind.value === "elasticsearch") {
+    error.value = "Elasticsearch 集群不支持创建数据库，索引会随数据自动建立。";
+    return;
+  }
   const postgresql = activeConnectionKind.value === "postgresql";
   const name = await promptAction({
     title: postgresql ? "新建 Schema" : "新建数据库",
@@ -1537,6 +1565,7 @@ async function createDatabase() {
 async function dropDatabase(database: string) {
   if (!await confirmDestructiveAction(`永久删除数据库“${database}”及其中全部对象？`)) return;
   if (activeConnectionKind.value === "sqlite") { error.value = "SQLite 主数据库不能在当前连接中删除。"; return; }
+  if (activeConnectionKind.value === "elasticsearch") { error.value = "Elasticsearch 集群不支持删除数据库，如需清理请删除具体索引。"; return; }
   const page = await store.execute(null, activeConnectionKind.value === "postgresql"
     ? `DROP SCHEMA ${quoteIdentifier(database, "postgresql")} CASCADE;`
     : `DROP DATABASE ${quoteMysqlIdentifier(database)};`, true);
@@ -1558,15 +1587,85 @@ async function runTableContextAction(action: "preview" | "generate" | "design" |
     else await designTable(table);
   } else if (action === "truncate") {
     if (!table.tableType.includes("VIEW")) {
+      if (activeConnectionKind.value === "elasticsearch") {
+        await clearElasticsearchIndex(table);
+        return;
+      }
       const target = `${quoteIdentifier(table.database, activeConnectionKind.value)}.${quoteIdentifier(table.name, activeConnectionKind.value)}`;
       await runTableDdl(table, activeConnectionKind.value === "sqlite" ? `DELETE FROM ${target};` : `TRUNCATE TABLE ${target};`, "清空表中全部数据");
     }
   }
   else if (action === "drop") {
+    if (activeConnectionKind.value === "elasticsearch") {
+      await dropElasticsearchIndex(table);
+      return;
+    }
     const objectType = table.tableType.includes("VIEW") ? "VIEW" : "TABLE";
     await runTableDdl(table, `DROP ${objectType} ${quoteIdentifier(table.database, activeConnectionKind.value)}.${quoteIdentifier(table.name, activeConnectionKind.value)};`, `永久删除该${objectType === "VIEW" ? "视图" : "表"}`);
   } else if (action === "copy") await copyText(table.name);
   else if (action === "copy-qualified") await copyText(`${table.database}.${table.name}`);
+}
+
+async function runElasticsearchIndexAction(description: string, action: () => Promise<unknown>) {
+  const connectionId = activeConnectionId.value;
+  if (!connectionId) { error.value = "请先连接数据库"; return; }
+  if (!await confirmDestructiveAction(description)) return;
+  error.value = null;
+  try {
+    await action();
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause);
+    return;
+  }
+  await store.loadTables("", false);
+}
+
+async function clearElasticsearchIndex(table: TableInfo) {
+  await runElasticsearchIndexAction(
+    `清空索引“${table.name}”中的全部文档？索引与字段映射会保留。`,
+    () => api.clearIndex(activeConnectionId.value!, table.name),
+  );
+}
+
+async function dropElasticsearchIndex(table: TableInfo) {
+  const connectionId = activeConnectionId.value;
+  await runElasticsearchIndexAction(
+    `永久删除索引“${table.name}”？索引、字段映射与全部文档都会被删除。`,
+    () => api.deleteIndex(activeConnectionId.value!, table.name),
+  );
+  if (!connectionId || error.value) return;
+  const tabId = `table:${connectionId}:${table.database}:${table.name}`;
+  const tab = workspaceTabs.value.find((item) => item.id === tabId);
+  if (tab) await closeWorkspaceTab(tab.id);
+}
+
+async function createElasticsearchIndex(database: string) {
+  const name = await promptAction({
+    title: "新建索引",
+    message: "输入要创建的 Elasticsearch 索引名称。",
+    detail: "不指定字段映射时，字段类型会随首份文档自动推断。",
+    inputLabel: "索引名称",
+    inputPlaceholder: "例如 orders_2026",
+    inputRequired: true,
+    inputValidationMessage: "名称不能为空",
+    confirmLabel: "创建",
+  });
+  if (!name) return;
+  if (!isValidElasticsearchIndexName(name)) {
+    error.value = "索引名仅允许小写字母、数字与 - _ .，且不能以 - _ + 开头。";
+    return;
+  }
+  const connectionId = activeConnectionId.value;
+  if (!connectionId) { error.value = "请先连接数据库"; return; }
+  try {
+    await api.createIndex(connectionId, name);
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause);
+    return;
+  }
+  if (selectedDatabase.value !== database) await openDatabase(database);
+  else await store.loadTables("", false);
+  expandedTableGroup.value = true;
 }
 
 async function runTableDdl(table: TableInfo, statement: string, description: string) {
@@ -2355,8 +2454,10 @@ async function execute(overrideSql?: unknown) {
   const allowWrite = assessment.requiresConfirmation;
   const safeSelect = assessment.statementKind === "SELECT" && !assessment.requiresConfirmation;
   const canPageQuery = tab.kind === "console" && safeSelect && canPageSelectQuery(sqlToRun);
-  const appendPageLimit = canPageQuery && canAppendSelectQueryLimit(sqlToRun);
+  // Elasticsearch SQL 不支持 OFFSET，查询分页统一走后端游标偏移。
+  const appendPageLimit = canPageQuery && canAppendSelectQueryLimit(sqlToRun) && activeQueryConnection.value?.driverKind !== "elasticsearch";
   const editableTargets = tab.kind === "console" && !assessment.requiresConfirmation
+      && activeQueryConnection.value?.driverKind !== "elasticsearch"
     ? singleTableSelectAllTargets(sqlToRun, tab.database)
     : [];
   if (tab.kind === "console") {
@@ -2433,6 +2534,7 @@ async function changeResultPage(direction: -1 | 1) {
   let requestSql = tab.sql;
   let requestOffset = nextOffset;
   if (tab.kind === "table" && tab.database) {
+    const tableDriverKind = connections.value.find((item) => item.id === tab.connectionId)?.driverKind ?? "mysql";
     requestSql = selectTablePageSql(
       tab.database,
       tab.title,
@@ -2441,9 +2543,10 @@ async function changeResultPage(direction: -1 | 1) {
       tab.appliedFilter,
       tab.sortColumn,
       tab.sortDirection,
-      connections.value.find((item) => item.id === tab.connectionId)?.driverKind ?? "mysql",
+      tableDriverKind,
     );
-    requestOffset = 0;
+    // Elasticsearch 的 SQL 不含 LIMIT/OFFSET，翻页偏移交给后端游标。
+    requestOffset = tableDriverKind === "elasticsearch" ? nextOffset : 0;
   } else if (tab.kind === "console" && tab.pagingSql) {
     if (tab.pagingUsesDriverOffset) {
       requestSql = tab.pagingSql;
@@ -2481,7 +2584,7 @@ async function selectResultSet(index: number) {
 function formatSql() {
   syncActiveSqlEditor();
   const kind = activeQueryConnection.value?.driverKind ?? "mysql";
-  const language = kind === "postgresql" ? "postgresql" : kind === "sqlite" ? "sqlite" : kind === "mariadb" ? "mariadb" : "mysql";
+  const language = kind === "postgresql" ? "postgresql" : kind === "sqlite" ? "sqlite" : kind === "mariadb" ? "mariadb" : kind === "elasticsearch" ? "sql" : "mysql";
   try {
     const tab = activeWorkspaceTab.value;
     if (tab) tab.sql = format(sql.value, { language, keywordCase: "upper" });
@@ -2717,6 +2820,7 @@ async function handleGridCellKeydown(event: KeyboardEvent, row: number, column: 
       && activeTableHasUniqueKey.value
       && inlineColumnEditable(columnName)
     ) startInlineRowEdit(row, columnName);
+    else if (activeConnectionIsEs.value) openRowJsonViewer(row);
     else openCellViewer(row, column);
     return;
   }
@@ -2752,6 +2856,44 @@ function openCellViewer(row: number, column: number) {
   const value = page?.rows[row]?.[column];
   const meta = page?.columns[column];
   if (value && meta) cellViewer.value = { column: meta.name, value };
+}
+
+function openRowJsonViewer(row: number) {
+  const page = displayedResult.value;
+  const cells = page?.rows[row];
+  if (!page?.columns.length || !cells) return;
+  // 打开时快照整行，避免弹窗展示期间结果被重新执行替换。
+  // 只有 _search 路径的结果带 _id 首列与来源索引，才允许编辑写回（列不全时整文档覆盖会丢字段）
+  const idColumn = page.columns[0]?.name === "_id" ? cells[0] : undefined;
+  rowJsonViewer.value = {
+    columns: page.columns,
+    row: cells,
+    rowNumber: (page.rowOffset ?? 0) + row + 1,
+    index: page.sourceTable ?? null,
+    documentId: idColumn?.kind === "text" ? idColumn.value : null,
+  };
+}
+
+async function saveRowJsonDocument(document: Record<string, unknown>): Promise<string | null> {
+  const viewer = rowJsonViewer.value;
+  const tab = activeWorkspaceTab.value;
+  if (!viewer?.index || !viewer.documentId || !tab?.connectionId) {
+    return "缺少来源索引或文档 _id，无法保存";
+  }
+  try {
+    await api.updateDocument(tab.connectionId, tab.sessionId ?? null, viewer.index, viewer.documentId, document);
+  } catch (cause) {
+    return cause instanceof Error ? cause.message : String(cause);
+  }
+  await reloadBatchEditedTab(tab);
+  return null;
+}
+
+function rowJsonSaveHandler() {
+  const viewer = rowJsonViewer.value;
+  if (!viewer?.index || !viewer.documentId) return undefined;
+  if (!activeConnectionIsEs.value || activeQueryConnection.value?.readOnly) return undefined;
+  return saveRowJsonDocument;
 }
 
 function tsvCell(value: string) {
@@ -3096,7 +3238,9 @@ async function handleTableDataCellClick(rowIndex: number, sourceIndex: number, c
     if (!await selectTableDataRow(rowIndex)) return;
   } else selectDataRow(rowIndex);
   selectDataCell(rowIndex, sourceIndex);
-  startInlineRowEdit(rowIndex, columnName);
+  // ES 与只读连接不可能行内编辑（同“编辑”按钮的禁用条件），
+  // 单击只选中，不弹“没有主键/只读”类报错
+  if (!activeConnectionWriteBlocked.value) startInlineRowEdit(rowIndex, columnName);
 }
 
 function cancelInlineRowEdit() {
@@ -3408,6 +3552,7 @@ async function reloadTableTab(tab: WorkspaceTab) {
   if (!await applyQueryContext(tab)) return;
   const offset = tab.result?.rowOffset ?? 0;
   const pageSize = tab.pageSize ?? 100;
+  const tableDriverKind = connections.value.find((item) => item.id === tab.connectionId)?.driverKind ?? "mysql";
   const statement = selectTablePageSql(
     tab.database,
     tab.title,
@@ -3416,9 +3561,10 @@ async function reloadTableTab(tab: WorkspaceTab) {
     tab.appliedFilter,
     tab.sortColumn,
     tab.sortDirection,
-    connections.value.find((item) => item.id === tab.connectionId)?.driverKind ?? "mysql",
+    tableDriverKind,
   );
-  const page = await store.execute(tab.sessionId, statement, false, 0, pageSize);
+  // Elasticsearch 的 SQL 不含 LIMIT/OFFSET，偏移由驱动游标完成。
+  const page = await store.execute(tab.sessionId, statement, false, tableDriverKind === "elasticsearch" ? offset : 0, pageSize);
   if (page) {
     if (inlineRowEditor.value?.tabId === tab.id) inlineRowEditor.value = null;
     page.rowOffset = offset;
@@ -3829,7 +3975,7 @@ async function importSqlFile(targetDatabase?: string) {
                   <button class="ghost compact" @click="saveCurrentQuery()"><img class="query-toolbar-icon" :src="saveQueryIcon" alt="" aria-hidden="true" /> 保存 <kbd>{{ shortcutModifier }}S</kbd></button>
                   <button class="ghost compact" @click="formatSql"><img class="query-toolbar-icon" :src="formatIcon" alt="" aria-hidden="true" /> 美化</button>
                 </div>
-                <div class="query-toolbar-group" role="group" aria-label="事务操作">
+                <div v-if="activeQueryConnection?.driverKind !== 'elasticsearch'" class="query-toolbar-group" role="group" aria-label="事务操作">
                   <template v-if="activeTransaction">
                     <button class="ghost compact" :disabled="busy" @click="commitTransaction"><img class="query-toolbar-icon" :src="commitIcon" alt="" aria-hidden="true" /> 提交</button>
                     <button class="danger compact" :disabled="busy" @click="rollbackTransaction"><img class="query-toolbar-icon" :src="rollbackIcon" alt="" aria-hidden="true" /> 回滚</button>
@@ -3895,8 +4041,8 @@ async function importSqlFile(targetDatabase?: string) {
                 <button class="ghost compact icon-only" aria-label="复制选中单元格" :disabled="!activeWorkspaceTab.selectedCell" @click="copyResult('cell')"><Copy :size="13" /></button>
                 <button class="ghost compact icon-only" aria-label="复制当前页" @click="copyResult('page')"><Clipboard :size="13" /></button>
                 <div v-if="activeEditableTable" class="table-primary-actions query-edit-actions">
-                  <button class="ghost compact" :disabled="busy || Boolean(executingId) || activeQueryConnection?.readOnly || Boolean(activeInlineRowEditor)" @click="startInlineRowInsert"><Plus :size="13" /> 新增</button>
-                  <button class="danger compact" :disabled="busy || Boolean(executingId) || activeWorkspaceTab.selectedRowIndex == null || activeQueryConnection?.readOnly || Boolean(activeInlineRowEditor)" @click="deleteSelectedRow"><Trash2 :size="13" /> 删除</button>
+                  <button class="ghost compact" :disabled="busy || Boolean(executingId) || activeConnectionWriteBlocked || Boolean(activeInlineRowEditor)" @click="startInlineRowInsert"><Plus :size="13" /> 新增</button>
+                  <button class="danger compact" :disabled="busy || Boolean(executingId) || activeWorkspaceTab.selectedRowIndex == null || activeConnectionWriteBlocked || Boolean(activeInlineRowEditor)" @click="deleteSelectedRow"><Trash2 :size="13" /> 删除</button>
                 </div>
               </template>
               <div v-if="displayedResult?.columns.length" class="result-pagination">
@@ -3988,7 +4134,7 @@ async function importSqlFile(targetDatabase?: string) {
                     :style="frozenColumnStyle(displayIndex, columnEntry.column, columnEntry.sourceIndex)"
                     @focus="selectDataCell(entry.rowIndex, columnEntry.sourceIndex)"
                     @click.stop="activeEditableTable ? handleTableDataCellClick(entry.rowIndex, columnEntry.sourceIndex, columnEntry.column.name) : handleResultDataCellClick(entry.rowIndex, columnEntry.sourceIndex)"
-                    @dblclick.stop="!activeEditableTable && openCellViewer(entry.rowIndex, columnEntry.sourceIndex)"
+                    @dblclick.stop="!activeEditableTable && (activeConnectionIsEs ? openRowJsonViewer(entry.rowIndex) : openCellViewer(entry.rowIndex, columnEntry.sourceIndex))"
                     @keydown="handleGridCellKeydown($event, entry.rowIndex, columnEntry.sourceIndex, columnEntry.column.name)"
                   >
                     <div v-if="activeEditableTable && isInlineEditingRow(entry.rowIndex) && inlineColumnEditable(columnEntry.column.name) && activeInlineRowEditor?.activeColumn === columnEntry.column.name" class="inline-cell-editor">
@@ -4162,8 +4308,8 @@ async function importSqlFile(targetDatabase?: string) {
                     @click="toggleColumnMenu(entry.column.name)"
                   ><MoreHorizontal :size="16" /></button>
                   <div v-if="columnMenuColumn === entry.column.name" class="column-menu-panel" role="menu" :aria-label="`${entry.column.name} 列操作`">
-                    <button type="button" role="menuitem" :class="{ active: activeWorkspaceTab.sortColumn === entry.column.name && activeWorkspaceTab.sortDirection === 'asc' }" @click="applyTableSort(entry.column.name, 'asc')"><ArrowUpNarrowWide :size="15" />升序排序</button>
-                    <button type="button" role="menuitem" :class="{ active: activeWorkspaceTab.sortColumn === entry.column.name && activeWorkspaceTab.sortDirection === 'desc' }" @click="applyTableSort(entry.column.name, 'desc')"><ArrowDownWideNarrow :size="15" />降序排序</button>
+                    <button type="button" role="menuitem" :disabled="activeConnectionIsEs && (entry.column.name === '_id' || entry.column.name === '_version')" :class="{ active: activeWorkspaceTab.sortColumn === entry.column.name && activeWorkspaceTab.sortDirection === 'asc' }" @click="applyTableSort(entry.column.name, 'asc')"><ArrowUpNarrowWide :size="15" />升序排序</button>
+                    <button type="button" role="menuitem" :disabled="activeConnectionIsEs && (entry.column.name === '_id' || entry.column.name === '_version')" :class="{ active: activeWorkspaceTab.sortColumn === entry.column.name && activeWorkspaceTab.sortDirection === 'desc' }" @click="applyTableSort(entry.column.name, 'desc')"><ArrowDownWideNarrow :size="15" />降序排序</button>
                     <button type="button" role="menuitem" class="remove-sort" :disabled="!activeWorkspaceTab.sortColumn" @click="clearTableSort"><CircleMinus :size="15" />移除所有排序</button>
                     <span class="column-menu-divider" aria-hidden="true" />
                     <button type="button" role="menuitem" @click="addColumnFilter(entry.column.name)"><ListFilter :size="15" />添加筛选</button>
@@ -4200,6 +4346,7 @@ async function importSqlFile(targetDatabase?: string) {
                 :style="frozenColumnStyle(displayIndex, columnEntry.column, columnEntry.sourceIndex)"
                 @focus="selectDataCell(entry.rowIndex, columnEntry.sourceIndex)"
                 @click.stop="handleTableDataCellClick(entry.rowIndex, columnEntry.sourceIndex, columnEntry.column.name)"
+                @dblclick.stop="activeConnectionIsEs && openRowJsonViewer(entry.rowIndex)"
                 @keydown="handleGridCellKeydown($event, entry.rowIndex, columnEntry.sourceIndex, columnEntry.column.name)"
               >
                 <div v-if="isInlineEditingRow(entry.rowIndex) && inlineColumnEditable(columnEntry.column.name) && activeInlineRowEditor?.activeColumn === columnEntry.column.name" class="inline-cell-editor">
@@ -4257,9 +4404,9 @@ async function importSqlFile(targetDatabase?: string) {
           <div class="toolbar-actions table-toolbar-actions">
             <input v-model="activeWorkspaceTab.resultFilter" class="result-search" type="search" aria-label="在当前数据页中搜索" placeholder="页内搜索" />
             <div class="table-primary-actions">
-              <button class="ghost compact" :disabled="busy || Boolean(executingId) || activeQueryConnection?.readOnly || Boolean(activeInlineRowEditor)" @click="startInlineRowInsert"><Plus :size="13" /> 新增</button>
-              <button class="ghost compact" :disabled="busy || Boolean(executingId) || Boolean(activeInlineRowEditor) || activeWorkspaceTab.selectedRowIndex == null || activeQueryConnection?.readOnly || !activeTableHasUniqueKey" @click="startInlineRowEdit()"><Pencil :size="13" /> 编辑</button>
-              <button class="danger compact" :disabled="busy || Boolean(executingId) || activeWorkspaceTab.selectedRowIndex == null || activeQueryConnection?.readOnly || Boolean(activeInlineRowEditor)" @click="deleteSelectedRow"><Trash2 :size="13" /> 删除</button>
+              <button class="ghost compact" :disabled="busy || Boolean(executingId) || activeConnectionWriteBlocked || Boolean(activeInlineRowEditor)" @click="startInlineRowInsert"><Plus :size="13" /> 新增</button>
+              <button class="ghost compact" :disabled="busy || Boolean(executingId) || Boolean(activeInlineRowEditor) || activeWorkspaceTab.selectedRowIndex == null || activeConnectionWriteBlocked || !activeTableHasUniqueKey" @click="startInlineRowEdit()"><Pencil :size="13" /> 编辑</button>
+              <button class="danger compact" :disabled="busy || Boolean(executingId) || activeWorkspaceTab.selectedRowIndex == null || activeConnectionWriteBlocked || Boolean(activeInlineRowEditor)" @click="deleteSelectedRow"><Trash2 :size="13" /> 删除</button>
             </div>
             <div ref="tableActionsMenu" class="table-actions-menu">
               <button type="button" class="ghost compact table-actions-trigger" aria-haspopup="menu" aria-controls="table-actions-panel" :aria-expanded="tableActionsOpen" :disabled="busy || Boolean(executingId) || Boolean(activeInlineRowEditor)" @click="tableActionsOpen = !tableActionsOpen">更多 <ChevronDown :size="13" aria-hidden="true" /></button>
@@ -4269,8 +4416,8 @@ async function importSqlFile(targetDatabase?: string) {
                   <button type="button" role="menuitem" @click="showColumnManager = true"><Columns3 :size="15" aria-hidden="true" />列设置</button>
                   <button type="button" role="menuitem" @click="showResultInsights = true"><ArrowUpDown :size="15" aria-hidden="true" />分析结果</button>
                   <span class="table-actions-label" aria-hidden="true">行操作</span>
-                  <button type="button" role="menuitem" :disabled="!selectedRowIndexes.length || activeQueryConnection?.readOnly" @click="openSelectedRowsBatchEdit"><Pencil :size="15" aria-hidden="true" />批量修改</button>
-                  <button type="button" role="menuitem" class="destructive" :disabled="!selectedRowIndexes.length || activeQueryConnection?.readOnly" @click="deleteSelectedRows"><Trash2 :size="15" aria-hidden="true" />批量删除</button>
+                  <button type="button" role="menuitem" :disabled="!selectedRowIndexes.length || activeConnectionWriteBlocked" @click="openSelectedRowsBatchEdit"><Pencil :size="15" aria-hidden="true" />批量修改</button>
+                  <button type="button" role="menuitem" class="destructive" :disabled="!selectedRowIndexes.length || activeConnectionWriteBlocked" @click="deleteSelectedRows"><Trash2 :size="15" aria-hidden="true" />批量删除</button>
                   <button type="button" role="menuitem" :disabled="!selectedForeignKey" @click="openSelectedForeignKey"><ExternalLink :size="15" aria-hidden="true" />外键跳转</button>
                   <button type="button" role="menuitem" :disabled="activeWorkspaceTab.selectedRowIndex == null" @click="copyResult('row')"><Copy :size="15" aria-hidden="true" />复制当前行</button>
                   <button type="button" role="menuitem" @click="copyResult('page')"><Clipboard :size="15" aria-hidden="true" />复制当前页</button>
@@ -4279,10 +4426,10 @@ async function importSqlFile(targetDatabase?: string) {
                     <button type="button" role="menuitem" @click="commitTransaction"><CircleCheck :size="15" aria-hidden="true" />提交事务</button>
                     <button type="button" role="menuitem" class="destructive" @click="rollbackTransaction"><RotateCcw :size="15" aria-hidden="true" />回滚事务</button>
                   </template>
-                  <button v-else type="button" role="menuitem" :disabled="activeQueryConnection?.readOnly" @click="beginTransaction"><Play :size="15" aria-hidden="true" />开始事务</button>
-                  <button type="button" role="menuitem" :disabled="activeQueryConnection?.readOnly" @click="importIntoCurrentTable"><FileUp :size="15" aria-hidden="true" />导入数据</button>
+                  <button v-else type="button" role="menuitem" :disabled="activeConnectionWriteBlocked" @click="beginTransaction"><Play :size="15" aria-hidden="true" />开始事务</button>
+                  <button type="button" role="menuitem" :disabled="activeConnectionWriteBlocked" @click="importIntoCurrentTable"><FileUp :size="15" aria-hidden="true" />导入数据</button>
                   <span class="table-actions-label" aria-hidden="true">导出</span>
-                  <TableExportControl v-model="exportFormat" :options="EXPORT_FORMATS" :disabled="busy" full-label="整表" @export-page="exportCurrentPage" @export-full="exportFullTable" />
+                  <TableExportControl v-model="exportFormat" :options="EXPORT_FORMATS" :disabled="busy" :full-disabled="activeQueryConnection?.driverKind === 'elasticsearch'" full-label="整表" @export-page="exportCurrentPage" @export-full="exportFullTable" />
                 </div>
               </Transition>
             </div>
@@ -4294,7 +4441,7 @@ async function importSqlFile(targetDatabase?: string) {
 
     <ConnectionDialog v-if="showDialog" :initial="editing" @close="showDialog = false; editing = null" @save="saveConnection" />
 
-    <QueryExportDialog v-if="showQueryExportDialog && displayedResult?.columns.length" v-model="exportFormat" :options="EXPORT_FORMATS" :busy="busy" :full-disabled="!activeWorkspaceTab?.pagingSql" @close="showQueryExportDialog = false" @export-page="showQueryExportDialog = false; exportCurrentPage()" @export-full="showQueryExportDialog = false; exportFullQuery()" />
+    <QueryExportDialog v-if="showQueryExportDialog && displayedResult?.columns.length" v-model="exportFormat" :options="EXPORT_FORMATS" :busy="busy" :full-disabled="!activeWorkspaceTab?.pagingSql || activeQueryConnection?.driverKind === 'elasticsearch'" @close="showQueryExportDialog = false" @export-page="showQueryExportDialog = false; exportCurrentPage()" @export-full="showQueryExportDialog = false; exportFullQuery()" />
 
     <SettingsDialog v-if="showSettings" :initial="settings" :version="appVersion" :checking-update="updateCheckPending" @close="showSettings = false" @save="saveSettings" @diagnostics="showDiagnostics = true" @check-update="checkForUpdates()" />
     <DiagnosticsDialog v-if="showDiagnostics" @close="showDiagnostics = false" />
@@ -4323,6 +4470,16 @@ async function importSqlFile(targetDatabase?: string) {
     />
 
     <CellViewer v-if="cellViewer" :column="cellViewer.column" :value="cellViewer.value" @close="cellViewer = null" />
+
+    <RowJsonViewer
+      v-if="rowJsonViewer"
+      :columns="rowJsonViewer.columns"
+      :row="rowJsonViewer.row"
+      :row-number="rowJsonViewer.rowNumber"
+      :document-id="rowJsonViewer.documentId"
+      :on-save="rowJsonSaveHandler()"
+      @close="rowJsonViewer = null"
+    />
 
     <ImportDataDialog
       v-if="showImportDialog && activeWorkspaceTab?.kind === 'table' && activeWorkspaceTab.connectionId && activeWorkspaceTab.database && activeWorkspaceTab.tableDetail"
@@ -4358,9 +4515,11 @@ async function importSqlFile(targetDatabase?: string) {
         <div class="context-menu-title">{{ contextMenu.target.database }}</div>
         <button role="menuitem" @click="runDatabaseContextAction('open')"><Database :size="14" />打开数据库</button>
         <button role="menuitem" @click="runDatabaseContextAction('refresh')"><RefreshCw :size="14" />刷新对象</button>
-        <button role="menuitem" @click="runDatabaseContextAction('backup')"><Download :size="14" />备份数据库</button>
-        <button role="menuitem" @click="runDatabaseContextAction('restore')"><FileUp :size="14" />恢复 SQL 备份</button>
-        <button role="menuitem" @click="runDatabaseContextAction('compare')"><Braces :size="14" />结构对比</button>
+        <template v-if="activeConnectionKind !== 'elasticsearch'">
+          <button role="menuitem" @click="runDatabaseContextAction('backup')"><Download :size="14" />备份数据库</button>
+          <button role="menuitem" @click="runDatabaseContextAction('restore')"><FileUp :size="14" />恢复 SQL 备份</button>
+          <button role="menuitem" @click="runDatabaseContextAction('compare')"><Braces :size="14" />结构对比</button>
+        </template>
         <div class="context-menu-separator" />
         <button role="menuitem" @click="runDatabaseContextAction('copy')"><Clipboard :size="14" />复制名称</button>
         <div class="context-menu-separator" />
@@ -4368,24 +4527,24 @@ async function importSqlFile(targetDatabase?: string) {
       </template>
 
       <template v-else-if="contextMenu.target.kind === 'table-group'">
-        <div class="context-menu-title">{{ contextMenu.target.database }} · 表</div>
-        <button role="menuitem" @click="runTableGroupContextAction('create')"><Plus :size="14" />新建表</button>
-        <button role="menuitem" @click="runTableGroupContextAction('view')"><Eye :size="14" />新建视图</button>
+        <div class="context-menu-title">{{ contextMenu.target.database }} · {{ tableGroupLabel }}</div>
+        <button role="menuitem" @click="runTableGroupContextAction('create')"><Plus :size="14" />{{ activeConnectionKind === 'elasticsearch' ? '新建索引' : '新建表' }}</button>
+        <button v-if="driverSupportsObjectGroup(activeConnectionKind, 'view')" role="menuitem" @click="runTableGroupContextAction('view')"><Eye :size="14" />新建视图</button>
         <button role="menuitem" @click="runTableGroupContextAction('query')"><FileCode2 :size="14" />新建查询</button>
         <div class="context-menu-separator" />
-        <button role="menuitem" @click="runTableGroupContextAction('toggle')"><ChevronDown v-if="expandedTableGroup" :size="14" /><ChevronRight v-else :size="14" />{{ expandedTableGroup ? '收起表分组' : '展开表分组' }}</button>
-        <button role="menuitem" @click="runTableGroupContextAction('refresh')"><RefreshCw :size="14" />刷新表列表</button>
+        <button role="menuitem" @click="runTableGroupContextAction('toggle')"><ChevronDown v-if="expandedTableGroup" :size="14" /><ChevronRight v-else :size="14" />{{ expandedTableGroup ? `收起${tableGroupLabel}分组` : `展开${tableGroupLabel}分组` }}</button>
+        <button role="menuitem" @click="runTableGroupContextAction('refresh')"><RefreshCw :size="14" />刷新{{ tableGroupLabel }}列表</button>
       </template>
 
       <template v-else-if="contextMenu.target.kind === 'object-group'">
         <div class="context-menu-title">{{ contextMenu.target.database }} · {{ objectGroupLabel(contextMenu.target.group) }}</div>
         <button v-if="contextMenu.target.group === 'view'" role="menuitem" @click="runObjectGroupContextAction('create-view')"><Plus :size="14" />新建视图</button>
         <template v-else-if="contextMenu.target.group === 'routine'">
-          <button role="menuitem" :disabled="activeConnectionKind === 'sqlite'" @click="runObjectGroupContextAction('create-function')"><Plus :size="14" />新建函数</button>
-          <button role="menuitem" :disabled="activeConnectionKind === 'sqlite'" @click="runObjectGroupContextAction('create-procedure')"><Plus :size="14" />新建存储过程</button>
+          <button role="menuitem" @click="runObjectGroupContextAction('create-function')"><Plus :size="14" />新建函数</button>
+          <button role="menuitem" @click="runObjectGroupContextAction('create-procedure')"><Plus :size="14" />新建存储过程</button>
         </template>
         <button v-else-if="contextMenu.target.group === 'trigger'" role="menuitem" @click="runObjectGroupContextAction('create-trigger')"><Plus :size="14" />新建触发器</button>
-        <button v-else role="menuitem" :disabled="activeConnectionKind !== 'mysql' && activeConnectionKind !== 'mariadb'" @click="runObjectGroupContextAction('create-event')"><Plus :size="14" />新建事件</button>
+        <button v-else-if="driverSupportsObjectGroup(activeConnectionKind, 'event')" role="menuitem" @click="runObjectGroupContextAction('create-event')"><Plus :size="14" />新建事件</button>
         <button role="menuitem" @click="runObjectGroupContextAction('new-query')"><FileCode2 :size="14" />新建查询</button>
         <div class="context-menu-separator" />
         <button role="menuitem" @click="runObjectGroupContextAction('toggle')"><ChevronDown v-if="objectGroupExpanded(contextMenu.target.group)" :size="14" /><ChevronRight v-else :size="14" />{{ objectGroupExpanded(contextMenu.target.group) ? `收起${objectGroupLabel(contextMenu.target.group)}` : `展开${objectGroupLabel(contextMenu.target.group)}` }}</button>
@@ -4407,13 +4566,13 @@ async function importSqlFile(targetDatabase?: string) {
         <div class="context-menu-title">{{ contextMenu.target.table.name }}</div>
         <button role="menuitem" @click="runTableContextAction('preview')"><Play :size="14" />预览前 100 行</button>
         <button role="menuitem" @click="runTableContextAction('generate')"><FileCode2 :size="14" />生成 SELECT</button>
-        <button role="menuitem" @click="runTableContextAction('design')"><Pencil :size="14" />{{ contextMenu.target.table.tableType.includes('VIEW') ? '查看视图定义' : '设计表结构' }}</button>
+        <button role="menuitem" @click="runTableContextAction('design')"><Pencil :size="14" />{{ contextMenu.target.table.tableType.includes('VIEW') ? '查看视图定义' : activeConnectionKind === 'elasticsearch' ? '查看 Mapping' : '设计表结构' }}</button>
         <div class="context-menu-separator" />
         <button role="menuitem" @click="runTableContextAction('copy')"><Clipboard :size="14" />复制名称</button>
         <button role="menuitem" @click="runTableContextAction('copy-qualified')"><Clipboard :size="14" />复制完整名称</button>
         <div class="context-menu-separator" />
-        <button v-if="!contextMenu.target.table.tableType.includes('VIEW')" class="destructive" role="menuitem" @click="runTableContextAction('truncate')"><Trash2 :size="14" />清空表</button>
-        <button class="destructive" role="menuitem" @click="runTableContextAction('drop')"><Trash2 :size="14" />删除{{ contextMenu.target.table.tableType.includes('VIEW') ? '视图' : '表' }}</button>
+        <button v-if="!contextMenu.target.table.tableType.includes('VIEW')" class="destructive" role="menuitem" @click="runTableContextAction('truncate')"><Trash2 :size="14" />{{ activeConnectionKind === 'elasticsearch' ? '清空索引' : '清空表' }}</button>
+        <button class="destructive" role="menuitem" @click="runTableContextAction('drop')"><Trash2 :size="14" />删除{{ activeConnectionKind === 'elasticsearch' ? '索引' : contextMenu.target.table.tableType.includes('VIEW') ? '视图' : '表' }}</button>
       </template>
     </ContextMenu>
 

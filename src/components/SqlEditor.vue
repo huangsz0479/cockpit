@@ -6,7 +6,7 @@ import { indentLess, insertTab } from "@codemirror/commands";
 import { syntaxTree } from "@codemirror/language";
 import { Compartment, EditorState, Prec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
-import { sql, MariaSQL, MySQL, PostgreSQL, SQLite } from "@codemirror/lang-sql";
+import { sql, StandardSQL, MariaSQL, MySQL, PostgreSQL, SQLite } from "@codemirror/lang-sql";
 import { isSqlTableNamePosition, sqlCompletionQualifier, sqlTableReferences, type SqlTableReference } from "@/lib/sqlCompletion";
 import {
   codeMirrorExternalTextInput,
@@ -43,6 +43,7 @@ function dialectFor(kind: DatabaseKind) {
   if (kind === "mariadb") return MariaSQL;
   if (kind === "postgresql") return PostgreSQL;
   if (kind === "sqlite") return SQLite;
+  if (kind === "elasticsearch") return StandardSQL;
   return MySQL;
 }
 

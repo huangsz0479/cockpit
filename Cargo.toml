@@ -1,11 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/cockpit-core",
-  "crates/cockpit-mysql",
-  "crates/cockpit-postgres",
-  "crates/cockpit-sqlite",
-  "src-tauri",
+    "crates/cockpit-core",
+    "crates/cockpit-mysql",
+    "crates/cockpit-postgres",
+    "crates/cockpit-sqlite",
+    "crates/cockpit-elasticsearch",
+    "src-tauri",
 ]
 
 [workspace.package]
@@ -25,10 +26,12 @@ csv = "1"
 encoding_rs = "0.8"
 flate2 = "1"
 futures = "0.3"
+log = "0.4"
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls", "chrono", "rust_decimal"] }
 native-tls = "0.2"
 postgres-native-tls = "0.5"
 rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rust_xlsxwriter = "0.96"
 regex = "1"

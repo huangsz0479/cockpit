@@ -3,6 +3,7 @@ import { computed, ref } from "vue";
 import { Activity, Cable, ChevronDown, ChevronRight, Database, LockKeyhole, MemoryStick, Pencil, Plus, Unplug } from "lucide-vue-next";
 import databaseIcon from "../../../src-tauri/icons/database/database.svg";
 import databaseIconSvg from "../../../src-tauri/icons/database/database.svg?raw";
+import elasticsearchIconSvg from "../../../src-tauri/icons/database/elasticsearch.svg?raw";
 import eventIcon from "../../../src-tauri/icons/database/event.svg";
 import functionIcon from "../../../src-tauri/icons/database/fn.svg";
 import mysqlIconSvg from "../../../src-tauri/icons/database/mysql.svg?raw";
@@ -11,6 +12,7 @@ import sqliteIconSvg from "../../../src-tauri/icons/database/sql-lite.svg?raw";
 import tableIcon from "../../../src-tauri/icons/database/Table.svg";
 import triggerIcon from "../../../src-tauri/icons/database/trigger.svg";
 import viewIcon from "../../../src-tauri/icons/database/view.svg";
+import { driverSupportsObjectGroup, driverTableGroupLabel } from "@/lib/driverCapabilities";
 import type { ConnectionInfo, ConnectionProfile, DatabaseInfo, DatabaseKind, DatabaseObjectKind, EventInfo, RoutineInfo, RuntimeStats, TableInfo, TriggerInfo, UUID } from "@/types";
 import type { NavigationContextTarget } from "./types";
 
@@ -78,8 +80,16 @@ const databaseTypeIcons = {
   mysql: inlineSvg(mysqlIconSvg),
   postgresql: inlineSvg(postgresqlIconSvg),
   sqlite: inlineSvg(sqliteIconSvg),
+  elasticsearch: inlineSvg(elasticsearchIconSvg),
 };
 const connectedCount = computed(() => props.connections.filter((connection) => Boolean(props.connectionInfo[connection.id])).length);
+
+const activeDriverKind = computed(() => props.connections.find((connection) => connection.id === props.activeConnectionId)?.driverKind);
+const tableGroupLabel = computed(() => driverTableGroupLabel(activeDriverKind.value));
+const supportsViews = computed(() => driverSupportsObjectGroup(activeDriverKind.value, "view"));
+const supportsRoutines = computed(() => driverSupportsObjectGroup(activeDriverKind.value, "routine"));
+const supportsTriggers = computed(() => driverSupportsObjectGroup(activeDriverKind.value, "trigger"));
+const supportsEvents = computed(() => driverSupportsObjectGroup(activeDriverKind.value, "event"));
 
 function formatMemory(bytes: number | null | undefined) {
   if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return "—";
@@ -94,6 +104,7 @@ function formatMemory(bytes: number | null | undefined) {
 function connectionIcon(kind?: DatabaseKind) {
   if (kind === "postgresql") return databaseTypeIcons.postgresql;
   if (kind === "sqlite") return databaseTypeIcons.sqlite;
+  if (kind === "elasticsearch") return databaseTypeIcons.elasticsearch;
   if (kind === "mysql" || !kind) return databaseTypeIcons.mysql;
   return databaseTypeIcons.generic;
 }
@@ -128,10 +139,11 @@ function toggleConnectionGroup(name: string) {
         <p>添加连接，立即浏览数据结构、编写 SQL 并轻松管理数据。</p>
       </div>
 
-      <div class="navigation-empty-databases" aria-label="支持 MySQL、PostgreSQL 和 SQLite">
+      <div class="navigation-empty-databases" aria-label="支持 MySQL、PostgreSQL、SQLite 和 Elasticsearch">
         <span><i v-html="databaseTypeIcons.mysql" />MySQL</span>
         <span><i v-html="databaseTypeIcons.postgresql" />PostgreSQL</span>
         <span><i v-html="databaseTypeIcons.sqlite" />SQLite</span>
+        <span><i v-html="databaseTypeIcons.elasticsearch" />Elasticsearch</span>
       </div>
 
       <button type="button" class="navigation-empty-action" @click="$emit('add-connection')">
@@ -161,7 +173,7 @@ function toggleConnectionGroup(name: string) {
                 v-html="connectionIcon(connection.driverKind)"
               />
               <span class="tree-label"><strong>{{ connection.name }}</strong><span v-if="connection.production || connection.readOnly" class="connection-badges"><span v-if="connection.production" class="connection-badge production">生产</span><span v-if="connection.readOnly" class="connection-badge readonly">只读</span></span></span>
-              <span class="connection-kind">{{ connection.driverKind === 'postgresql' ? 'PG' : connection.driverKind === 'sqlite' ? 'SQLite' : connection.driverKind === 'mariadb' ? 'MariaDB' : 'MySQL' }}</span>
+              <span class="connection-kind">{{ connection.driverKind === 'postgresql' ? 'PG' : connection.driverKind === 'sqlite' ? 'SQLite' : connection.driverKind === 'mariadb' ? 'MariaDB' : connection.driverKind === 'elasticsearch' ? 'ES' : 'MySQL' }}</span>
             </button>
             <span class="tree-row-actions"><button type="button" class="tree-action" aria-label="编辑连接" @mousedown.stop @click.stop="$emit('edit-connection', connection)"><Pencil :size="13" /></button><button v-if="connectionInfo[connection.id]" type="button" class="tree-action" aria-label="断开连接" @mousedown.stop @click.stop="$emit('disconnect-connection', connection.id)"><Unplug :size="13" /></button></span>
             <span class="status-dot" :class="{ online: connectionInfo[connection.id] }" />
@@ -179,24 +191,24 @@ function toggleConnectionGroup(name: string) {
                 </div>
 
                 <div v-if="expandedDatabase === database.name" class="tree-branch database-children">
-                  <button class="tree-row object-group-title" @click="expandedTableGroup = !expandedTableGroup" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'table-group', database: database.name })"><ChevronDown v-if="expandedTableGroup" :size="12" /><ChevronRight v-else :size="12" /><img class="table-symbol" :src="tableIcon" alt="" aria-hidden="true" /><span>表</span><small>{{ filteredBaseTables.length }}</small></button>
+                  <button class="tree-row object-group-title" @click="expandedTableGroup = !expandedTableGroup" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'table-group', database: database.name })"><ChevronDown v-if="expandedTableGroup" :size="12" /><ChevronRight v-else :size="12" /><img class="table-symbol" :src="tableIcon" alt="" aria-hidden="true" /><span>{{ tableGroupLabel }}</span><small>{{ filteredBaseTables.length }}</small></button>
                   <template v-if="expandedTableGroup">
                     <button v-for="table in filteredBaseTables" :key="table.name" class="tree-row object-node" :class="{ active: selectedTable?.name === table.name }" @click="$emit('highlight-table', table)" @dblclick="$emit('preview-table', table)" @keydown.enter.prevent="$emit('preview-table', table)" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'table', table })"><img class="table-symbol" :src="tableIcon" alt="" aria-hidden="true" /><span class="node-name">{{ table.name }}</span></button>
                   </template>
 
-                  <button class="tree-row object-group-title" @click="expandedViewGroup = !expandedViewGroup" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object-group', database: database.name, group: 'view' })"><ChevronDown v-if="expandedViewGroup" :size="12" /><ChevronRight v-else :size="12" /><img class="view-symbol" :src="viewIcon" alt="" aria-hidden="true" /><span>视图</span><small>{{ filteredViews.length }}</small></button>
-                  <template v-if="expandedViewGroup">
+                  <button v-if="supportsViews" class="tree-row object-group-title" @click="expandedViewGroup = !expandedViewGroup" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object-group', database: database.name, group: 'view' })"><ChevronDown v-if="expandedViewGroup" :size="12" /><ChevronRight v-else :size="12" /><img class="view-symbol" :src="viewIcon" alt="" aria-hidden="true" /><span>视图</span><small>{{ filteredViews.length }}</small></button>
+                  <template v-if="expandedViewGroup && supportsViews">
                     <button v-for="table in filteredViews" :key="table.name" class="tree-row object-node" :class="{ active: selectedTable?.name === table.name }" @click="$emit('highlight-table', table)" @dblclick="$emit('preview-table', table)" @keydown.enter.prevent="$emit('preview-table', table)" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'table', table })"><img class="view-symbol" :src="viewIcon" alt="" aria-hidden="true" /><span class="node-name">{{ table.name }}</span></button>
                   </template>
 
-                  <button class="tree-row object-group-title" @click="expandedFunctionGroup = !expandedFunctionGroup" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object-group', database: database.name, group: 'routine' })"><ChevronDown v-if="expandedFunctionGroup" :size="12" /><ChevronRight v-else :size="12" /><img class="routine-symbol" :src="functionIcon" alt="" aria-hidden="true" /><span>函数</span><small>{{ filteredRoutines.length }}</small></button>
-                  <template v-if="expandedFunctionGroup"><button v-for="routine in filteredRoutines" :key="routine.routineType + routine.name" class="tree-row object-node metadata-node" @dblclick="$emit('open-database-object', routine.database, routineKind(routine), routine.name)" @keydown.enter.prevent="$emit('open-database-object', routine.database, routineKind(routine), routine.name)" @keydown.space.prevent="$emit('open-database-object', routine.database, routineKind(routine), routine.name)" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object', database: routine.database, objectKind: routineKind(routine), name: routine.name, label: routine.routineType === 'FUNCTION' ? '函数' : '存储过程' })"><img class="routine-symbol" :src="functionIcon" alt="" aria-hidden="true" /><span class="node-name">{{ routine.name }}</span><small>{{ routine.routineType }}</small></button></template>
+                  <button v-if="supportsRoutines" class="tree-row object-group-title" @click="expandedFunctionGroup = !expandedFunctionGroup" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object-group', database: database.name, group: 'routine' })"><ChevronDown v-if="expandedFunctionGroup" :size="12" /><ChevronRight v-else :size="12" /><img class="routine-symbol" :src="functionIcon" alt="" aria-hidden="true" /><span>函数</span><small>{{ filteredRoutines.length }}</small></button>
+                  <template v-if="expandedFunctionGroup && supportsRoutines"><button v-for="routine in filteredRoutines" :key="routine.routineType + routine.name" class="tree-row object-node metadata-node" @dblclick="$emit('open-database-object', routine.database, routineKind(routine), routine.name)" @keydown.enter.prevent="$emit('open-database-object', routine.database, routineKind(routine), routine.name)" @keydown.space.prevent="$emit('open-database-object', routine.database, routineKind(routine), routine.name)" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object', database: routine.database, objectKind: routineKind(routine), name: routine.name, label: routine.routineType === 'FUNCTION' ? '函数' : '存储过程' })"><img class="routine-symbol" :src="functionIcon" alt="" aria-hidden="true" /><span class="node-name">{{ routine.name }}</span><small>{{ routine.routineType }}</small></button></template>
 
-                  <button class="tree-row object-group-title" @click="expandedEventGroup = !expandedEventGroup" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object-group', database: database.name, group: 'event' })"><ChevronDown v-if="expandedEventGroup" :size="12" /><ChevronRight v-else :size="12" /><img class="event-symbol" :src="eventIcon" alt="" aria-hidden="true" /><span>事件</span><small>{{ filteredEvents.length }}</small></button>
-                  <template v-if="expandedEventGroup"><button v-for="event in filteredEvents" :key="event.name" class="tree-row object-node metadata-node" @dblclick="$emit('open-database-object', event.database, 'event', event.name)" @keydown.enter.prevent="$emit('open-database-object', event.database, 'event', event.name)" @keydown.space.prevent="$emit('open-database-object', event.database, 'event', event.name)" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object', database: event.database, objectKind: 'event', name: event.name, label: '事件', status: event.status })"><img class="event-symbol" :src="eventIcon" alt="" aria-hidden="true" /><span class="node-name">{{ event.name }}</span><small>{{ event.status }}</small></button></template>
+                  <button v-if="supportsEvents" class="tree-row object-group-title" @click="expandedEventGroup = !expandedEventGroup" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object-group', database: database.name, group: 'event' })"><ChevronDown v-if="expandedEventGroup" :size="12" /><ChevronRight v-else :size="12" /><img class="event-symbol" :src="eventIcon" alt="" aria-hidden="true" /><span>事件</span><small>{{ filteredEvents.length }}</small></button>
+                  <template v-if="expandedEventGroup && supportsEvents"><button v-for="event in filteredEvents" :key="event.name" class="tree-row object-node metadata-node" @dblclick="$emit('open-database-object', event.database, 'event', event.name)" @keydown.enter.prevent="$emit('open-database-object', event.database, 'event', event.name)" @keydown.space.prevent="$emit('open-database-object', event.database, 'event', event.name)" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object', database: event.database, objectKind: 'event', name: event.name, label: '事件', status: event.status })"><img class="event-symbol" :src="eventIcon" alt="" aria-hidden="true" /><span class="node-name">{{ event.name }}</span><small>{{ event.status }}</small></button></template>
 
-                  <button class="tree-row object-group-title" @click="expandedTriggerGroup = !expandedTriggerGroup" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object-group', database: database.name, group: 'trigger' })"><ChevronDown v-if="expandedTriggerGroup" :size="12" /><ChevronRight v-else :size="12" /><img class="trigger-symbol" :src="triggerIcon" alt="" aria-hidden="true" /><span>触发器</span><small>{{ filteredTriggers.length }}</small></button>
-                  <template v-if="expandedTriggerGroup"><button v-for="trigger in filteredTriggers" :key="trigger.name" class="tree-row object-node metadata-node" @dblclick="$emit('open-database-object', trigger.database, 'trigger', trigger.name)" @keydown.enter.prevent="$emit('open-database-object', trigger.database, 'trigger', trigger.name)" @keydown.space.prevent="$emit('open-database-object', trigger.database, 'trigger', trigger.name)" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object', database: trigger.database, objectKind: 'trigger', name: trigger.name, label: '触发器' })"><img class="trigger-symbol" :src="triggerIcon" alt="" aria-hidden="true" /><span class="node-name">{{ trigger.name }}</span><small>{{ trigger.timing }} {{ trigger.event }}</small></button></template>
+                  <button v-if="supportsTriggers" class="tree-row object-group-title" @click="expandedTriggerGroup = !expandedTriggerGroup" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object-group', database: database.name, group: 'trigger' })"><ChevronDown v-if="expandedTriggerGroup" :size="12" /><ChevronRight v-else :size="12" /><img class="trigger-symbol" :src="triggerIcon" alt="" aria-hidden="true" /><span>触发器</span><small>{{ filteredTriggers.length }}</small></button>
+                  <template v-if="expandedTriggerGroup && supportsTriggers"><button v-for="trigger in filteredTriggers" :key="trigger.name" class="tree-row object-node metadata-node" @dblclick="$emit('open-database-object', trigger.database, 'trigger', trigger.name)" @keydown.enter.prevent="$emit('open-database-object', trigger.database, 'trigger', trigger.name)" @keydown.space.prevent="$emit('open-database-object', trigger.database, 'trigger', trigger.name)" @contextmenu.prevent="$emit('context-menu', $event, { kind: 'object', database: trigger.database, objectKind: 'trigger', name: trigger.name, label: '触发器' })"><img class="trigger-symbol" :src="triggerIcon" alt="" aria-hidden="true" /><span class="node-name">{{ trigger.name }}</span><small>{{ trigger.timing }} {{ trigger.event }}</small></button></template>
                   <div v-if="tableHasMore" class="load-more">继续滚动加载</div>
                 </div>
               </div>

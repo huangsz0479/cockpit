@@ -1037,6 +1037,7 @@ async fn simple_stream_to_page(
         row_offset: first.row_offset,
         page_size: first.page_size,
         additional_result_sets: sets,
+        source_table: None,
     })
 }
 

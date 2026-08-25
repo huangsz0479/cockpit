@@ -475,7 +475,7 @@ fn quote_identifier(identifier: &str, database_kind: DatabaseKind) -> String {
         DatabaseKind::MySql | DatabaseKind::MariaDb => {
             format!("`{}`", identifier.replace('`', "``"))
         }
-        DatabaseKind::PostgreSql | DatabaseKind::Sqlite => {
+        DatabaseKind::PostgreSql | DatabaseKind::Sqlite | DatabaseKind::Elasticsearch => {
             format!("\"{}\"", identifier.replace('"', "\"\""))
         }
     }
@@ -499,24 +499,28 @@ fn sql_literal(value: &CellValue, database_kind: DatabaseKind) -> Result<String>
         | CellValue::DateTime(value)
         | CellValue::Json(value) => Ok(match database_kind {
             DatabaseKind::MySql | DatabaseKind::MariaDb => mysql_utf8_literal(value),
-            DatabaseKind::PostgreSql | DatabaseKind::Sqlite => quote_sql_string(value),
+            DatabaseKind::PostgreSql | DatabaseKind::Sqlite | DatabaseKind::Elasticsearch => {
+                quote_sql_string(value)
+            }
         }),
         CellValue::Bytes { base64, .. } => {
             let hex = decode_hex(base64)?;
             Ok(match database_kind {
                 DatabaseKind::PostgreSql => format!("decode('{hex}', 'hex')"),
-                DatabaseKind::MySql | DatabaseKind::MariaDb | DatabaseKind::Sqlite => {
-                    format!("X'{hex}'")
-                }
+                DatabaseKind::MySql
+                | DatabaseKind::MariaDb
+                | DatabaseKind::Sqlite
+                | DatabaseKind::Elasticsearch => format!("X'{hex}'"),
             })
         }
         CellValue::Geometry { wkb_base64, srid } => {
             let hex = decode_hex(wkb_base64)?;
             let bytes = match database_kind {
                 DatabaseKind::PostgreSql => format!("decode('{hex}', 'hex')"),
-                DatabaseKind::MySql | DatabaseKind::MariaDb | DatabaseKind::Sqlite => {
-                    format!("X'{hex}'")
-                }
+                DatabaseKind::MySql
+                | DatabaseKind::MariaDb
+                | DatabaseKind::Sqlite
+                | DatabaseKind::Elasticsearch => format!("X'{hex}'"),
             };
             Ok(srid.map_or_else(
                 || format!("ST_GeomFromWKB({bytes})"),
@@ -671,6 +675,7 @@ mod tests {
             row_offset: 0,
             page_size: 500,
             additional_result_sets: vec![],
+            source_table: None,
         }
     }
 

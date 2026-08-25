@@ -60,6 +60,7 @@ pub enum DatabaseKind {
     MariaDb,
     PostgreSql,
     Sqlite,
+    Elasticsearch,
 }
 
 impl ConnectionProfile {
@@ -72,7 +73,10 @@ impl ConnectionProfile {
         if self.host.trim().is_empty() {
             return Err(crate::CockpitError::InvalidConfig("主机不能为空".into()));
         }
-        if self.driver_kind != DatabaseKind::Sqlite && self.username.trim().is_empty() {
+        if self.driver_kind != DatabaseKind::Sqlite
+            && self.driver_kind != DatabaseKind::Elasticsearch
+            && self.username.trim().is_empty()
+        {
             return Err(crate::CockpitError::InvalidConfig("用户名不能为空".into()));
         }
         if self.port == 0 {
@@ -414,6 +418,10 @@ pub struct QueryResultPage {
     pub page_size: usize,
     #[serde(default)]
     pub additional_result_sets: Vec<QueryResultSet>,
+    /// 结果行所属的数据源对象（Elasticsearch `_search` 路径为索引名），
+    /// 供前端按整文档编辑后写回；普通 SQL 查询不设置。
+    #[serde(default)]
+    pub source_table: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

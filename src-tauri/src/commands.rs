@@ -23,6 +23,7 @@ use cockpit_core::{
     ServerVariable, SqlAssessment, TableDetail, TableInfo, TriggerInfo, UserAccount,
     safety::assess_sql, write_result_page,
 };
+use cockpit_elasticsearch::ElasticsearchDriver;
 use cockpit_mysql::MySqlDriver;
 use cockpit_postgres::PostgresDriver;
 use cockpit_sqlite::SqliteDriver;
@@ -30,6 +31,7 @@ use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rand_core::{OsRng, RngCore};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
@@ -409,6 +411,7 @@ pub async fn test_connection(
         }
         DatabaseKind::Sqlite => SqliteDriver.test(&request.profile, "").await,
         DatabaseKind::PostgreSql => PostgresDriver.test(&request.profile, &password).await,
+        DatabaseKind::Elasticsearch => ElasticsearchDriver.test(&request.profile, &password).await,
     }
     .map_err(payload)
 }
@@ -435,6 +438,7 @@ async fn open_driver_session(
         DatabaseKind::MySql | DatabaseKind::MariaDb => MySqlDriver.open(profile, password).await,
         DatabaseKind::Sqlite => SqliteDriver.open(profile, String::new()).await,
         DatabaseKind::PostgreSql => PostgresDriver.open(profile, password).await,
+        DatabaseKind::Elasticsearch => ElasticsearchDriver.open(profile, password).await,
     }
     .map_err(payload)
 }
@@ -1007,6 +1011,62 @@ pub async fn mutate_row(
 }
 
 #[tauri::command]
+pub async fn update_document(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    session_id: Option<Uuid>,
+    index: String,
+    document_id: String,
+    source: Value,
+) -> CommandResult<()> {
+    data_session(&state, connection_id, session_id)
+        .await?
+        .update_document(&index, &document_id, &source)
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn delete_index(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    index: String,
+) -> CommandResult<()> {
+    session(&state, connection_id)
+        .await?
+        .delete_index(&index)
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn clear_index(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    index: String,
+) -> CommandResult<u64> {
+    session(&state, connection_id)
+        .await?
+        .clear_index(&index)
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
+pub async fn create_index(
+    state: State<'_, Arc<AppState>>,
+    connection_id: Uuid,
+    name: String,
+    body: Option<Value>,
+) -> CommandResult<()> {
+    session(&state, connection_id)
+        .await?
+        .create_index(&name, body.as_ref())
+        .await
+        .map_err(payload)
+}
+
+#[tauri::command]
 pub async fn begin_transaction(
     state: State<'_, Arc<AppState>>,
     connection_id: Uuid,
@@ -1117,6 +1177,11 @@ pub async fn export_table(
         .map_err(payload)?
         .ok_or_else(|| payload(CockpitError::NotFound("连接配置不存在".into())))?
         .driver_kind;
+    if driver_kind == DatabaseKind::Elasticsearch {
+        return Err(payload(CockpitError::Unsupported(
+            "Elasticsearch 连接暂不支持整表流式导出，可先查询后导出当前页".into(),
+        )));
+    }
     let session = session(&state, connection_id).await?;
     emit_export_progress(
         &app,
@@ -1347,6 +1412,11 @@ pub async fn export_query(
         .map_err(payload)?
         .ok_or_else(|| payload(CockpitError::NotFound("连接配置不存在".into())))?
         .driver_kind;
+    if driver_kind == DatabaseKind::Elasticsearch {
+        return Err(payload(CockpitError::Unsupported(
+            "Elasticsearch 连接暂不支持完整结果导出，可导出当前页".into(),
+        )));
+    }
     let session = session(&state, connection_id).await?;
     emit_export_progress(
         &app,
@@ -1690,6 +1760,11 @@ pub async fn backup_database(
         .map_err(payload)?
         .ok_or_else(|| payload(CockpitError::NotFound("连接配置不存在".into())))?
         .driver_kind;
+    if driver_kind == DatabaseKind::Elasticsearch {
+        return Err(payload(CockpitError::Unsupported(
+            "Elasticsearch 连接暂不支持 SQL 备份".into(),
+        )));
+    }
     let session = session(&state, connection_id).await?;
     if session.transaction_active().await {
         return Err(payload(CockpitError::Query(
@@ -1788,6 +1863,7 @@ pub async fn backup_database(
             DatabaseKind::Sqlite => {
                 writeln!(output, "PRAGMA foreign_keys=OFF;\n").map_err(exchange_error)?;
             }
+            DatabaseKind::Elasticsearch => {}
         }
 
         let tables = list_all_tables(&session, &database).await?;
@@ -2149,7 +2225,7 @@ pub async fn backup_database(
             DatabaseKind::Sqlite => {
                 writeln!(output, "PRAGMA foreign_keys=ON;").map_err(exchange_error)?
             }
-            DatabaseKind::PostgreSql => {}
+            DatabaseKind::PostgreSql | DatabaseKind::Elasticsearch => {}
         }
         output.flush().map_err(exchange_error)?;
         output.get_ref().sync_all().map_err(exchange_error)?;
@@ -2647,6 +2723,11 @@ async fn import_data_inner(
         .get_connection(request.connection_id)?
         .ok_or_else(|| CockpitError::NotFound("连接配置不存在".into()))?
         .driver_kind;
+    if driver_kind == DatabaseKind::Elasticsearch {
+        return Err(CockpitError::Unsupported(
+            "Elasticsearch 连接暂不支持数据导入".into(),
+        ));
+    }
     let session = state
         .sessions
         .read()
@@ -3881,7 +3962,7 @@ fn quote_identifier(value: &str) -> String {
 fn backup_quote_identifier(value: &str, database_kind: DatabaseKind) -> String {
     match database_kind {
         DatabaseKind::MySql | DatabaseKind::MariaDb => quote_identifier(value),
-        DatabaseKind::PostgreSql | DatabaseKind::Sqlite => {
+        DatabaseKind::PostgreSql | DatabaseKind::Sqlite | DatabaseKind::Elasticsearch => {
             format!("\"{}\"", value.replace('"', "\"\""))
         }
     }
@@ -4121,9 +4202,12 @@ fn keyset_literal(value: &CellValue, database_kind: DatabaseKind) -> Option<Stri
             DatabaseKind::MySql | DatabaseKind::MariaDb => {
                 text.replace('\\', "\\\\").replace('\'', "''")
             }
-            // PostgreSQL (standard_conforming_strings) and SQLite treat
-            // backslash literally; only single quotes need doubling.
-            DatabaseKind::PostgreSql | DatabaseKind::Sqlite => text.replace('\'', "''"),
+            // PostgreSQL (standard_conforming_strings), SQLite and
+            // Elasticsearch treat backslash literally; only single quotes
+            // need doubling.
+            DatabaseKind::PostgreSql | DatabaseKind::Sqlite | DatabaseKind::Elasticsearch => {
+                text.replace('\'', "''")
+            }
         };
         format!("'{escaped}'")
     };
@@ -4133,9 +4217,10 @@ fn keyset_literal(value: &CellValue, database_kind: DatabaseKind) -> Option<Stri
             .map(|byte| format!("{byte:02X}"))
             .collect::<String>();
         match database_kind {
-            DatabaseKind::MySql | DatabaseKind::MariaDb | DatabaseKind::Sqlite => {
-                format!("X'{hex}'")
-            }
+            DatabaseKind::MySql
+            | DatabaseKind::MariaDb
+            | DatabaseKind::Sqlite
+            | DatabaseKind::Elasticsearch => format!("X'{hex}'"),
             DatabaseKind::PostgreSql => format!("'\\x{hex}'"),
         }
     };

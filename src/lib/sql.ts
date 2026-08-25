@@ -10,8 +10,20 @@ export function quoteIdentifier(identifier: string, databaseKind: DatabaseKind =
     : `"${identifier.replace(/"/g, "\"\"")}"`;
 }
 
+// Elasticsearch SQL 的 FROM 只接受索引名，不带库名限定。
+function qualifiedTableName(database: string, table: string, databaseKind: DatabaseKind): string {
+  return databaseKind === "elasticsearch"
+    ? quoteIdentifier(table, databaseKind)
+    : `${quoteIdentifier(database, databaseKind)}.${quoteIdentifier(table, databaseKind)}`;
+}
+
+// Elasticsearch SQL 解析器不接受尾部分号。
+function statementTerminator(databaseKind: DatabaseKind): string {
+  return databaseKind === "elasticsearch" ? "" : ";";
+}
+
 export function selectPreviewSql(database: string, table: string, databaseKind: DatabaseKind = "mysql"): string {
-  return `SELECT *\nFROM ${quoteIdentifier(database, databaseKind)}.${quoteIdentifier(table, databaseKind)}\nLIMIT 100;`;
+  return `SELECT *\nFROM ${qualifiedTableName(database, table, databaseKind)}\nLIMIT 100${statementTerminator(databaseKind)}`;
 }
 
 export function selectTablePageSql(
@@ -29,7 +41,11 @@ export function selectTablePageSql(
   const orderClause = sortColumn
     ? `\nORDER BY ${quoteIdentifier(sortColumn, databaseKind)} ${sortDirection.toUpperCase()}`
     : "";
-  return `SELECT *\nFROM ${quoteIdentifier(database, databaseKind)}.${quoteIdentifier(table, databaseKind)}${whereClause}${orderClause}\nLIMIT ${Math.max(1, pageSize) + 1} OFFSET ${Math.max(0, offset)};`;
+  // Elasticsearch SQL 只有 LIMIT 没有 OFFSET，深分页由后端游标完成。
+  const pageClause = databaseKind === "elasticsearch"
+    ? ""
+    : `\nLIMIT ${Math.max(1, pageSize) + 1} OFFSET ${Math.max(0, offset)}${statementTerminator(databaseKind)}`;
+  return `SELECT *\nFROM ${qualifiedTableName(database, table, databaseKind)}${whereClause}${orderClause}${pageClause}`;
 }
 
 export function selectQueryPageSql(sql: string, pageSize: number, offset: number, databaseKind: DatabaseKind = "mysql"): string {

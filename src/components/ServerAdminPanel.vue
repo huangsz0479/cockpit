@@ -12,8 +12,8 @@ const props = withDefaults(defineProps<{ connectionId: UUID; databaseKind?: Data
 const emit = defineEmits<{ close: []; openSql: [sql: string] }>();
 const { actionDialog, confirmAction, acceptActionDialog, cancelActionDialog } = useActionDialog();
 type AdminTab = "processes" | "status" | "variables" | "locks" | "replication" | "users";
-const tab = ref<AdminTab>(props.databaseKind === "sqlite" ? "status" : "processes");
-const tabs = computed<AdminTab[]>(() => props.databaseKind === "sqlite"
+const tab = ref<AdminTab>(props.databaseKind === "sqlite" || props.databaseKind === "elasticsearch" ? "status" : "processes");
+const tabs = computed<AdminTab[]>(() => props.databaseKind === "sqlite" || props.databaseKind === "elasticsearch"
   ? ["status"]
   : props.databaseKind === "mysql" || props.databaseKind === "mariadb"
     ? ["processes", "status", "variables", "locks", "replication", "users"]

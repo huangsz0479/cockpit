@@ -893,6 +893,7 @@ fn execute_sync(connection: &Connection, request: ExecuteQueryRequest) -> Result
         row_offset,
         page_size,
         additional_result_sets: Vec::new(),
+        source_table: None,
     })
 }
 
@@ -916,6 +917,7 @@ fn empty_result(
         row_offset,
         page_size,
         additional_result_sets: Vec::new(),
+        source_table: None,
     }
 }
 

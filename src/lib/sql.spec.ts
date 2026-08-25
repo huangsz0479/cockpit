@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { alterTableSql, canAppendSelectQueryLimit, canPageSelectQuery, createDefaultTableDefinition, createTableSql, quoteIdentifier, quoteMysqlIdentifier, selectPreviewSql, selectQueryPageSql, selectTablePageSql, singleTableSelectAllTargets, tableDetailToDefinition, validateCreateTableDefinition } from "./sql";
 
+describe("Elasticsearch SQL helpers", () => {
+  it("omits the database qualifier and trailing semicolon for Elasticsearch", () => {
+    expect(selectPreviewSql("cluster", "card-info", "elasticsearch")).toBe(
+      'SELECT *\nFROM "card-info"\nLIMIT 100',
+    );
+    expect(selectTablePageSql("cluster", "card-info", 100, 200, "", null, "asc", "elasticsearch")).toBe(
+      'SELECT *\nFROM "card-info"',
+    );
+  });
+});
+
 describe("MySQL identifier SQL helpers", () => {
   it("quotes identifiers and escapes embedded backticks", () => {
     expect(quoteMysqlIdentifier("odd`name")).toBe("`odd``name`");

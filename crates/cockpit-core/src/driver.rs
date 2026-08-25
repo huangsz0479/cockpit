@@ -85,6 +85,35 @@ pub trait DriverSession: Send + Sync {
         }
         self.insert_rows(database, table, columns, rows).await
     }
+    /// 按主标识整对象更新一行（Elasticsearch 文档按 `_id` 全量替换）。
+    async fn update_document(
+        &self,
+        _index: &str,
+        _document_id: &str,
+        _source: &serde_json::Value,
+    ) -> Result<()> {
+        Err(crate::CockpitError::Unsupported(
+            "当前数据库驱动不支持整文档更新".into(),
+        ))
+    }
+    /// 删除整个索引及其全部文档（Elasticsearch `DELETE /{index}`）。
+    async fn delete_index(&self, _index: &str) -> Result<()> {
+        Err(crate::CockpitError::Unsupported(
+            "当前数据库驱动不支持删除索引".into(),
+        ))
+    }
+    /// 清空索引中的全部文档但保留索引与 mapping，返回删除的文档数。
+    async fn clear_index(&self, _index: &str) -> Result<u64> {
+        Err(crate::CockpitError::Unsupported(
+            "当前数据库驱动不支持清空索引".into(),
+        ))
+    }
+    /// 创建索引（Elasticsearch `PUT /{index}`），body 可选携带 settings/mappings。
+    async fn create_index(&self, _name: &str, _body: Option<&serde_json::Value>) -> Result<()> {
+        Err(crate::CockpitError::Unsupported(
+            "当前数据库驱动不支持创建索引".into(),
+        ))
+    }
     async fn begin_transaction(&self) -> Result<()>;
     async fn begin_read_transaction(&self) -> Result<()> {
         self.begin_transaction().await

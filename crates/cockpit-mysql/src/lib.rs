@@ -1331,6 +1331,7 @@ async fn execute_on_connection(
         row_offset,
         page_size,
         additional_result_sets: result_sets.collect(),
+        source_table: None,
     })
 }
 

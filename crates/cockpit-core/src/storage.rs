@@ -45,11 +45,17 @@ impl Storage {
             .map_err(|_| CockpitError::Storage("本地数据库锁已损坏".into()))?;
         let mut statement = connection.prepare("SELECT profile_json FROM connections ORDER BY json_extract(profile_json, '$.name') COLLATE NOCASE")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.map(|row| {
+        let mut profiles = Vec::new();
+        for row in rows {
             let json = row?;
-            Ok(serde_json::from_str(&json)?)
-        })
-        .collect()
+            // 跳过无法解析的记录（例如来自更高版本的驱动类型），
+            // 避免单条坏数据导致整个连接列表加载失败。
+            match serde_json::from_str(&json) {
+                Ok(profile) => profiles.push(profile),
+                Err(error) => log::warn!("跳过无法解析的连接配置：{error}"),
+            }
+        }
+        Ok(profiles)
     }
 
     pub fn get_connection(&self, id: Uuid) -> Result<Option<ConnectionProfile>> {
@@ -64,7 +70,13 @@ impl Storage {
             return Ok(None);
         };
         let json: String = row.get(0)?;
-        Ok(Some(serde_json::from_str(&json)?))
+        // 与 list_connections 一致：无法解析的记录视为不存在，而不是拖垮调用方。
+        Ok(serde_json::from_str(&json)
+            .map_err(|error| {
+                log::warn!("跳过无法解析的连接配置 {id}：{error}");
+                error
+            })
+            .ok())
     }
 
     pub fn save_connection(&self, profile: &ConnectionProfile) -> Result<()> {
@@ -153,6 +165,42 @@ mod tests {
         };
         storage.save_connection(&profile).unwrap();
         assert_eq!(storage.get_connection(profile.id).unwrap(), Some(profile));
+    }
+
+    #[test]
+    fn unparsable_profiles_are_skipped_instead_of_failing_the_list() {
+        let storage = Storage::open(":memory:").unwrap();
+        let connection = storage.connection.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO connections(id, profile_json, updated_at) VALUES ('legacy', '{\"driver_kind\":\"redis\"}', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let profile = ConnectionProfile {
+            id: Uuid::new_v4(),
+            driver_kind: crate::DatabaseKind::MySql,
+            group: None,
+            name: "Local".into(),
+            host: "127.0.0.1".into(),
+            port: 3306,
+            username: "root".into(),
+            database: None,
+            tls: TlsOptions::default(),
+            ssh: None,
+            connect_timeout_secs: 5,
+            query_timeout_secs: 30,
+            pool_size: 5,
+            read_only: false,
+            production: false,
+            color: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        storage.save_connection(&profile).unwrap();
+        assert_eq!(storage.list_connections().unwrap(), vec![profile]);
+        assert_eq!(storage.get_connection(Uuid::new_v4()).unwrap(), None);
     }
 
     #[test]
