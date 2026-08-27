@@ -50,6 +50,16 @@ fn ensure_writable(read_only: bool) -> Result<()> {
     Ok(())
 }
 
+/// pg_terminate_backend 接收 int4 参数：超出范围的 u64 用 `as i32` 强转会
+/// 回绕成错误的（甚至正在使用的）进程号，必须在发送前校验范围。
+fn validate_process_pid(process_id: u64) -> Result<i32> {
+    i32::try_from(process_id).map_err(|_| {
+        CockpitError::InvalidConfig(format!(
+            "无效的进程 ID：{process_id}，超出 PostgreSQL 会话 ID 范围"
+        ))
+    })
+}
+
 fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -436,10 +446,12 @@ impl DriverSession for PostgresSession {
         }).await
     }
 
+    /// 先校验 PID 范围再下发终止命令，避免 `as i32` 回绕误伤其他会话。
     async fn kill_process(&self, process_id: u64) -> Result<()> {
+        let process_id = validate_process_pid(process_id)?;
         self.with_client(async move |client| {
             let stopped: bool = client
-                .query_one("SELECT pg_terminate_backend($1)", &[&(process_id as i32)])
+                .query_one("SELECT pg_terminate_backend($1)", &[&process_id])
                 .await
                 .map_err(query_error)?
                 .get(0);
@@ -1111,5 +1123,20 @@ mod tests {
         }
         assert!(page.rows.is_empty());
         assert!(!page.has_more);
+    }
+
+    #[test]
+    fn process_pid_must_fit_postgres_int4() {
+        assert_eq!(validate_process_pid(0).unwrap(), 0);
+        assert_eq!(validate_process_pid(12345).unwrap(), 12345);
+        assert_eq!(validate_process_pid(i32::MAX as u64).unwrap(), i32::MAX);
+        // 超过 int4 范围的 PID 不能被静默回绕成错误会话。
+        assert!(
+            matches!(validate_process_pid(i32::MAX as u64 + 1), Err(CockpitError::InvalidConfig(message)) if message.contains("无效的进程 ID"))
+        );
+        assert!(matches!(
+            validate_process_pid(u64::MAX),
+            Err(CockpitError::InvalidConfig(_))
+        ));
     }
 }
