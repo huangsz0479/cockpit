@@ -9,7 +9,7 @@ use base64::Engine as _;
 use cockpit_core::{
     CellValue, CockpitError, ColumnInfo, ColumnMeta, ConnectionInfo, ConnectionProfile,
     DatabaseDriver, DatabaseInfo, DatabaseObjectDefinition, DatabaseObjectKind, DriverSession,
-    EventInfo, ExecuteQueryRequest, ForeignKeyInfo, ImportConflictPolicy, IndexInfo,
+    EventInfo, ExecuteQueryRequest, ForeignKeyInfo, ImportConflictPolicy, IndexInfo, QueryMessage,
     QueryResultPage, Result, RiskLevel, RoutineInfo, RoutineParameter, RowMutationKind,
     RowMutationRequest, RowMutationResult, ServerMetric, ServerProcessInfo, TableDetail, TableInfo,
     TriggerInfo, UserAccount, safety::assess_sql,
@@ -830,6 +830,12 @@ fn execute_sync(connection: &Connection, request: ExecuteQueryRequest) -> Result
     let row_offset = request.row_offset;
     let mut statement = connection.prepare(&request.sql).map_err(sqlite_error)?;
     let column_count = statement.column_count();
+    // rusqlite compiles only the script's first statement; remember what
+    // follows so it can run once this result set has been consumed.
+    let pending_tail = match column_count {
+        0 => None,
+        _ => remainder_after_first_statement(&request.sql),
+    };
     if column_count == 0 {
         drop(statement);
         let affected_rows = connection
@@ -880,6 +886,15 @@ fn execute_sync(connection: &Connection, request: ExecuteQueryRequest) -> Result
     }
     drop(cursor);
     drop(statement);
+    let mut messages = Vec::new();
+    if let Some(tail) = pending_tail {
+        connection.execute_batch(&tail).map_err(sqlite_error)?;
+        messages.push(QueryMessage {
+            severity: "info".into(),
+            code: None,
+            message: "首条语句返回了结果集，脚本中其余语句已在同一连接上执行".into(),
+        });
+    }
     Ok(QueryResultPage {
         execution_id: request.execution_id,
         columns,
@@ -889,12 +904,180 @@ fn execute_sync(connection: &Connection, request: ExecuteQueryRequest) -> Result
         truncated: has_more,
         has_more,
         result_set_index: 0,
-        messages: Vec::new(),
+        messages,
         row_offset,
         page_size,
         additional_result_sets: Vec::new(),
         source_table: None,
     })
+}
+
+#[derive(Clone, Copy)]
+enum ScriptLexerState {
+    Normal,
+    SingleQuote,
+    DoubleQuote,
+    Backtick,
+    LineComment,
+    BlockComment,
+}
+
+/// Splits a script into statements at semicolons outside quotes and comments.
+/// CREATE TRIGGER bodies (`BEGIN … END;`) legally contain internal semicolons,
+/// so their keywords are tracked and never treated as terminators.
+fn split_script(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut word = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut state = ScriptLexerState::Normal;
+    let mut trigger_seen = false;
+    // Stack of currently open keywords; true marks a trigger-body BEGIN.
+    let mut open_keywords: Vec<bool> = Vec::new();
+    while let Some(character) = chars.next() {
+        match state {
+            ScriptLexerState::Normal => {
+                if character.is_ascii_alphanumeric() || character == '_' {
+                    current.push(character);
+                    word.push(character.to_ascii_lowercase());
+                    continue;
+                }
+                if !word.is_empty() {
+                    note_script_keyword(&mut word, &mut open_keywords, &mut trigger_seen);
+                }
+                match character {
+                    '\'' => {
+                        current.push(character);
+                        state = ScriptLexerState::SingleQuote;
+                    }
+                    '"' => {
+                        current.push(character);
+                        state = ScriptLexerState::DoubleQuote;
+                    }
+                    '`' => {
+                        current.push(character);
+                        state = ScriptLexerState::Backtick;
+                    }
+                    '#' => {
+                        current.push(character);
+                        state = ScriptLexerState::LineComment;
+                    }
+                    '-' if chars.peek() == Some(&'-') => {
+                        current.push(character);
+                        current.push(chars.next().expect("peeked character"));
+                        state = ScriptLexerState::LineComment;
+                    }
+                    '/' if chars.peek() == Some(&'*') => {
+                        current.push(character);
+                        current.push(chars.next().expect("peeked character"));
+                        state = ScriptLexerState::BlockComment;
+                    }
+                    ';' if trigger_seen && open_keywords.iter().any(|is_begin| *is_begin) => {
+                        current.push(character);
+                    }
+                    ';' => {
+                        current.push(character);
+                        close_script_statement(
+                            &mut statements,
+                            &mut current,
+                            &mut trigger_seen,
+                            &mut open_keywords,
+                        );
+                    }
+                    _ => current.push(character),
+                }
+            }
+            ScriptLexerState::SingleQuote
+            | ScriptLexerState::DoubleQuote
+            | ScriptLexerState::Backtick => {
+                let delimiter = match state {
+                    ScriptLexerState::SingleQuote => '\'',
+                    ScriptLexerState::DoubleQuote => '"',
+                    ScriptLexerState::Backtick => '`',
+                    _ => unreachable!(),
+                };
+                if character == '\\' {
+                    current.push(character);
+                    if let Some(escaped) = chars.next() {
+                        current.push(escaped);
+                    }
+                } else {
+                    current.push(character);
+                    if character == delimiter {
+                        if chars.peek() == Some(&delimiter) {
+                            current.push(chars.next().expect("peeked character"));
+                        } else {
+                            state = ScriptLexerState::Normal;
+                        }
+                    }
+                }
+            }
+            ScriptLexerState::LineComment if character == '\n' => {
+                current.push(character);
+                state = ScriptLexerState::Normal;
+            }
+            ScriptLexerState::BlockComment if character == '*' && chars.peek() == Some(&'/') => {
+                current.push(character);
+                current.push(chars.next().expect("peeked character"));
+                state = ScriptLexerState::Normal;
+            }
+            ScriptLexerState::LineComment | ScriptLexerState::BlockComment => {
+                current.push(character);
+            }
+        }
+    }
+    if !word.is_empty() {
+        note_script_keyword(&mut word, &mut open_keywords, &mut trigger_seen);
+    }
+    close_script_statement(
+        &mut statements,
+        &mut current,
+        &mut trigger_seen,
+        &mut open_keywords,
+    );
+    statements
+}
+
+fn note_script_keyword(word: &mut String, open_keywords: &mut Vec<bool>, trigger_seen: &mut bool) {
+    match std::mem::take(word).as_str() {
+        "trigger" => *trigger_seen = true,
+        "case" => open_keywords.push(false),
+        "begin" => open_keywords.push(true),
+        // The END closing the outermost BEGIN finishes the trigger body, so
+        // the following semicolon terminates the statement again.
+        "end" => {
+            if open_keywords.pop() == Some(true) && open_keywords.is_empty() && *trigger_seen {
+                *trigger_seen = false;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn close_script_statement(
+    statements: &mut Vec<String>,
+    current: &mut String,
+    trigger_seen: &mut bool,
+    open_keywords: &mut Vec<bool>,
+) {
+    if !cockpit_core::safety::strip_leading_trivia(current)
+        .trim_matches(';')
+        .trim()
+        .is_empty()
+    {
+        statements.push(std::mem::take(current));
+    } else {
+        current.clear();
+    }
+    *trigger_seen = false;
+    open_keywords.clear();
+}
+
+/// Everything worth executing after the script's first statement, or `None`
+/// when the script holds a single statement (comments-only tails dropped).
+fn remainder_after_first_statement(sql: &str) -> Option<String> {
+    let statements = split_script(sql);
+    (statements.len() > 1).then(|| statements[1..].join("\n"))
 }
 
 fn empty_result(
@@ -1006,6 +1189,82 @@ mod tests {
                 .object_definition("main", DatabaseObjectKind::View, "missing")
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rows_returning_head_still_executes_the_rest_of_the_script() {
+        let session = SqliteDriver.open(profile(), String::new()).await.unwrap();
+        let page = session
+            .execute(request(
+                "SELECT 1 AS head;\nCREATE TABLE tail_rows(id INTEGER);\nINSERT INTO tail_rows VALUES (7), (8)",
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert!(!page.messages.is_empty());
+        let follow_up = session
+            .execute(request("SELECT COUNT(*) FROM tail_rows", false))
+            .await
+            .unwrap();
+        assert!(
+            follow_up
+                .rows
+                .iter()
+                .flatten()
+                .any(|value| value == &CellValue::Signed("2".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_bodies_with_semicolons_survive_multi_statement_scripts() {
+        let session = SqliteDriver.open(profile(), String::new()).await.unwrap();
+        session
+            .execute(request("CREATE TABLE fired(n INTEGER)", true))
+            .await
+            .unwrap();
+        session
+            .execute(request(
+                "SELECT 40 + 2 AS answer;\nCREATE TABLE src(n INTEGER);\nCREATE TRIGGER tg AFTER INSERT ON src\nBEGIN\n  INSERT INTO fired VALUES (NEW.n);\n  INSERT INTO fired VALUES (NEW.n * 10);\nEND",
+                true,
+            ))
+            .await
+            .unwrap();
+        session
+            .execute(request("INSERT INTO src VALUES (3)", true))
+            .await
+            .unwrap();
+        let audit = session
+            .execute(request("SELECT COUNT(*) FROM fired", false))
+            .await
+            .unwrap();
+        assert!(
+            audit
+                .rows
+                .iter()
+                .flatten()
+                .any(|value| value == &CellValue::Signed("2".into()))
+        );
+    }
+
+    #[test]
+    fn script_splitter_respects_quotes_comments_and_trigger_bodies() {
+        assert_eq!(
+            split_script("SELECT 'a;b' /* ; */; DELETE FROM t -- ;\n").len(),
+            2
+        );
+        assert_eq!(split_script("BEGIN TRANSACTION; ROLLBACK;").len(), 2);
+        assert_eq!(
+            split_script("SELECT CASE WHEN 1 THEN 2 ELSE 3 END; SELECT 5;").len(),
+            2
+        );
+        assert_eq!(
+            split_script(
+                "CREATE TRIGGER g BEFORE UPDATE ON t BEGIN\n  INSERT INTO log DEFAULT VALUES;\n  SELECT CASE WHEN 1 THEN 2 ELSE 3 END;\nEND;"
+            )
+            .len(),
+            1
         );
     }
 }
