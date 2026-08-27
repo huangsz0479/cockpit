@@ -18,6 +18,9 @@ use uuid::Uuid;
 
 const CELL_EDIT_MESSAGE: &str = "Elasticsearch 暂不支持行级写入，请通过行 JSON 查看器编辑整份文档";
 
+/// ES 默认 `index.max_result_window`：`_search` 的 from+size 超过即被集群拒绝。
+const MAX_RESULT_WINDOW: usize = 10_000;
+
 #[derive(Default)]
 pub struct ElasticsearchDriver;
 
@@ -196,6 +199,27 @@ fn unsupported_array_field(error: &CockpitError) -> Option<String> {
     let start = message.find(marker)? + marker.len();
     let end = start + message[start..].find(']')?;
     Some(message[start..end].to_string())
+}
+
+/// from+size 是否超过 ES 默认 max_result_window。超过的 `_search` 注定失败，
+/// 必须在发起请求前就跳过快路径。
+fn exceeds_result_window(from: usize, size: usize) -> bool {
+    from.saturating_add(size) > MAX_RESULT_WINDOW
+}
+
+/// `_search` 因 from+size 超过 index.max_result_window 被拒（HTTP 400）时，
+/// 错误原因固定含 "Result window"。send 会把 4xx 归为 Query 错误且不带状态码，
+/// 只能按原因文本识别；仅该情形允许回退 SQL 游标深分页。
+fn is_result_window_overflow(message: &str) -> bool {
+    message.contains("Result window") || message.contains("result_window")
+}
+
+/// 索引名会拼进 URL 路径的查询（mapping/settings）必须先过命名校验，防路径注入。
+fn ensure_valid_index_name(index: &str) -> Result<()> {
+    if !is_valid_index_name(index) {
+        return Err(query_error(format!("无效的索引名：{index}")));
+    }
+    Ok(())
 }
 
 fn scheme_for(tls_mode: cockpit_core::TlsMode) -> &'static str {
@@ -981,6 +1005,7 @@ impl EsSession {
     }
 
     async fn fetch_mapping(&self, table: &str, timeout: Duration) -> Result<Value> {
+        ensure_valid_index_name(table)?;
         let body = self
             .send(
                 Uuid::new_v4(),
@@ -1036,6 +1061,18 @@ impl EsSession {
         page_size: usize,
     ) -> Result<Option<QueryResultPage>> {
         let started = Instant::now();
+        // 非法索引名拼不进 _search URL：不在快路径上报错，静默让位给 SQL 回退
+        // 路径，由那边的方言校验给出报错
+        if !is_valid_index_name(table) {
+            return Ok(None);
+        }
+        // ES 默认 max_result_window 限制 from+size：超限请求注定失败且失败时会
+        // 被当作"不适合快路径"。在发起任何 HTTP 前就跳过快路径，交给 SQL 游标深分页
+        if search_size(request.row_offset, page_size, sql_limit(sql))
+            .is_some_and(|size| exceeds_result_window(request.row_offset, size))
+        {
+            return Ok(None);
+        }
         // ES SQL 不认识 _id 元字段：先剥离 WHERE 中的 _id 条件，等价改写为 ids 过滤；
         // 无法安全改写时保留原 SQL，交给 translate/ES SQL 走原有报错路径。
         let (search_sql, id_predicates) =
@@ -1097,7 +1134,11 @@ impl EsSession {
             .await
         {
             Ok(value) => value,
-            Err(CockpitError::Query(_)) => return Ok(None),
+            // 结果窗口溢出说明查询合法只是翻页过深，回退 SQL 游标路径；
+            // 其余查询错误如实上抛，避免把真实故障伪装成"不适合快路径"
+            Err(CockpitError::Query(message)) if is_result_window_overflow(&message) => {
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         let response: SearchResponse = serde_json::from_value(raw)
@@ -1355,6 +1396,8 @@ impl DriverSession for EsSession {
 
     async fn table_detail(&self, database: &str, table: &str) -> Result<TableDetail> {
         let timeout = request_timeout(&self.profile, None);
+        // 校验必须先于并发的 mapping/settings 查询，避免非法名拼进 _settings 的 URL
+        ensure_valid_index_name(table)?;
         let (mapping, settings) = tokio::try_join!(self.fetch_mapping(table, timeout), async {
             self.send(
                 Uuid::new_v4(),
@@ -1586,21 +1629,63 @@ impl DriverSession for EsSession {
             return Err(CockpitError::Query("文档 _id 不能为空".into()));
         }
         let timeout = request_timeout(&self.profile, None);
-        let body = self
+        // 写前读取最新 seq_no/primary_term 作为乐观锁基线，避免并发编辑时静默覆盖
+        // 他端改动。GET 返回 404（文档不存在）被归为 Query 错误：维持原有语义，
+        // 本次 PUT 无条件写入并新建该文档。
+        let version = match self
             .send(
                 Uuid::new_v4(),
                 timeout,
                 self.request(
-                    Method::PUT,
-                    &format!("/{index}/_doc/{}", percent_encode(document_id)),
-                )
-                .json(source),
+                    Method::GET,
+                    &format!(
+                        "/{index}/_doc/{}?_source=false&seq_no_primary_term=true",
+                        percent_encode(document_id)
+                    ),
+                ),
             )
-            .await?;
+            .await
+        {
+            Ok(body) => {
+                let seq_no = body.get("_seq_no").and_then(Value::as_u64);
+                let primary_term = body.get("_primary_term").and_then(Value::as_u64);
+                match (seq_no, primary_term) {
+                    (Some(seq_no), Some(primary_term)) => Some((seq_no, primary_term)),
+                    // 旧版本 ES 不返回 seq_no：无基线可用，退回无条件写入
+                    _ => None,
+                }
+            }
+            Err(CockpitError::Query(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let mut put_path = format!("/{index}/_doc/{}", percent_encode(document_id));
+        if let Some((seq_no, primary_term)) = version {
+            put_path.push_str(&format!(
+                "?if_seq_no={seq_no}&if_primary_term={primary_term}"
+            ));
+        }
+        let body = match self
+            .send(
+                Uuid::new_v4(),
+                timeout,
+                self.request(Method::PUT, &put_path).json(source),
+            )
+            .await
+        {
+            Ok(body) => body,
+            // send 把 409 的版本冲突按 4xx 归为 Query 错误，按原因文本识别后给出
+            // 可操作的提示
+            Err(CockpitError::Query(message)) if message.contains("version conflict") => {
+                return Err(query_error("文档已被并发修改（版本冲突），请刷新后重试"));
+            }
+            Err(error) => return Err(error),
+        };
         let result = body.get("result").and_then(Value::as_str).unwrap_or("");
         if !matches!(result, "created" | "updated" | "noop") {
             return Err(query_error(format!("更新文档失败：{result}")));
         }
+        // 整文档替换可能经 dynamic mapping 引入新字段，星号展开的列缓存一并作废
+        lock(&self.star_columns_cache).remove(index);
         // 管理工具场景：保存后立即刷新索引，让重新查询马上反映新值
         let _ = self
             .send(
@@ -2294,5 +2379,466 @@ mod tests {
         assert_eq!(percent_encode("a b/c"), "a%20b%2Fc");
         assert_eq!(percent_encode("中文"), "%E4%B8%AD%E6%96%87");
         assert_eq!(percent_encode(""), "");
+    }
+
+    #[test]
+    fn result_window_boundary_is_enforced_before_requests() {
+        assert!(!exceeds_result_window(0, MAX_RESULT_WINDOW));
+        // from+size 恰好等于窗口上限仍允许快路径
+        assert!(!exceeds_result_window(9_900, 100));
+        // 常规翻页会多取 1 行判定 has_more，此时刚好越界
+        assert!(exceeds_result_window(9_900, 101));
+        assert!(exceeds_result_window(MAX_RESULT_WINDOW, 1));
+        // 饱和加法避免极端入参下溢出 panic
+        assert!(exceeds_result_window(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn only_result_window_overflow_allows_fast_path_fallback() {
+        let es_message = "Result window is too large, from + size must be less than or \
+                          equal to: [10000] but was [10500]. See the scroll api for a more \
+                          efficient way to request large data sets.";
+        assert!(is_result_window_overflow(es_message));
+        assert!(is_result_window_overflow(
+            "[10001] result_window validation failed"
+        ));
+        // 其余 400 类查询错误必须如实上抛，不得伪装成可回退
+        assert!(!is_result_window_overflow(
+            "line 1:8: no matching field [titel]"
+        ));
+        assert!(!is_result_window_overflow(""));
+    }
+
+    #[test]
+    fn url_bearing_lookups_reject_invalid_index_names_in_chinese() {
+        assert!(ensure_valid_index_name("logs-2024.01").is_ok());
+        // 引号标识符里的路径注入与含逗号的跨索引表达式同样要拦下
+        for bad in ["../_search", "..", "a-b,c", "-hidden", "Bad Name"] {
+            assert!(
+                matches!(ensure_valid_index_name(bad),
+                    Err(CockpitError::Query(message))
+                    if message.contains("无效的索引名")),
+                "{bad} 应被拒绝并给出中文报错"
+            );
+        }
+    }
+
+    // —— 以下为基于本地假 ES 服务的行为测试 ——
+
+    /// 极简假 ES：真实监听 TCP，命中「方法 + 路径前缀」即回放预设响应，
+    /// 其余一律 404；收到的每个请求行记入 shared 列表供断言。
+    struct MockRoute {
+        method: &'static str,
+        path_prefix: &'static str,
+        status: u16,
+        body: Value,
+    }
+
+    fn mock_route(method: &'static str, path_prefix: &str, status: u16, body: Value) -> MockRoute {
+        MockRoute {
+            method,
+            path_prefix: Box::leak(path_prefix.to_string().into_boxed_str()),
+            status,
+            body,
+        }
+    }
+
+    fn spawn_mock_es(routes: Vec<MockRoute>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定测试端口失败");
+        let base_url = format!("http://{}", listener.local_addr().expect("取端口失败"));
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let routes: Arc<[MockRoute]> = routes.into();
+        {
+            let seen = seen.clone();
+            // 线程随进程退出即可，无需显式关闭
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let routes = routes.clone();
+                    let seen = seen.clone();
+                    std::thread::spawn(move || {
+                        let Some((method, path)) = read_mock_request(&mut stream) else {
+                            return;
+                        };
+                        lock(&seen).push(format!("{method} {path}"));
+                        let matched = routes.iter().find(|route| {
+                            route.method == method && path.starts_with(route.path_prefix)
+                        });
+                        let (status, body) = match matched {
+                            Some(route) => (route.status, route.body.clone()),
+                            None => (
+                                404u16,
+                                json!({ "error": { "reason": "未配置该路由的响应" } }),
+                            ),
+                        };
+                        write_mock_response(&mut stream, status, &body);
+                    });
+                }
+            });
+        }
+        (base_url, seen)
+    }
+
+    /// 读到请求头末尾并按 Content-Length 排干请求体，返回方法与完整路径。
+    fn read_mock_request(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
+        use std::io::Read;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        };
+        let content_length = std::str::from_utf8(&buffer[..head_end])
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length:")
+                    .or_else(|| line.strip_prefix("Content-Length:"))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buffer.len() < head_end + content_length {
+            let read = stream.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        let request_line = std::str::from_utf8(&buffer[..head_end])
+            .ok()?
+            .lines()
+            .next()?
+            .to_string();
+        let (method, path) = request_line.split_once(' ')?;
+        Some((method.to_string(), path.to_string()))
+    }
+
+    fn write_mock_response(stream: &mut std::net::TcpStream, status: u16, body: &Value) {
+        use std::io::Write;
+        let text = body.to_string();
+        let reason = if (200..400).contains(&status) {
+            "OK"
+        } else {
+            "Err"
+        };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+            text.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    fn mock_session(base_url: String) -> EsSession {
+        EsSession {
+            cluster_name: Mutex::new(None),
+            base_url,
+            auth: None,
+            http: Client::new(),
+            profile: profile(TlsMode::Disabled),
+            running: Mutex::new(HashMap::new()),
+            cursor_cache: Mutex::new(None),
+            star_columns_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn star_query(row_offset: usize) -> ExecuteQueryRequest {
+        ExecuteQueryRequest {
+            execution_id: Uuid::new_v4(),
+            sql: "SELECT * FROM orders".into(),
+            database: None,
+            timeout_secs: None,
+            allow_write: false,
+            page_size: 100,
+            row_offset,
+        }
+    }
+
+    fn mapping_route(index: &str) -> MockRoute {
+        mock_route(
+            "GET",
+            &format!("/{index}/_mapping"),
+            200,
+            json!({
+                index: { "mappings": { "properties": { "title": { "type": "keyword" } } } }
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn deep_paging_skips_fast_path_without_any_http_call() {
+        let (base_url, seen) = spawn_mock_es(vec![mock_route(
+            "POST",
+            "/_sql/translate",
+            200,
+            json!({ "query": { "match_all": {} } }),
+        )]);
+        let session = mock_session(base_url);
+        // from=10000 注定越过 max_result_window：应在任何请求前直接回退 SQL 游标路径
+        let result = session
+            .execute_search(
+                "orders",
+                "SELECT * FROM orders",
+                &star_query(10_000),
+                Duration::from_secs(5),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none(), "深翻页应放弃快路径返回 None");
+        assert!(
+            lock(&seen).is_empty(),
+            "不应对超出窗口的翻页发起任何 HTTP 请求"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_falls_back_only_on_window_overflow_and_propagates_other_errors() {
+        let common = |search_status: u16, search_body: Value| {
+            vec![
+                mock_route(
+                    "POST",
+                    "/_sql/translate",
+                    200,
+                    json!({ "query": { "match_all": {} } }),
+                ),
+                mapping_route("orders"),
+                mock_route("POST", "/orders/_search", search_status, search_body),
+            ]
+        };
+        // 窗口阈值内但仍被服务端按更小的 index.max_result_window 拒绝：
+        // 仅溢出类错误才回退 SQL 路径
+        let (base_url, seen) = spawn_mock_es(common(
+            400,
+            json!({
+                "error": {
+                    "root_cause": [{ "type": "illegal_argument_exception",
+                        "reason": "Result window is too large, from + size must be less than or equal to: [500] but was [501]. This can be avoided by adjusting the index.max_result_window..." }],
+                    "type": "illegal_argument_exception",
+                    "reason": "Result window is too large..."
+                },
+                "status": 400
+            }),
+        ));
+        let session = mock_session(base_url);
+        let result = session
+            .execute_search(
+                "orders",
+                "SELECT * FROM orders",
+                &star_query(400),
+                Duration::from_secs(5),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none(), "窗口溢出应回退 SQL 路径");
+        assert!(
+            lock(&seen)
+                .iter()
+                .any(|request| request.starts_with("POST /orders/_search")),
+            "该用例验证的是服务端拒绝分支，须已发出过 _search 请求"
+        );
+
+        // 其他查询类故障必须上抛，不得吞成 None 导致静默降级
+        let (base_url, _) = spawn_mock_es(common(
+            400,
+            json!({
+                "error": {
+                    "root_cause": [{ "type": "query_shard_exception",
+                        "reason": "Failed to create query: No mapping found for [title]" }],
+                    "type": "search_phase_execution_exception",
+                    "reason": "all shards failed"
+                },
+                "status": 400
+            }),
+        ));
+        let session = mock_session(base_url);
+        let error = session
+            .execute_search(
+                "orders",
+                "SELECT * FROM orders",
+                &star_query(0),
+                Duration::from_secs(5),
+                100,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CockpitError::Query(ref message) if message.contains("No mapping found")),
+            "非窗口溢出的查询错误应上抛：{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_sql_derived_table_names_are_rejected_before_any_request() {
+        let (base_url, seen) = spawn_mock_es(vec![
+            mock_route("POST", "/_sql/translate", 200, json!({})),
+            mock_route("GET", "/_mapping", 200, json!({})),
+        ]);
+        let session = mock_session(base_url);
+        let timeout = Duration::from_secs(5);
+
+        // 快路径不发请求也不报错，交由 SQL 回退路径给出方言错误
+        let result = session
+            .execute_search(
+                "../_search",
+                "SELECT * FROM \"../_search\"",
+                &star_query(0),
+                timeout,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        // mapping/settings 类 URL 直接给出中文报错
+        for bad in ["../_mapping", "a-b,c"] {
+            let error = session.fetch_mapping(bad, timeout).await.unwrap_err();
+            assert!(
+                matches!(error, CockpitError::Query(ref message) if message.contains(bad)),
+                "{bad} 的 mapping 查询应携带中文名校验错误：{error}"
+            );
+            let error = session.table_detail("", bad).await.unwrap_err();
+            assert!(
+                matches!(error, CockpitError::Query(ref message) if message.contains(bad)),
+                "{bad} 的表详情应携带中文名校验错误：{error}"
+            );
+        }
+        assert!(lock(&seen).is_empty(), "非法索引名不得产生 HTTP 请求");
+    }
+
+    #[tokio::test]
+    async fn update_document_locks_version_then_invalidates_star_cache() {
+        let (base_url, seen) = spawn_mock_es(vec![
+            mock_route(
+                "GET",
+                "/orders/_doc/alpha",
+                200,
+                json!({
+                    "_index": "orders", "_id": "alpha", "_version": 4,
+                    "_seq_no": 3, "_primary_term": 2, "found": true
+                }),
+            ),
+            mock_route(
+                "PUT",
+                "/orders/_doc/alpha",
+                200,
+                json!({ "_id": "alpha", "result": "updated" }),
+            ),
+            mock_route(
+                "POST",
+                "/orders/_refresh",
+                200,
+                json!({ "acknowledged": true }),
+            ),
+        ]);
+        let session = mock_session(base_url);
+        lock(&session.star_columns_cache).insert("orders".into(), vec!["title".into()]);
+        session
+            .update_document("orders", "alpha", &json!({ "title": "edited" }))
+            .await
+            .unwrap();
+
+        let requests = lock(&seen).clone();
+        // 写前读取版本基线
+        assert!(
+            requests.iter().any(|request| request
+                .starts_with("GET /orders/_doc/alpha?_source=false&seq_no_primary_term=true")),
+            "应先 GET seq_no/primary_term 作为乐观锁基线：{requests:?}"
+        );
+        // PUT 附带条件写入参数
+        let put = requests
+            .iter()
+            .find(|request| request.starts_with("PUT "))
+            .expect("应发起 PUT 写入");
+        assert!(
+            put.contains("if_seq_no=3&if_primary_term=2"),
+            "PUT 应携带乐观锁参数：{put}"
+        );
+        // 整文档替换可能经 dynamic mapping 引入新字段，星号展开缓存须作废
+        assert!(
+            !lock(&session.star_columns_cache).contains_key("orders"),
+            "保存成功后星号列缓存应失效"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_document_maps_version_conflict_to_refresh_hint() {
+        let (base_url, seen) = spawn_mock_es(vec![
+            mock_route(
+                "GET",
+                "/orders/_doc/alpha",
+                200,
+                json!({ "_seq_no": 3, "_primary_term": 2, "found": true }),
+            ),
+            mock_route(
+                "PUT",
+                "/orders/_doc/alpha",
+                409,
+                json!({
+                    "error": {
+                        "type": "version_conflict_engine_exception",
+                        "reason": "[alpha]: version conflict, required seqNo [3], primaryTerm [2], but current document has seqNo [5]"
+                    },
+                    "status": 409
+                }),
+            ),
+        ]);
+        let session = mock_session(base_url);
+        let error = session
+            .update_document("orders", "alpha", &json!({ "title": "stale" }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CockpitError::Query(ref message) if message.contains("文档已被并发修改")),
+            "版本冲突应提示刷新重试：{error}"
+        );
+        // 写入失败即中止，不再执行收尾刷新
+        assert!(
+            lock(&seen)
+                .iter()
+                .all(|request| !request.contains("_refresh")),
+            "冲突后不应继续刷新索引"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_document_keeps_create_on_missing_doc_semantics() {
+        let (base_url, seen) = spawn_mock_es(vec![
+            // 文档不存在时 ES 返回 404（无 error 字段）
+            mock_route(
+                "GET",
+                "/orders/_doc/new-id",
+                404,
+                json!({ "_index": "orders", "_id": "new-id", "found": false }),
+            ),
+            mock_route(
+                "PUT",
+                "/orders/_doc/new-id",
+                200,
+                json!({ "result": "created" }),
+            ),
+        ]);
+        let session = mock_session(base_url);
+        // 缺文档维持原行为：无条件 PUT 新建，不加乐观锁参数
+        session
+            .update_document("orders", "new-id", &json!({ "title": "fresh" }))
+            .await
+            .unwrap();
+        let put = lock(&seen)
+            .iter()
+            .find(|request| request.starts_with("PUT "))
+            .cloned()
+            .expect("应发起 PUT");
+        assert!(
+            !put.contains("if_seq_no"),
+            "新建文档不应带乐观锁参数：{put}"
+        );
     }
 }
