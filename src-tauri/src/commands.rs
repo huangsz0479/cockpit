@@ -3,7 +3,10 @@ use std::{
     fs::OpenOptions,
     io::{BufWriter, Cursor, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        {Arc, LazyLock},
+    },
 };
 
 use aes_gcm::{
@@ -33,7 +36,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -373,6 +376,8 @@ pub async fn delete_connection(
     state: State<'_, Arc<AppState>>,
     connection_id: Uuid,
 ) -> CommandResult<()> {
+    // 与 disconnect 相同：先撤销 connect 预约，防止删除后被在途连接复活。
+    CONNECT_RESERVATIONS.lock().await.remove(&connection_id);
     if let Some(session) = state.sessions.write().await.remove(&connection_id) {
         let _ = session.close().await;
     }
@@ -472,6 +477,22 @@ async fn close_tab_sessions_for_connection(state: &AppState, connection_id: Uuid
     }
 }
 
+/// 建立中的连接预约表：connect_connection 先占位再打开驱动会话，保证并发的
+/// connect 不会互相覆盖泄漏会话，并发的 disconnect/delete 也总能撤销仍在
+/// 建立的连接，而不会出现“先关闭又被复活”的会话。值是每次 connect 的
+/// 世代号，用于区分“我自己的预约”和“后来者重新发起的预约”。
+static CONNECT_RESERVATIONS: LazyLock<tokio::sync::Mutex<HashMap<Uuid, u64>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+static NEXT_CONNECT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+async fn cancel_connect_reservation(connection_id: Uuid, generation: u64) {
+    let mut reservations = CONNECT_RESERVATIONS.lock().await;
+    if reservations.get(&connection_id) == Some(&generation) {
+        reservations.remove(&connection_id);
+    }
+}
+
 #[tauri::command]
 pub async fn connect_connection(
     state: State<'_, Arc<AppState>>,
@@ -480,10 +501,63 @@ pub async fn connect_connection(
     if let Some(session) = state.sessions.read().await.get(&connection_id).cloned() {
         return session.connection_info().await.map_err(payload);
     }
-    let session = open_driver_session(&state, connection_id, false).await?;
-    let info = session.connection_info().await.map_err(payload)?;
-    state.sessions.write().await.insert(connection_id, session);
-    Ok(info)
+    // 先占位再打开驱动会话：同一连接的并发 connect 直接报错，避免重复打开。
+    let generation = {
+        let mut reservations = CONNECT_RESERVATIONS.lock().await;
+        if reservations.contains_key(&connection_id) {
+            return Err(payload(CockpitError::Connection(
+                "连接正在建立中，请稍后重试".into(),
+            )));
+        }
+        let generation = NEXT_CONNECT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        reservations.insert(connection_id, generation);
+        generation
+    };
+    let session = match open_driver_session(&state, connection_id, false).await {
+        Ok(session) => session,
+        Err(error) => {
+            cancel_connect_reservation(connection_id, generation).await;
+            return Err(error);
+        }
+    };
+    let info = match session.connection_info().await {
+        Ok(info) => info,
+        Err(error) => {
+            cancel_connect_reservation(connection_id, generation).await;
+            return Err(payload(error));
+        }
+    };
+    // 发布前在同一临界区内确认预约仍属于本次调用；若已被并发 disconnect/
+    // delete 撤销，则必须关闭新会话而不是插入，避免让断开操作悄悄失效。
+    let replaced = {
+        let mut reservations = CONNECT_RESERVATIONS.lock().await;
+        if reservations.get(&connection_id) != Some(&generation) {
+            None
+        } else {
+            reservations.remove(&connection_id);
+            Some(
+                state
+                    .sessions
+                    .write()
+                    .await
+                    .insert(connection_id, session.clone()),
+            )
+        }
+    };
+    match replaced {
+        Some(previous) => {
+            if let Some(previous) = previous {
+                // 理论上不应发生（同 id 的并发 connect 已被预约挡下），一旦
+                // 出现也要关闭被顶掉的旧会话，绝不泄漏。
+                let _ = close_driver_session(previous).await;
+            }
+            Ok(info)
+        }
+        None => {
+            let _ = close_driver_session(session).await;
+            Err(payload(CockpitError::Connection("连接已被断开".into())))
+        }
+    }
 }
 
 #[tauri::command]
@@ -536,6 +610,9 @@ pub async fn disconnect_connection(
     state: State<'_, Arc<AppState>>,
     connection_id: Uuid,
 ) -> CommandResult<()> {
+    // 先撤销可能存在的 connect 预约，让在途的 connect 在发布前发现自己已被
+    // 断开并自行关闭，而不是把刚断开的会话悄悄复活。
+    CONNECT_RESERVATIONS.lock().await.remove(&connection_id);
     let close_result = if let Some(session) = state.sessions.write().await.remove(&connection_id) {
         session.close().await.map_err(payload)
     } else {
@@ -847,9 +924,10 @@ pub struct TextFileContent {
 }
 
 #[tauri::command]
-pub async fn read_text_file(input_path: String) -> CommandResult<TextFileContent> {
+pub async fn read_text_file(app: AppHandle, input_path: String) -> CommandResult<TextFileContent> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = PathBuf::from(&input_path);
+        ensure_not_private_secret_target(&app, &path, "读取")?;
         let metadata = std::fs::metadata(&path).map_err(exchange_error)?;
         if metadata.len() > MAX_EDITOR_FILE_BYTES {
             return Err(CockpitError::Exchange(format!(
@@ -868,10 +946,74 @@ pub async fn read_text_file(input_path: String) -> CommandResult<TextFileContent
     .map_err(payload)
 }
 
+/// 应用私密凭据文件（相对 app 数据目录）：设备密钥与加密凭据库一旦被通用
+/// 文件命令读取或覆盖，轻则泄露所有已保存连接的密钥，重则凭据库整体失效。
+const PRIVATE_SECRET_FILE_NAMES: &[&str] = &[
+    crate::secrets::DEVICE_KEY_FILE,
+    crate::secrets::SECRETS_VAULT_FILE,
+];
+
+fn secret_material_paths(app: &AppHandle) -> Vec<PathBuf> {
+    let Ok(data_dir) = app.path().app_data_dir() else {
+        return Vec::new();
+    };
+    PRIVATE_SECRET_FILE_NAMES
+        .iter()
+        .map(|name| data_dir.join(name))
+        .collect()
+}
+
+/// 目标可能尚不存在，`canonicalize` 失败时退回解析其父目录再拼接文件名，
+/// 从而同时拦截符号链接绕过和“目标尚未创建”的首次写入。
+fn canonicalized_target_candidates(target: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![target.to_path_buf()];
+    match std::fs::canonicalize(target) {
+        Ok(resolved) => candidates.push(resolved),
+        Err(_) => {
+            if let (Some(parent), Some(file_name)) = (target.parent(), target.file_name())
+                && let Ok(resolved_parent) = std::fs::canonicalize(parent)
+            {
+                candidates.push(resolved_parent.join(file_name));
+            }
+        }
+    }
+    candidates
+}
+
+/// 纯判定函数：目标路径是否命中受保护的应用私密文件（可独立单测）。
+/// 两侧都按“原样 + 解析后”两组候选比较，从而同时覆盖符号链接与
+/// 未完全规范化的路径写法。
+fn is_private_secret_target(target: &Path, private_files: &[PathBuf]) -> bool {
+    let candidates = canonicalized_target_candidates(target);
+    private_files.iter().any(|private_file| {
+        canonicalized_target_candidates(private_file)
+            .iter()
+            .any(|candidate| candidates.contains(candidate))
+    })
+}
+
+fn ensure_not_private_secret_target(
+    app: &AppHandle,
+    target: &Path,
+    action: &str,
+) -> cockpit_core::Result<()> {
+    if is_private_secret_target(target, &secret_material_paths(app)) {
+        return Err(CockpitError::InvalidConfig(format!(
+            "拒绝{action}应用私密文件"
+        )));
+    }
+    Ok(())
+}
+
 #[tauri::command]
-pub async fn write_text_file(output_path: String, contents: String) -> CommandResult<String> {
+pub async fn write_text_file(
+    app: AppHandle,
+    output_path: String,
+    contents: String,
+) -> CommandResult<String> {
     tauri::async_runtime::spawn_blocking(move || {
         let output_path = PathBuf::from(output_path);
+        ensure_not_private_secret_target(&app, &output_path, "写入")?;
         let parent = output_path
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -942,7 +1084,11 @@ pub async fn reveal_file(input_path: String) -> CommandResult<()> {
 const MAX_BINARY_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[tauri::command]
-pub async fn write_binary_file(output_path: String, base64: String) -> CommandResult<String> {
+pub async fn write_binary_file(
+    app: AppHandle,
+    output_path: String,
+    base64: String,
+) -> CommandResult<String> {
     tauri::async_runtime::spawn_blocking(move || {
         // Reject oversized payloads before decoding: base64 inflates the
         // raw bytes by ~4/3, so the encoded length is a cheap upper bound.
@@ -962,6 +1108,7 @@ pub async fn write_binary_file(output_path: String, base64: String) -> CommandRe
             )));
         }
         let output_path = PathBuf::from(output_path);
+        ensure_not_private_secret_target(&app, &output_path, "写入")?;
         let parent = output_path
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -1208,6 +1355,8 @@ pub async fn export_table(
         .map_err(|error| payload(exchange_error(error)))?;
     let owns_transaction = !session.transaction_active().await;
     if owns_transaction && let Err(error) = session.begin_read_transaction().await {
+        // Windows 上删除仍被占用的临时文件会失败，先关闭句柄再清理。
+        drop(file);
         let _ = std::fs::remove_file(&temporary_path);
         return Err(payload(error));
     }
@@ -1360,12 +1509,16 @@ pub async fn export_table(
             if owns_transaction {
                 let _ = session.rollback_transaction().await;
             }
+            // 写入器（及其克隆的文件句柄）随 async 块一起释放，这里先关闭
+            // 原始句柄，确保 Windows 能成功删除临时文件。
+            drop(file);
             let _ = std::fs::remove_file(&temporary_path);
             return Err(payload(error));
         }
     };
     if owns_transaction && let Err(error) = session.commit_transaction().await {
         let _ = session.rollback_transaction().await;
+        drop(file);
         let _ = std::fs::remove_file(&temporary_path);
         return Err(payload(error));
     }
@@ -1443,6 +1596,8 @@ pub async fn export_query(
         .map_err(|error| payload(exchange_error(error)))?;
     let owns_transaction = !session.transaction_active().await;
     if owns_transaction && let Err(error) = session.begin_read_transaction().await {
+        // Windows 上删除仍被占用的临时文件会失败，先关闭句柄再清理。
+        drop(file);
         let _ = std::fs::remove_file(&temporary_path);
         return Err(payload(error));
     }
@@ -1596,12 +1751,16 @@ pub async fn export_query(
             if owns_transaction {
                 let _ = session.rollback_transaction().await;
             }
+            // 分页函数持有的写入器克隆句柄已随 async 块释放，这里先关闭原始
+            // 句柄，确保 Windows 能成功删除临时文件。
+            drop(file);
             let _ = std::fs::remove_file(&temporary_path);
             return Err(payload(error));
         }
     };
     if owns_transaction && let Err(error) = session.commit_transaction().await {
         let _ = session.rollback_transaction().await;
+        drop(file);
         let _ = std::fs::remove_file(&temporary_path);
         return Err(payload(error));
     }
@@ -1805,6 +1964,8 @@ pub async fn backup_database(
     let token = tokio_util::sync::CancellationToken::new();
     state.transfers.write().await.insert(task_id, token.clone());
     if let Err(error) = session.begin_read_transaction().await {
+        // 与导出一致：Windows 上需先关闭句柄才能删除临时文件。
+        drop(file);
         let _ = std::fs::remove_file(&temporary_path);
         state.transfers.write().await.remove(&task_id);
         return Err(payload(error));
@@ -2277,7 +2438,9 @@ pub async fn backup_database(
                 Ok(compress_output)
             })
             .await
-            .map_err(|error| payload(CockpitError::Exchange(error.to_string())))?;
+            // 把 JoinError 折叠进内层结果，让下面的错误分支统一清理临时文件
+            // 并从 state.transfers 移除取消令牌，避免任何路径泄漏令牌。
+            .unwrap_or_else(|error| Err(exchange_error(error)));
         match compress_result {
             Ok(path) => {
                 let _ = std::fs::remove_file(&temporary_path);
@@ -2310,7 +2473,8 @@ pub async fn backup_database(
             )
         })
         .await
-        .map_err(|error| payload(CockpitError::Exchange(error.to_string())))?;
+        // JoinError 同样折叠进 encrypt_result，保证取消令牌总能被移除。
+        .unwrap_or_else(|error| Err(exchange_error(error)));
         if let Err(error) = encrypt_result {
             let _ = std::fs::remove_file(&final_temporary_path);
             let _ = std::fs::remove_file(&encrypted_path);
@@ -2324,7 +2488,8 @@ pub async fn backup_database(
     let hash_token = token.clone();
     let hash_result = tokio::task::spawn_blocking(move || file_sha256(&hash_path, &hash_token))
         .await
-        .map_err(|error| payload(CockpitError::Exchange(error.to_string())))?;
+        // JoinError 折叠进 hash_result，走下方已有的清理分支。
+        .unwrap_or_else(|error| Err(exchange_error(error)));
     let (checksum_sha256, bytes_written) = match hash_result {
         Ok(result) => result,
         Err(error) => {
@@ -2333,7 +2498,10 @@ pub async fn backup_database(
             return Err(payload(error));
         }
     };
-    replace_file(&final_temporary_path, &output_path).map_err(payload)?;
+    if let Err(error) = replace_file(&final_temporary_path, &output_path) {
+        state.transfers.write().await.remove(&task_id);
+        return Err(payload(error));
+    }
     state.transfers.write().await.remove(&task_id);
     emit_transfer_progress(
         &app,
@@ -4393,16 +4561,7 @@ fn table_page_sql(
             .collect::<Vec<_>>()
             .join(", ")
     } else {
-        selected_columns
-            .iter()
-            .map(|column| {
-                format!(
-                    "SHA2(COALESCE(HEX({}), 'NULL'), 256)",
-                    backup_quote_identifier(&column.name, database_kind)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        mysql_content_order_keys(&selected_columns, database_kind)
     };
     if let (Some(key_columns), Some(cursor)) = (key_columns.as_ref(), keyset)
         && cursor.columns == *key_columns
@@ -4423,6 +4582,34 @@ fn table_page_sql(
         page_size + 1,
         offset
     ))
+}
+
+/// Builds the fallback ORDER BY for MySQL/MariaDB tables without a primary or
+/// non-null unique key. The per-column SHA2 hashes alone are not a total
+/// order: collisions make page boundaries unstable across separate paged
+/// queries, so rows could be duplicated or skipped. Every projected column is
+/// therefore appended as a trailing sort key, producing a deterministic total
+/// content ordering — rows identical in all projected columns are completely
+/// interchangeable, so no data can be lost regardless of tie-breaking.
+fn mysql_content_order_keys(
+    selected_columns: &[&ColumnInfo],
+    database_kind: DatabaseKind,
+) -> String {
+    let mut keys = selected_columns
+        .iter()
+        .map(|column| {
+            format!(
+                "SHA2(COALESCE(HEX({}), 'NULL'), 256)",
+                backup_quote_identifier(&column.name, database_kind)
+            )
+        })
+        .collect::<Vec<_>>();
+    keys.extend(
+        selected_columns
+            .iter()
+            .map(|column| backup_quote_identifier(&column.name, database_kind)),
+    );
+    keys.join(", ")
 }
 
 fn backup_table_page_sql(
@@ -4493,7 +4680,8 @@ mod tests {
 
     use super::{
         DatabaseKind, KeysetCursor, RuntimeStats, decrypt_backup_file, encrypt_backup_file,
-        export_total_cell, keyset_condition_sql, mysql_alter_database_definition, order_view_names,
+        export_total_cell, is_private_secret_target, keyset_condition_sql,
+        mysql_alter_database_definition, mysql_content_order_keys, order_view_names,
         paged_select_sql, process_tree_memory_bytes, read_backup_text, split_sql_script,
         strip_cockpit_backup_header, strip_definer_clause, table_keyset_columns, table_page_sql,
         write_delimited_definition,
@@ -4994,5 +5182,106 @@ mod tests {
             strip_definer_clause("CREATE DEFINER=`root`@`localhost` PROCEDURE p() SELECT 1"),
             "CREATE  PROCEDURE p() SELECT 1"
         );
+    }
+
+    fn keyless_mysql_detail() -> cockpit_core::TableDetail {
+        let column = |name: &str| cockpit_core::ColumnInfo {
+            name: name.into(),
+            ordinal: 0,
+            data_type: "varchar".into(),
+            full_type: "varchar(64)".into(),
+            nullable: true,
+            default_value: None,
+            extra: None,
+            comment: None,
+            key: None,
+            generation_expression: None,
+            collation: None,
+        };
+        cockpit_core::TableDetail {
+            table: cockpit_core::TableInfo {
+                database: "demo".into(),
+                name: "logs".into(),
+                table_type: "BASE TABLE".into(),
+                comment: None,
+                estimated_rows: None,
+                total_bytes: None,
+            },
+            columns: vec![column("id"), column("or`der")],
+            indexes: vec![],
+            foreign_keys: vec![],
+            ddl: String::new(),
+        }
+    }
+
+    #[test]
+    fn keyless_mysql_pages_order_by_hash_then_every_projected_column() {
+        // 无主键/唯一键时仅按 SHA2 哈希排序不是全序，哈希碰撞会让不同分页
+        // 查询的页界漂移，导致漏行或重复；全部投影列必须作为末级排序键追加，
+        // 形成确定的内容全序。
+        let sql = table_page_sql(
+            "demo",
+            "logs",
+            &keyless_mysql_detail(),
+            500,
+            3_000,
+            None,
+            DatabaseKind::MySql,
+            true,
+        )
+        .unwrap();
+        assert!(sql.starts_with("SELECT `id`, `or``der` FROM `demo`.`logs`"));
+        assert!(sql.contains(
+            "ORDER BY SHA2(COALESCE(HEX(`id`), 'NULL'), 256), SHA2(COALESCE(HEX(`or``der`), 'NULL'), 256), `id`, `or``der` LIMIT 501 OFFSET 3000"
+        ));
+    }
+
+    #[test]
+    fn mysql_content_order_keys_quote_identifiers_per_dialect_and_keep_order() {
+        let detail = keyless_mysql_detail();
+        let columns = detail.columns.iter().collect::<Vec<_>>();
+        assert_eq!(
+            mysql_content_order_keys(&columns, DatabaseKind::MySql),
+            "SHA2(COALESCE(HEX(`id`), 'NULL'), 256), \
+             SHA2(COALESCE(HEX(`or``der`), 'NULL'), 256), `id`, `or``der`"
+        );
+        assert_eq!(
+            mysql_content_order_keys(&columns, DatabaseKind::MariaDb),
+            mysql_content_order_keys(&columns, DatabaseKind::MySql)
+        );
+    }
+
+    #[test]
+    fn private_secret_path_guard_rejects_matches_and_aliases() {
+        use crate::secrets::{DEVICE_KEY_FILE, SECRETS_VAULT_FILE};
+        let directory =
+            std::env::temp_dir().join(format!("cockpit-guard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(directory.join("data")).unwrap();
+        let protected = vec![
+            directory.join("data").join(DEVICE_KEY_FILE),
+            directory.join("data").join(SECRETS_VAULT_FILE),
+        ];
+        std::fs::write(&protected[0], b"key").unwrap();
+
+        // 直接命中已存在的设备密钥文件。
+        assert!(is_private_secret_target(&protected[0], &protected));
+        // 凭据库文件尚不存在（首次写入）同样要拦截。
+        assert!(is_private_secret_target(&protected[1], &protected));
+        // 用户选择的正常导出路径不受影响。
+        assert!(!is_private_secret_target(
+            &directory.join("export").join("dump.sql"),
+            &protected
+        ));
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(directory.join("data"), directory.join("alias")).unwrap();
+            assert!(is_private_secret_target(
+                &directory.join("alias").join(DEVICE_KEY_FILE),
+                &protected
+            ));
+        }
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

@@ -17,8 +17,11 @@ use cockpit_core::{CockpitError, Result};
 use rand_core::{OsRng, RngCore};
 use uuid::Uuid;
 
-const DEVICE_KEY_FILE: &str = "device.key";
-const SECRETS_VAULT_FILE: &str = "credentials.vault";
+/// 设备密钥文件：加密本机存储的全部凭据，属于绝不能被外部写命令覆盖的
+/// 应用私密文件（路径守卫使用，见 commands.rs）。
+pub(crate) const DEVICE_KEY_FILE: &str = "device.key";
+/// 加密的凭据库文件（同上，受写入守卫保护）。
+pub(crate) const SECRETS_VAULT_FILE: &str = "credentials.vault";
 const VAULT_MAGIC: &[u8; 8] = b"CKPVAULT";
 const NONCE_LENGTH: usize = 12;
 const KEY_LENGTH: usize = 32;
