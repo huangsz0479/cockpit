@@ -8,7 +8,8 @@ import type { QueryResultPage, RowMutationKind, RowMutationRequest } from "@/typ
 vi.mock("@/lib/api", () => ({
   api: {
     beginTransaction: vi.fn(), cancel: vi.fn(), closeTabSession: vi.fn(), commitTransaction: vi.fn(),
-    connect: vi.fn(), execute: vi.fn(), listDatabases: vi.fn(), listTables: vi.fn(), mutateRow: vi.fn(),
+    connect: vi.fn(), disconnect: vi.fn(), execute: vi.fn(), listDatabases: vi.fn(), listTables: vi.fn(),
+    mutateRow: vi.fn(),
     openTabSession: vi.fn(), rollbackTransaction: vi.fn(),
   },
 }));
@@ -78,7 +79,7 @@ describe("app store query execution", () => {
     expect(isReactive(returned!.additionalResultSets![0]!.rows)).toBe(false);
   });
 
-  it("clears the previous connection tree before loading the next connection", async () => {
+  it("keeps the previous connection tree until the next connection succeeds", async () => {
     const store = useAppStore();
     const previousConnectionId = crypto.randomUUID();
     const nextConnectionId = crypto.randomUUID();
@@ -95,9 +96,9 @@ describe("app store query execution", () => {
 
     const connecting = store.connect(nextConnectionId);
 
-    expect(store.databases).toEqual([]);
-    expect(store.selectedDatabase).toBeNull();
-    expect(store.tables).toEqual([]);
+    expect(store.databases).toEqual([{ name: "previous_database" }]);
+    expect(store.selectedDatabase).toBe("previous_database");
+    expect(store.tables).toEqual([{ database: "previous_database", name: "previous_table", tableType: "BASE TABLE" }]);
 
     resolveConnection({ serverVersion: "8.0", connectionId: 2 });
     await connecting;
@@ -105,6 +106,67 @@ describe("app store query execution", () => {
     expect(store.activeConnectionId).toBe(nextConnectionId);
     expect(store.databases).toEqual([{ name: "next_database" }]);
     expect(store.tables).toEqual([]);
+  });
+
+  it("keeps the previous connection view when connecting fails", async () => {
+    const store = useAppStore();
+    const previousConnectionId = crypto.randomUUID();
+    const nextConnectionId = crypto.randomUUID();
+    store.activeConnectionId = previousConnectionId;
+    store.databases = [{ name: "previous_database" }];
+    store.selectedDatabase = "previous_database";
+    store.tables = [{ database: "previous_database", name: "previous_table", tableType: "BASE TABLE" }];
+    vi.mocked(api.connect).mockRejectedValueOnce(new Error("连接被拒绝"));
+
+    await store.connect(nextConnectionId);
+
+    expect(store.error).toBe("连接被拒绝");
+    expect(store.activeConnectionId).toBe(previousConnectionId);
+    expect(store.databases).toEqual([{ name: "previous_database" }]);
+    expect(store.selectedDatabase).toBe("previous_database");
+    expect(store.tables).toEqual([{ database: "previous_database", name: "previous_table", tableType: "BASE TABLE" }]);
+  });
+
+  it("forgets tab sessions and resets the workspace after disconnecting successfully", async () => {
+    const store = useAppStore();
+    const connectionId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    store.activeConnectionId = connectionId;
+    store.connectionInfo[connectionId] = { serverVersion: "8.0", connectionId: 1 };
+    vi.mocked(api.openTabSession).mockResolvedValue();
+    vi.mocked(api.beginTransaction).mockResolvedValue();
+    expect(await store.openTabSession(connectionId, sessionId)).toBe(true);
+    await store.beginTransaction(sessionId);
+    vi.mocked(api.disconnect).mockResolvedValueOnce();
+
+    await store.disconnect(connectionId);
+
+    expect(api.disconnect).toHaveBeenCalledWith(connectionId);
+    expect(store.connectionInfo[connectionId]).toBeUndefined();
+    expect(store.transactionSessions[sessionId]).toBeUndefined();
+    expect(store.activeConnectionId).toBeNull();
+  });
+
+  it("keeps workspace state and tab-session bindings when disconnecting fails", async () => {
+    const store = useAppStore();
+    const connectionId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    store.activeConnectionId = connectionId;
+    store.connectionInfo[connectionId] = { serverVersion: "8.0", connectionId: 1 };
+    store.databases = [{ name: "demo" }];
+    vi.mocked(api.openTabSession).mockResolvedValue();
+    vi.mocked(api.beginTransaction).mockResolvedValue();
+    expect(await store.openTabSession(connectionId, sessionId)).toBe(true);
+    await store.beginTransaction(sessionId);
+    vi.mocked(api.disconnect).mockRejectedValueOnce(new Error("断开连接失败"));
+
+    await store.disconnect(connectionId);
+
+    expect(store.error).toBe("断开连接失败");
+    expect(store.connectionInfo[connectionId]).toEqual({ serverVersion: "8.0", connectionId: 1 });
+    expect(store.transactionSessions[sessionId]).toBe(true);
+    expect(store.activeConnectionId).toBe(connectionId);
+    expect(store.databases).toEqual([{ name: "demo" }]);
   });
 
   it("ignores a database list returned by an older connection request", async () => {

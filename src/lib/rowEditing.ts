@@ -108,7 +108,13 @@ export function parseRowCell(
     if (!value) throw new Error(`${column.name} 需要选择日期`);
     return { kind: "date", value };
   }
-  if (type.startsWith("time") && !type.startsWith("timestamp")) return { kind: "time", value };
+  if (type.startsWith("time") && !type.startsWith("timestamp")) {
+    if (!value.trim()) throw new Error(`${column.name} 需要填写时间`);
+    if (!/^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(value.trim())) {
+      throw new Error(`${column.name} 时间格式无效，应为 HH:MM 或 HH:MM:SS`);
+    }
+    return { kind: "time", value };
+  }
   if (type === "datetime" || type.startsWith("timestamp")) {
     if (!value) throw new Error(`${column.name} 需要选择日期和时间`);
     return { kind: "date_time", value };

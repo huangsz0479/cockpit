@@ -87,6 +87,10 @@ export const useAppStore = defineStore("app", () => {
   async function connect(connectionId: UUID) {
     const requestSequence = ++connectionRequestSequence;
     tableRequestSequence++;
+    const info = await run(() => api.connect(connectionId));
+    if (!info) return;
+    connectionInfo.value[connectionId] = info;
+    if (requestSequence !== connectionRequestSequence) return;
     databases.value = [];
     selectedDatabase.value = null;
     tables.value = [];
@@ -96,10 +100,6 @@ export const useAppStore = defineStore("app", () => {
     routines.value = [];
     triggers.value = [];
     events.value = [];
-    const info = await run(() => api.connect(connectionId));
-    if (!info) return;
-    connectionInfo.value[connectionId] = info;
-    if (requestSequence !== connectionRequestSequence) return;
     activeConnectionId.value = connectionId;
     const databasePage = await run(() => api.listDatabases(connectionId));
     if (requestSequence !== connectionRequestSequence) return;
@@ -108,7 +108,8 @@ export const useAppStore = defineStore("app", () => {
 
   async function disconnect(connectionId: UUID) {
     await run(() => api.disconnect(connectionId));
-    if (!error.value) forgetTabSessions(connectionId);
+    if (error.value) return;
+    forgetTabSessions(connectionId);
     delete connectionInfo.value[connectionId];
     if (activeConnectionId.value === connectionId) resetWorkspace();
   }

@@ -38,6 +38,7 @@ const progress = ref<TransferProgress | null>(null);
 const resultMessage = ref("");
 let taskId: UUID | null = null;
 let unlisten: UnlistenFn | null = null;
+let latestPreviewRequestId = 0;
 
 const canImport = computed(() => Boolean(
   inputPath.value && preview.value && mappings.value.some((mapping) => mapping.target) && !importing.value,
@@ -63,6 +64,7 @@ async function chooseFile() {
 
 async function loadPreview() {
   if (!inputPath.value) return;
+  const requestId = ++latestPreviewRequestId;
   loadingPreview.value = true;
   error.value = "";
   resultMessage.value = "";
@@ -76,6 +78,7 @@ async function loadPreview() {
       encoding: encoding.value,
       previewRows: 50,
     });
+    if (requestId !== latestPreviewRequestId) return;
     preview.value = value;
     sheetName.value = value.selectedSheet ?? "";
     mappings.value = value.columns.map((source, index) => ({
@@ -86,10 +89,11 @@ async function loadPreview() {
       delimiter.value = value.detectedDelimiter;
     }
   } catch (cause) {
+    if (requestId !== latestPreviewRequestId) return;
     preview.value = null;
     error.value = cause instanceof Error ? cause.message : String(cause);
   } finally {
-    loadingPreview.value = false;
+    if (requestId === latestPreviewRequestId) loadingPreview.value = false;
   }
 }
 

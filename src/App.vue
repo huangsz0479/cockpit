@@ -1606,18 +1606,19 @@ async function runTableContextAction(action: "preview" | "generate" | "design" |
   else if (action === "copy-qualified") await copyText(`${table.database}.${table.name}`);
 }
 
-async function runElasticsearchIndexAction(description: string, action: () => Promise<unknown>) {
+async function runElasticsearchIndexAction(description: string, action: () => Promise<unknown>): Promise<boolean> {
   const connectionId = activeConnectionId.value;
-  if (!connectionId) { error.value = "请先连接数据库"; return; }
-  if (!await confirmDestructiveAction(description)) return;
+  if (!connectionId) { error.value = "请先连接数据库"; return false; }
+  if (!await confirmDestructiveAction(description)) return false;
   error.value = null;
   try {
     await action();
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause);
-    return;
+    return false;
   }
   await store.loadTables("", false);
+  return true;
 }
 
 async function clearElasticsearchIndex(table: TableInfo) {
@@ -1629,11 +1630,11 @@ async function clearElasticsearchIndex(table: TableInfo) {
 
 async function dropElasticsearchIndex(table: TableInfo) {
   const connectionId = activeConnectionId.value;
-  await runElasticsearchIndexAction(
+  const dropped = await runElasticsearchIndexAction(
     `永久删除索引“${table.name}”？索引、字段映射与全部文档都会被删除。`,
     () => api.deleteIndex(activeConnectionId.value!, table.name),
   );
-  if (!connectionId || error.value) return;
+  if (!connectionId || !dropped) return;
   const tabId = `table:${connectionId}:${table.database}:${table.name}`;
   const tab = workspaceTabs.value.find((item) => item.id === tabId);
   if (tab) await closeWorkspaceTab(tab.id);
