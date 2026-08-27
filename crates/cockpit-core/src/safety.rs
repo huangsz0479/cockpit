@@ -37,7 +37,6 @@ fn assess_statement(sql: &str) -> SqlAssessment {
     let normalized = strip_leading_trivia(sql);
     let tokens = sql_tokens(normalized);
     let keyword = tokens.first().cloned().unwrap_or_default();
-    let upper = normalized.to_ascii_uppercase();
 
     let (risk, requires_confirmation, reason) = match keyword.as_str() {
         "SELECT" if select_has_side_effects(&tokens) => (
@@ -57,7 +56,7 @@ fn assess_statement(sql: &str) -> SqlAssessment {
             Some("CTE 可能包含数据修改，当前版本按保守策略处理".to_string()),
         ),
         "INSERT" | "REPLACE" => (RiskLevel::Review, true, Some("将写入数据".to_string())),
-        "UPDATE" | "DELETE" if !contains_keyword(&upper, "WHERE") => (
+        "UPDATE" | "DELETE" if !tokens.iter().any(|token| token == "WHERE") => (
             RiskLevel::Destructive,
             true,
             Some("UPDATE/DELETE 未包含 WHERE 条件".to_string()),
@@ -272,7 +271,7 @@ fn push_statement(statements: &mut Vec<String>, current: &mut String) {
     }
 }
 
-fn strip_leading_trivia(mut sql: &str) -> &str {
+pub fn strip_leading_trivia(mut sql: &str) -> &str {
     loop {
         sql = sql.trim_start();
         if let Some(rest) = sql.strip_prefix("--") {
@@ -289,11 +288,6 @@ fn strip_leading_trivia(mut sql: &str) -> &str {
         }
         return sql;
     }
-}
-
-fn contains_keyword(sql: &str, keyword: &str) -> bool {
-    sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|part| part == keyword)
 }
 
 #[cfg(test)]
@@ -354,5 +348,31 @@ mod tests {
             RiskLevel::Safe
         );
         assert!(assess_sql("SELECT/* comment */SLEEP(1)").requires_confirmation);
+    }
+
+    #[test]
+    fn where_word_inside_comment_does_not_count_as_a_condition() {
+        let assessment = assess_sql("DELETE FROM audit_log /* WHERE handled by retention job */");
+        assert_eq!(assessment.risk, RiskLevel::Destructive);
+        assert_eq!(
+            assessment.reason.as_deref(),
+            Some("UPDATE/DELETE 未包含 WHERE 条件")
+        );
+    }
+
+    #[test]
+    fn where_word_inside_line_comment_does_not_count_as_a_condition() {
+        assert_eq!(
+            assess_sql("UPDATE settings SET value = 'x' -- where should this go?\n").risk,
+            RiskLevel::Destructive
+        );
+    }
+
+    #[test]
+    fn real_where_clause_still_downgrades_to_review() {
+        assert_eq!(
+            assess_sql("DELETE FROM logs WHERE created_at < '2020-01-01'").risk,
+            RiskLevel::Review
+        );
     }
 }

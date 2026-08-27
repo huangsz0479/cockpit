@@ -497,12 +497,11 @@ fn sql_literal(value: &CellValue, database_kind: DatabaseKind) -> Result<String>
         | CellValue::Date(value)
         | CellValue::Time(value)
         | CellValue::DateTime(value)
-        | CellValue::Json(value) => Ok(match database_kind {
-            DatabaseKind::MySql | DatabaseKind::MariaDb => mysql_utf8_literal(value),
-            DatabaseKind::PostgreSql | DatabaseKind::Sqlite | DatabaseKind::Elasticsearch => {
-                quote_sql_string(value)
-            }
-        }),
+        | CellValue::Json(value) => match database_kind {
+            DatabaseKind::MySql | DatabaseKind::MariaDb => Ok(mysql_utf8_literal(value)),
+            DatabaseKind::PostgreSql => postgres_text_literal(value),
+            DatabaseKind::Sqlite | DatabaseKind::Elasticsearch => Ok(quote_sql_string(value)),
+        },
         CellValue::Bytes { base64, .. } => {
             let hex = decode_hex(base64)?;
             Ok(match database_kind {
@@ -539,15 +538,27 @@ fn mysql_utf8_literal(value: &str) -> String {
     format!("CONVERT(X'{hex}' USING utf8mb4)")
 }
 
+/// 标准字符串字面量（SQLite / Elasticsearch SQL）：仅按标准转义单引号，
+/// 不处理任何反斜杠转义，保证换行、反斜杠等字符原样往返。
 fn quote_sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// PostgreSQL 默认开启 standard_conforming_strings，普通 '...' 不解析反斜杠；
+/// 因此使用 E'' 转义字符串保留字节级内容（换行、反斜杠等）。
+/// PostgreSQL 文本无法保存空字符（NUL），遇到时返回错误而不是静默损坏数据。
+fn postgres_text_literal(value: &str) -> Result<String> {
+    if value.contains('\0') {
+        return Err(CockpitError::Exchange(
+            "PostgreSQL 文本无法保存空字符（NUL）".into(),
+        ));
+    }
     let escaped = value
         .replace('\\', "\\\\")
-        .replace('\0', "\\0")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
         .replace('\'', "''")
-        .replace('\u{001a}', "\\Z");
-    format!("'{escaped}'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    Ok(format!("E'{escaped}'"))
 }
 
 fn decode_hex(value: &str) -> Result<String> {
@@ -778,6 +789,48 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("CONVERT(X'"));
         assert!(!text.contains("quote ' slash"));
+    }
+
+    #[test]
+    fn postgres_text_literals_use_escape_strings_for_control_characters() {
+        let literal = sql_literal(
+            &CellValue::Text("line1\nback\\slash'quoted\r\tend".into()),
+            DatabaseKind::PostgreSql,
+        )
+        .unwrap();
+        assert_eq!(literal, "E'line1\\nback\\\\slash''quoted\\r\tend'");
+    }
+
+    #[test]
+    fn sqlite_text_literals_only_double_single_quotes() {
+        let literal = sql_literal(
+            &CellValue::Text("line1\nback\\slash'quoted\r\tend".into()),
+            DatabaseKind::Sqlite,
+        )
+        .unwrap();
+        assert_eq!(literal, "'line1\nback\\slash''quoted\r\tend'");
+    }
+
+    #[test]
+    fn elasticsearch_text_literals_only_double_single_quotes() {
+        let literal = sql_literal(
+            &CellValue::Text("line1\nback\\slash'quoted\r\tend".into()),
+            DatabaseKind::Elasticsearch,
+        )
+        .unwrap();
+        assert_eq!(literal, "'line1\nback\\slash''quoted\r\tend'");
+    }
+
+    #[test]
+    fn postgres_text_literals_reject_null_bytes_instead_of_corrupting_data() {
+        let error = sql_literal(
+            &CellValue::Text("bad\u{0}byte".into()),
+            DatabaseKind::PostgreSql,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("空字符"));
+        assert!(error.contains("NUL"));
     }
 
     #[test]
