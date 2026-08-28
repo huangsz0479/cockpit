@@ -48,6 +48,9 @@ uuid = { version = "1", features = ["serde", "v4"] }
 [profile.release]
 panic = "abort"
 strip = true
-lto = true
+# Fat LTO (`lto = true`) breaks the final link on x86_64-unknown-linux-gnu
+# with rustc 1.88: calamine keeps references to the encoding_rs::UTF_* statics
+# while their definitions are dropped, failing with "undefined reference".
+lto = "thin"
 codegen-units = 1
 opt-level = "s"
