@@ -460,8 +460,15 @@ async fn index_management_creates_clears_and_deletes_indices() {
         .await
         .unwrap();
     assert_eq!(count.rows[0][0], CellValue::Signed("0".into()));
+    // delete_by_query 只删文档不回滚动态 mapping：写入文档时 price 已被
+    // 动态加入 mapping，清空后 title（显式）与 price（动态）都应保留
     let columns_after = session.list_columns("", &index).await.unwrap();
-    assert_eq!(columns_after.len(), 1);
+    let names_after: Vec<&str> = columns_after
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert!(names_after.contains(&"title"));
+    assert!(names_after.contains(&"price"));
 
     // 删除索引后从列表消失，重复删除报索引不存在
     session.delete_index(&index).await.unwrap();
