@@ -753,7 +753,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "cockpit"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "cockpit-core"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "cockpit-elasticsearch"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "cockpit-mysql"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "cockpit-postgres"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "cockpit-sqlite"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
