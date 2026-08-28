@@ -1,3 +1,6 @@
 [toolchain]
-channel = "1.88"
+# Pin the patch version: dtolnay/rust-toolchain@1.88 in CI installs the
+# toolchain named "1.88.0", and rustup treats "1.88" and "1.88.0" as two
+# separate toolchains (targets installed into one are invisible to the other).
+channel = "1.88.0"
 components = ["rustfmt", "clippy"]

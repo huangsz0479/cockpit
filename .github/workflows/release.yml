@@ -37,8 +37,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      # rust-toolchain.toml overrides the toolchain the action installed, so
+      # make sure the universal-apple-darwin targets exist in the one cargo
+      # actually resolves to (guards against channel-name drift like "1.88"
+      # vs "1.88.0", which rustup treats as two separate toolchains).
+      - name: Install macOS universal targets
+        if: matrix.platform == 'macos-latest'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Verify version consistency
         if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
         run: |
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
           CONF_VERSION="$(node -e "console.log(require('./src-tauri/tauri.conf.json').version)")"
